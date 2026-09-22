@@ -306,3 +306,27 @@ reforcos que essa auditoria tornou explicitos.
     em `schema_migrations` entra na MESMA transacao atomica do resto da
     migration, nunca como uma escrita separada depois que o esquema ja
     commitou.
+
+32. **Coordenar exclusao entre threads exige uma primitiva que serializa
+    "checar e agir" atomicamente - um booleano isolado, ligado e
+    desligado por chamadores diferentes sem um lock compartilhado com
+    quem le, NAO basta.**
+    O mesmo usuario que validou o Principio 31 em Windows encontrou, la
+    mesmo, dois problemas no portao: (a) `_pause_for_restore()` so
+    ligava/desligava um `bool`, nunca impedindo uma SEGUNDA restauracao de
+    tambem "entrar" enquanto a primeira ainda estava em andamento - quando
+    a primeira terminava, desligava o portao mesmo com a segunda ainda
+    tocando arquivos; (b) `get_conn()` consultava o portao e SO DEPOIS
+    abria a conexao, dois passos sem nenhum lock em comum entre eles - uma
+    restauracao podia comecar exatamente nesse meio-tempo. A correcao
+    trocou o `bool` isolado por uma coordenacao leitor/escritor de verdade
+    sobre um `threading.Condition` UNICO, compartilhado entre
+    `reader_slot()` (usado por `get_conn`, registra "conexao aberta" e
+    checa o portao como UMA operacao atomica) e `_pause_for_restore()`
+    (rejeita uma segunda restauracao NA HORA, antes de tocar qualquer
+    coisa, e so avanca depois que todos os leitores registrados
+    terminarem) - nunca dois passos separados de nenhum dos dois lados
+    (`test_restore_rejects_a_concurrent_second_restore_attempt`,
+    `test_restore_waits_for_an_in_flight_request_before_touching_files`,
+    ambos com threads reais e `threading.Event` para sincronizacao
+    deterministica, nunca `sleep`).

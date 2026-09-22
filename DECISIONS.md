@@ -840,3 +840,79 @@ instante do `os.replace`), que a causa raiz relatada no Windows deixou de
 existir, mas NAO substituem rodar a suite de verdade num Windows real. O
 usuario que reportou o bug e quem tem esse ambiente; a validacao final em
 Windows depende dele confirmar.
+
+**Atualizacao:** o usuario confirmou 128/128 (suite completa) e 10/10
+(`test_restore.py` isolado) num Windows real apos esta correcao - o
+`WinError 5` original foi resolvido.
+
+---
+
+## Correcao pos-entrega: portao de concorrencia do restore tinha duas janelas (quinta auditoria)
+
+O mesmo usuario, ja no Windows, encontrou e REPRODUZIU dois problemas
+novos no portao introduzido pela correcao anterior:
+
+1. `_pause_for_restore()` so ligava/desligava um `bool` isolado
+   (`_restore_in_progress = True`/`False`) protegido por um lock que era
+   solto logo depois de cada atribuicao - ele nunca IMPEDIA uma segunda
+   chamada de tambem entrar enquanto a primeira ainda estivesse em
+   andamento. Com duas restauracoes "dentro" ao mesmo tempo, quando a
+   PRIMEIRA terminava, seu `finally` desligava o portao mesmo com a
+   SEGUNDA ainda tocando arquivos - reabrindo exatamente a janela sem
+   protecao que a correcao anterior deveria ter fechado.
+2. `get_conn()` consultava o portao (`is_restore_in_progress()`) e SO
+   DEPOIS abria a conexao - dois passos separados, sem nenhum lock em
+   comum entre eles. Uma restauracao podia comecar exatamente nesse
+   meio-tempo: a requisicao via o portao desligado, comecava a abrir a
+   conexao, e a restauracao comecava a tocar arquivos antes dessa conexao
+   sequer existir de fato ou ser fechada.
+
+**Decisao:** o portao deixou de ser um `bool` isolado e virou uma
+coordenacao leitor/escritor de verdade sobre um unico
+`threading.Condition` compartilhado (`persistence/restore.py`):
+
+- `reader_slot()` (usado por `get_conn()`) registra "esta requisicao tem
+  uma conexao aberta" e CHECA que nenhuma restauracao esta em andamento
+  como UMA UNICA operacao atomica sob o lock - nunca mais dois passos
+  separados. O slot fica registrado durante toda a vida da conexao (do
+  `connect()` ate o `close()` no `finally` de `get_conn`), nao so no
+  instante de abrir.
+- `_pause_for_restore()` (o "escritor") primeiro tenta marcar
+  `_restore_in_progress = True` sob o MESMO lock - se ja estiver `True`
+  (outra restauracao em andamento), levanta `RestoreAlreadyInProgressError`
+  IMEDIATAMENTE, antes de tocar em qualquer coisa, nunca deixando uma
+  segunda restauracao "entrar" junto com a primeira. So depois de marcar
+  com sucesso, espera (`Condition.wait()`, que solta o lock enquanto
+  espera) a contagem de leitores registrados chegar a zero - e, como
+  `_restore_in_progress` ja esta `True` nesse momento, qualquer NOVO
+  leitor que apareca nesse meio-tempo e recusado na hora por
+  `reader_slot()`, evitando que uma fila de leitores adie a restauracao
+  para sempre.
+- `restore_from_backup` captura `RestoreAlreadyInProgressError` e devolve
+  um `RestoreResult(success=False, ...)` legivel em vez de deixar a
+  excecao escapar - uma segunda tentativa de restauracao concorrente
+  falha de forma limpa, nunca com um traceback cru.
+
+Testado em `test_restore.py::test_restore_rejects_a_concurrent_second_restore_attempt`
+(duas restauracoes disparadas de fato ao mesmo tempo, via threads reais e
+sincronizacao por `threading.Event` - a primeira e segurada "dentro" de
+proposito enquanto a segunda e chamada; a segunda precisa ser rejeitada
+NA HORA, a primeira precisa terminar normalmente, e o portao so pode
+desligar depois que a UNICA restauracao real terminou) e
+`test_restore.py::test_restore_waits_for_an_in_flight_request_before_touching_files`
+(entra manualmente em `reader_slot()` simulando uma requisicao que ja
+passou pela checagem do portao, dispara uma restauracao numa thread
+separada, e confirma que `os.replace` NUNCA e chamado enquanto o "leitor"
+segue aberto - so depois que ele fecha).
+
+**Escopo permanece o mesmo de antes:** esta coordenacao protege contra
+disputas DENTRO deste processo (duas requisicoes/threads do mesmo
+servidor web); uma conexao verdadeiramente externa (outro processo do SO
+tocando o arquivo diretamente) continua dependendo so da checagem de
+exclusividade best-effort no proprio banco (`_check_exclusive`), como ja
+documentado na correcao anterior.
+
+**Limite honesto:** os dois testes acima usam threads reais e sincronizacao
+determinista (`threading.Event`, nunca `sleep`), rodados repetidamente em
+Linux sem falha - mas, como na correcao anterior, a confirmacao final em
+Windows depende do usuario rodar a suite de novo la.

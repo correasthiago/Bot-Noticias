@@ -13,7 +13,7 @@ from fastapi import Depends, HTTPException
 from central_universal.domain.entities import RuleVersion
 from central_universal.persistence.db import DEFAULT_DB_PATH, connect
 from central_universal.persistence.repositories import Repositories
-from central_universal.persistence.restore import is_restore_in_progress
+from central_universal.persistence.restore import RestoreBlockedError, reader_slot
 from central_universal.providers.base import Provider
 from central_universal.providers.mock import MockProvider
 from central_universal.web.bootstrap import DEFAULT_RULE_VERSION
@@ -30,18 +30,26 @@ ACTIVE_PROVIDER: Provider = MockProvider()
 
 
 def get_conn() -> Iterator[sqlite3.Connection]:
-    # Quarta auditoria pos-entrega, Secao 3: enquanto uma restauracao de
-    # backup estiver em andamento (`persistence.restore._pause_for_restore`),
-    # nenhuma requisicao nova pode abrir uma conexao com o banco - ele
-    # pode estar no meio de uma troca de arquivo. 503 e o codigo correto
-    # (servico temporariamente indisponivel, tente de novo em breve).
-    if is_restore_in_progress():
-        raise HTTPException(status_code=503, detail="Restauracao de backup em andamento - tente novamente em instantes.")
-    conn = connect(DB_PATH)
+    # Quinta auditoria pos-entrega, Secao 3: `reader_slot()` registra esta
+    # requisicao como "com uma conexao aberta" ATOMICAMENTE com a checagem
+    # de que nenhuma restauracao esta em andamento - nunca ha uma janela
+    # entre consultar o portao e abrir a conexao onde uma restauracao
+    # poderia comecar no meio (o bug relatado na correcao anterior, que so
+    # checava um booleano isolado antes de chamar `connect`). O slot fica
+    # registrado durante TODA a requisicao (ate o `finally` fechar a
+    # conexao), entao uma restauracao que comece depois espera esta
+    # requisicao terminar antes de tocar qualquer arquivo.
     try:
-        yield conn
-    finally:
-        conn.close()
+        with reader_slot():
+            conn = connect(DB_PATH)
+            try:
+                yield conn
+            finally:
+                conn.close()
+    except RestoreBlockedError as exc:
+        raise HTTPException(
+            status_code=503, detail="Restauracao de backup em andamento - tente novamente em instantes."
+        ) from exc
 
 
 def get_repos(conn: sqlite3.Connection = Depends(get_conn)) -> Repositories:

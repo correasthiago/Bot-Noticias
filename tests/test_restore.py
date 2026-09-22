@@ -265,6 +265,135 @@ def test_restore_pauses_the_application_gate_and_always_resumes_it(tmp_path: Pat
     assert restore_module.is_restore_in_progress() is False  # desligado depois
 
 
+def test_restore_rejects_a_concurrent_second_restore_attempt(tmp_path: Path, monkeypatch):
+    """Relato do usuario (quinta auditoria pos-entrega): 'Duas chamadas
+    simultaneas a _pause_for_restore() podem entrar; quando a primeira
+    sai, _restore_in_progress vira False enquanto a segunda ainda
+    restaura.' Uma SEGUNDA restauracao disparada enquanto a primeira ainda
+    esta em andamento precisa ser REJEITADA imediatamente - nunca as duas
+    'dentro' ao mesmo tempo, e o portao nunca desliga achando que
+    terminou quando na verdade so a primeira terminou."""
+
+    import threading
+
+    import central_universal.persistence.restore as restore_module
+
+    db_path = tmp_path / "central.db"
+    conn = connect(db_path)
+    run_migrations(conn)
+    repos = Repositories(conn)
+    learner = Learner(id=new_id(), display_name="Original", created_at=utc_now_iso())
+    repos.learners.insert(learner)
+    backup_event = create_backup(conn, repos, backup_dir=tmp_path / "backups")
+    assert backup_event.success is True
+    conn.close()
+
+    entered_first = threading.Event()
+    release_first = threading.Event()
+    observed: dict[str, object] = {}
+    real_copy2 = restore_module.shutil.copy2
+
+    def spy_copy2(src, dst, *args, **kwargs):
+        if "first_hit" not in observed:
+            observed["first_hit"] = True
+            entered_first.set()
+            release_first.wait(timeout=5)  # segura a PRIMEIRA restauracao "dentro" de proposito
+        return real_copy2(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(restore_module.shutil, "copy2", spy_copy2)
+
+    results: dict[str, object] = {}
+
+    def run_first():
+        results["first"] = restore_from_backup(db_path, backup_event.backup_path)
+
+    first_thread = threading.Thread(target=run_first)
+    first_thread.start()
+    assert entered_first.wait(timeout=5), "a primeira restauracao nunca entrou na janela protegida"
+
+    # a primeira restauracao esta comprovadamente "dentro" agora - uma
+    # segunda tentativa, disparada NESTE exato momento, precisa ser
+    # rejeitada na hora, sem esperar e sem tocar nenhum arquivo.
+    assert restore_module.is_restore_in_progress() is True
+    second_result = restore_from_backup(db_path, backup_event.backup_path)
+
+    release_first.set()
+    first_thread.join(timeout=5)
+    assert not first_thread.is_alive()
+
+    assert second_result.success is False
+    assert "andamento" in second_result.message.lower()
+    assert results["first"].success is True  # a primeira prossegue e termina normalmente
+    assert restore_module.is_restore_in_progress() is False  # desligado so depois que a UNICA restauracao real terminou
+
+    restored = connect(db_path)
+    assert Repositories(restored).learners.get(learner.id) is not None
+    restored.close()
+
+
+def test_restore_waits_for_an_in_flight_request_before_touching_files(tmp_path: Path, monkeypatch):
+    """Relato do usuario (quinta auditoria pos-entrega): 'ha uma janela em
+    get_conn() entre consultar o portao e abrir a conexao'. Uma
+    requisicao que ja passou pela checagem do portao e esta com uma
+    conexao aberta (registrada via `reader_slot()`, exatamente o que
+    `get_conn()` faz) precisa impedir que uma restauracao comece a tocar
+    arquivos ate essa conexao ser fechada - nunca uma janela onde as duas
+    coexistem."""
+
+    import threading
+
+    import central_universal.persistence.restore as restore_module
+
+    db_path = tmp_path / "central.db"
+    conn = connect(db_path)
+    run_migrations(conn)
+    repos = Repositories(conn)
+    learner = Learner(id=new_id(), display_name="Original", created_at=utc_now_iso())
+    repos.learners.insert(learner)
+    backup_event = create_backup(conn, repos, backup_dir=tmp_path / "backups")
+    assert backup_event.success is True
+    conn.close()
+
+    # simula uma requisicao que ja passou pela checagem do portao (como
+    # `get_conn()` faz) e esta com a conexao "aberta" - exatamente o
+    # cenario relatado, capturado logo ANTES do restore comecar.
+    reader_cm = restore_module.reader_slot()
+    reader_cm.__enter__()
+    touched_files = threading.Event()
+    real_os_replace = restore_module.os.replace
+
+    def spy_os_replace(src, dst, *args, **kwargs):
+        touched_files.set()
+        return real_os_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(restore_module.os, "replace", spy_os_replace)
+
+    result_holder: dict[str, object] = {}
+
+    def run_restore():
+        result_holder["result"] = restore_from_backup(db_path, backup_event.backup_path)
+
+    restore_thread = threading.Thread(target=run_restore)
+    restore_thread.start()
+    try:
+        # enquanto a "requisicao" mantiver a conexao aberta, a restauracao
+        # NUNCA deve chegar a tocar arquivos.
+        assert touched_files.wait(timeout=0.5) is False
+    finally:
+        reader_cm.__exit__(None, None, None)  # a "requisicao" termina, fecha a conexao
+
+    restore_thread.join(timeout=5)
+    assert not restore_thread.is_alive()
+
+    # so DEPOIS que a conexao fechou a restauracao prossegue e termina.
+    assert touched_files.wait(timeout=5) is True
+    assert result_holder["result"].success is True
+
+    restored = connect(db_path)
+    assert Repositories(restored).learners.get(learner.id) is not None
+    restored.close()
+
+
 def test_restore_reverts_cleanly_when_swap_target_had_active_wal(tmp_path: Path, monkeypatch):
     """Combina reversao (integrity_check falha apos a troca) com um WAL
     ativo no banco original - a reversao precisa devolver exatamente o

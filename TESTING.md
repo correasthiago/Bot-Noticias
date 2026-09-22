@@ -6,29 +6,39 @@
 python -m pytest -q
 ```
 
-Resultado atual: **128 testes**, 100% offline (nenhum teste faz chamada
+Resultado atual: **130 testes**, 100% offline (nenhum teste faz chamada
 de rede — `MockProvider` e usado em todos os cenarios que envolvem "IA",
 e `test_P11_offline_execution_fails_if_network_is_attempted` ativamente
 bloqueia qualquer tentativa de `socket.connect`/`create_connection`
 durante o ciclo completo, falhando o teste se algo tentar).
 
 **Resultado por sistema operacional (nao e universal - ver historico
-abaixo):**
+abaixo; NAO declare um numero como resultado valido para um SO que nao
+foi de fato executado nele):**
 
-- **Linux** (ambiente desta sessao): **128/128 passando**, tempo total
-  < 3s. Rodado 15 vezes consecutivas apos a correcao mais recente (e o
-  teste antes-flaky de P3, 30 vezes) sem nenhuma falha.
-- **Windows**: um usuario reportou **120/128 passando, 5 falhas**, todas
-  em `test_restore.py`, apos o commit `1133ded` (pacote v0.2.2) - causa
-  raiz identificada e corrigida (ver secao "Correcao pos-entrega: restore
-  quebrava no Windows" em `DECISIONS.md`). A correcao foi verificada por
-  raciocinio direto sobre o mecanismo e testada exaustivamente em Linux
-  (unico ambiente disponivel nesta sessao para executar testes), mas
-  **ainda nao foi reexecutada num Windows real** - isso depende do
-  usuario que reportou o bug rodar a suite de novo e confirmar. Ate essa
-  confirmacao chegar, NAO trate "128/128" como um resultado valido para
-  Windows - trate como "corrigido no codigo e validado em Linux,
-  pendente de confirmacao em Windows".
+- **Linux** (ambiente desta sessao): **130/130 passando**, tempo total
+  < 3.5s. Rodado 10 vezes consecutivas apos a correcao mais recente (e os
+  dois testes novos de concorrencia do portao, 20 vezes) sem nenhuma
+  falha.
+- **Windows**: um usuario reportou e CONFIRMOU, em duas rodadas:
+  1. Apos o commit `1133ded` (pacote v0.2.2): 120/128 passando, 5 falhas
+     em `test_restore.py` (`PermissionError: [WinError 5]`) - corrigido
+     no commit `961b5b8` (ver "Correcao pos-entrega: restore quebrava no
+     Windows" em DECISIONS.md).
+  2. Apos o commit `961b5b8`: **128/128 na suite completa e 10/10 em
+     `test_restore.py` isolado, CONFIRMADO em Windows real** pelo mesmo
+     usuario - o `WinError 5` original esta resolvido.
+  O mesmo usuario, ja em Windows, encontrou e reproduziu DOIS problemas
+  novos no portao de concorrencia (ver "Correcao pos-entrega: portao de
+  concorrencia do restore tinha duas janelas" em DECISIONS.md) - corrigidos
+  nesta revisao (130 testes, os dois novos exercitando exatamente os dois
+  problemas relatados). Esta correcao mais recente foi validada em Linux
+  (10 execucoes consecutivas, 20 dos dois testes novos), mas **ainda nao
+  foi reexecutada num Windows real** - isso depende do usuario confirmar
+  de novo. Ate essa confirmacao chegar, trate "130/130" como "corrigido
+  no codigo e validado em Linux, pendente de nova confirmacao em Windows"
+  para ESTA correcao especifica - nao como um resultado ja observado em
+  Windows.
 - **macOS**: nunca foi executado nesta ou em rodadas anteriores; sem
   dados. O mecanismo de `os.replace` deveria se comportar como Linux
   (semantica POSIX de `rename()`), mas isso e inferencia, nao um
@@ -50,7 +60,7 @@ abaixo):**
 | `test_orchestration.py` | ciclo completo via `SessionOrchestrator` com MockProvider; primeiro card FSRS nasce pelo fluxo NORMAL da aplicacao (banco novo, sem `is_planned_recall=True` setado no teste, so a sequencia real de chamadas ate o Decisor escolher SCHEDULE_RECALL, com relogio controlado via `now=`); atividade comum NAO chama FSRS; double-submit no nivel de orquestracao | 3 |
 | `test_integrity.py` | ciclo de pre-requisitos rejeitado na escrita (+ defesa por integrity_check contra bypass via SQL bruto), referencia pendurada, consistencia de geracao (multiplas geracoes 'active'), consistencia memory_state x memory_review_log | 6 |
 | `test_backup.py` | snapshot consistente e restauravel, falha de backup nao apaga estado, retencao mantem so os N mais recentes | 3 |
-| `test_restore.py` | restore real substitui e recupera o banco, snapshot invalido e rejeitado sem tocar no banco ativo, falha pos-troca reverte automaticamente, politica de backup automatico respeita intervalo minimo, WAL genuinamente ativo e achatado antes da troca, conexao concorrente detectada e recusada sem tocar em arquivos, reversao limpa com WAL ativo, NENHUMA conexao sqlite3 aberta no instante do `os.replace` (a causa raiz do bug relatado no Windows), o portao da aplicacao liga durante a operacao e sempre desliga depois, dupla falha (restauracao + reversao) nunca levanta excecao e preserva a copia de seguranca | 10 |
+| `test_restore.py` | restore real substitui e recupera o banco, snapshot invalido e rejeitado sem tocar no banco ativo, falha pos-troca reverte automaticamente, politica de backup automatico respeita intervalo minimo, WAL genuinamente ativo e achatado antes da troca, conexao concorrente detectada e recusada sem tocar em arquivos, reversao limpa com WAL ativo, NENHUMA conexao sqlite3 aberta no instante do `os.replace` (a causa raiz do bug relatado no Windows), o portao da aplicacao liga durante a operacao e sempre desliga depois, dupla falha (restauracao + reversao) nunca levanta excecao e preserva a copia de seguranca, uma SEGUNDA restauracao concorrente e rejeitada na hora (threads reais), uma requisicao com conexao ja aberta impede a restauracao de tocar arquivos ate fechar | 12 |
 | `test_seed_english_graph.py` | seed idempotente, sem ciclos, todas as referencias validas | 3 |
 | `test_web.py` | fluxo HTTP completo (start -> next -> answer -> next -> end), paginas de mapa/auditoria, backup manual via UI, falha de restore mostrada ao usuario na pagina de auditoria, requisicao HTTP recebe 503 se chegar enquanto uma restauracao esta em andamento | 5 |
 | `test_redteam.py` | **P1-P11**, um teste por item do pacote de correcao v0.2 (ver abaixo) | 11 |
@@ -143,6 +153,31 @@ para a decisao completa.
 | 1 | Nenhuma conexao sqlite3 deste processo aberta no instante exato do `os.replace` (a causa raiz do bug no Windows) | `test_restore.py::test_restore_holds_no_sqlite_connection_open_across_os_replace` |
 | 2 | Pausa de requisicoes no nivel da aplicacao durante toda a janela de restauracao, com retomada garantida | `test_restore.py::test_restore_pauses_the_application_gate_and_always_resumes_it`, `test_web.py::test_restore_rejects_new_requests_while_in_progress` |
 | 3 | Falha na propria reversao nunca levanta excecao; banco original preservado com resultado legivel | `test_restore.py::test_restore_never_raises_when_revert_itself_also_fails` |
+
+Confirmado pelo usuario em Windows real apos esta correcao: 128/128
+(suite completa) e 10/10 (`test_restore.py` isolado).
+
+## Correcao pos-entrega: portao de concorrencia do restore tinha duas janelas
+
+Ja em Windows, o mesmo usuario encontrou e REPRODUZIU dois problemas
+novos no portao introduzido pela correcao acima: (1) duas restauracoes
+disparadas ao mesmo tempo podiam ambas "entrar", e quando a primeira
+terminava, desligava o portao mesmo com a segunda ainda em andamento;
+(2) havia uma janela em `get_conn()` entre consultar o portao e abrir a
+conexao, onde uma restauracao podia comecar no meio. Ver secao "Correcao
+pos-entrega: portao de concorrencia do restore tinha duas janelas" em
+`DECISIONS.md` para a decisao completa (coordenacao leitor/escritor com
+`threading.Condition`).
+
+| # | Requisito | Teste principal |
+|---|---|---|
+| 1 | Uma segunda restauracao disparada enquanto a primeira ainda esta em andamento e rejeitada na hora, nunca "entra" junto | `test_restore.py::test_restore_rejects_a_concurrent_second_restore_attempt` |
+| 2 | Uma requisicao que ja passou pela checagem do portao (conexao aberta) impede a restauracao de tocar arquivos ate ela terminar | `test_restore.py::test_restore_waits_for_an_in_flight_request_before_touching_files` |
+
+Ambos os testes usam threads reais e sincronizacao deterministica
+(`threading.Event`, nunca `sleep`) - rodados 20 vezes consecutivas em
+Linux sem falha. Validacao em Windows ainda pendente (ver "Como rodar"
+acima).
 
 ## O que NAO esta coberto (limitacoes de teste, nao so de produto)
 
