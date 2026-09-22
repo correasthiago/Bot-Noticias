@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% block title %}Auditoria{% endblock %}
+{% block content %}
+<h1>Auditoria</h1>
+
+<h3>Integridade</h3>
+{% if report.ok %}
+  <p class="ok">Nenhum problema de integridade encontrado ({{ report.findings|length }} achado(s) de aviso, se houver).</p>
+{% else %}
+  <p class="error">{{ report.findings|length }} problema(s) de integridade encontrado(s).</p>
+{% endif %}
+<table>
+  <tr><th>Verificacao</th><th>Severidade</th><th>Mensagem</th></tr>
+  {% for f in report.findings %}
+  <tr>
+    <td>{{ f.check }}</td>
+    <td class="{{ 'error' if f.severity == 'error' else '' }}">{{ f.severity }}</td>
+    <td>{{ f.message }}</td>
+  </tr>
+  {% endfor %}
+</table>
+
+<h3>Backups</h3>
+<form method="post" action="/audit/backup">
+  <button type="submit">Fazer backup agora</button>
+</form>
+<table>
+  <tr><th>Quando</th><th>Sucesso</th><th>Tamanho</th><th>Caminho</th></tr>
+  {% for b in backups %}
+  <tr>
+    <td>{{ b.started_at }}</td>
+    <td>{{ "sim" if b.success else "nao" }}</td>
+    <td>{{ b.size_bytes }}</td>
+    <td>{{ b.backup_path }}</td>
+  </tr>
+  {% endfor %}
+</table>
+
+<h3>Versoes de regras</h3>
+<table>
+  <tr><th>Versao</th><th>Descricao</th><th>Ativa</th><th>Criada em</th></tr>
+  {% for rv in rule_versions %}
+  <tr><td>{{ rv.version }}</td><td>{{ rv.description }}</td><td>{{ "sim" if rv.active else "nao" }}</td><td>{{ rv.created_at }}</td></tr>
+  {% endfor %}
+</table>
+
+<h3>Decisoes recentes</h3>
+<table>
+  <tr><th>Quando</th><th>Roteamento</th><th>Acao</th><th>Regra</th><th>Justificativa</th></tr>
+  {% for d in decisions %}
+  <tr>
+    <td>{{ d.created_at }}</td>
+    <td class="routing-{{ d.routing }}">{{ d.routing }}</td>
+    <td>{{ d.decision_type or '-' }}</td>
+    <td>{{ d.rule_applied }}</td>
+    <td>{{ d.justification }}</td>
+  </tr>
+  {% endfor %}
+</table>
+
+<h3>Chamadas a fornecedores de IA</h3>
+<table>
+  <tr><th>Quando</th><th>Fornecedor</th><th>Modelo</th><th>Funcao</th><th>Sucesso</th><th>Latencia (ms)</th><th>Erro</th></tr>
+  {% for p in provider_events %}
+  <tr>
+    <td>{{ p.occurred_at }}</td>
+    <td>{{ p.provider_name }}</td>
+    <td>{{ p.model }}</td>
+    <td>{{ p.function.value }}</td>
+    <td>{{ "sim" if p.success else "nao" }}</td>
+    <td>{{ "%.2f"|format(p.latency_ms) if p.latency_ms is not none else '-' }}</td>
+    <td>{{ p.error_message or '-' }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endblock %}

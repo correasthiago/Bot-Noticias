@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+{% block title %}Sessao{% endblock %}
+{% block content %}
+<h1>Sessao {{ session.id[:8] }} ({{ session.status.value }})</h1>
+
+{% if not activity %}
+  <p>Nenhuma atividade ainda.</p>
+  <form method="post" action="/session/{{ session.id }}/next">
+    <button type="submit">Buscar proxima atividade</button>
+  </form>
+{% else %}
+  <div class="card">
+    <p><strong>Competencia:</strong> {{ competency.name if competency else "-" }}</p>
+    <p><strong>Tipo de atividade:</strong> {{ activity.activity_type }}</p>
+    <p><strong>Suporte permitido:</strong> {{ activity.support_level.value }}</p>
+    <p><strong>Atividade:</strong> {{ activity.prompt }}</p>
+  </div>
+
+  {% if not interaction %}
+    <form method="post" action="/session/{{ session.id }}/answer">
+      <input type="hidden" name="activity_id" value="{{ activity.id }}">
+      <input type="hidden" name="idempotency_key" value="{{ activity.id }}">
+      <label>Sua resposta:
+        <textarea name="learner_input" rows="3" required></textarea>
+      </label>
+      <label>Nivel de ajuda usado:
+        <select name="help_level">
+          {% for level in help_levels %}
+            <option value="{{ level.value }}">{{ level.value }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>Resultado da producao:
+        <select name="production_result">
+          {% for result in production_results %}
+            <option value="{{ result.value }}">{{ result.value }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <button type="submit">Enviar resposta</button>
+    </form>
+  {% else %}
+    <div class="card">
+      <p><strong>Sua resposta:</strong> {{ interaction.learner_input }}</p>
+      <p><strong>Ajuda:</strong> {{ interaction.help_level.value }} &middot;
+         <strong>Resultado:</strong> {{ interaction.production_result.value }}</p>
+    </div>
+
+    {% if dimension_states %}
+    <h3>Estado atual da competencia</h3>
+    <table>
+      <tr><th>Dimensao</th><th>Estado</th><th>Possivel regressao</th></tr>
+      {% for dimension, state in dimension_states.items() %}
+      <tr>
+        <td>{{ dimension.value }}</td>
+        <td class="state-{{ state.state.value }}">{{ state.state.value }}</td>
+        <td>{% if state.possible_regression %}<span class="flag">sim</span>{% else %}nao{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% endif %}
+
+    {% if recent_decisions %}
+    <h3>Decisoes recentes</h3>
+    <ul>
+      {% for d in recent_decisions %}
+      <li><span class="routing-{{ d.routing }}">{{ d.routing }}</span>
+          {% if d.decision_type %} / {{ d.decision_type }}{% endif %}
+          - {{ d.justification }}</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+
+    <form method="post" action="/session/{{ session.id }}/next">
+      <button type="submit">Proxima atividade</button>
+    </form>
+  {% endif %}
+{% endif %}
+
+<form method="post" action="/session/{{ session.id }}/end">
+  <button type="submit">Encerrar sessao</button>
+</form>
+{% endblock %}

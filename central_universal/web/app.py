@@ -1,0 +1,249 @@
+"""Interface web local minima (Secao 28). Funcional, nao bonita.
+
+Server-rendered com Jinja2 + forms HTML simples. Sem framework JS: o
+objetivo da V0 e provar o motor, nao a experiencia de usuario.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+from fastapi import Depends, FastAPI, Form, Request
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+
+from central_universal.decision.service import DecisionService
+from central_universal.domain.enums import ALL_DIMENSIONS, HelpLevel, ProductionResult
+from central_universal.domain.entities import RuleVersion
+from central_universal.integrity.checks import run_all as run_integrity_checks
+from central_universal.memory.fsrs_adapter import MemoryAdapter
+from central_universal.orchestration.session_service import SessionOrchestrator
+from central_universal.persistence.backup import create_backup, list_backups
+from central_universal.persistence.repositories import Repositories
+from central_universal.providers.base import Provider
+from central_universal.web.bootstrap import ensure_bootstrapped
+from central_universal.web.deps import DB_PATH, get_active_rule_version, get_conn, get_provider, get_repos
+
+BASE_DIR = Path(__file__).resolve().parent
+templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    ensure_bootstrapped(DB_PATH)
+    yield
+
+
+app = FastAPI(title="Central Universal de Aprendizagem - V0.1", lifespan=_lifespan)
+app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
+
+
+def _orchestrator(repos: Repositories, provider: Provider, rule_version: RuleVersion) -> SessionOrchestrator:
+    return SessionOrchestrator(repos, provider, rule_version)
+
+
+@app.get("/")
+def index(request: Request, repos: Repositories = Depends(get_repos)):
+    learner = repos.learners.list_all()[0]
+    decision_service = DecisionService(repos)
+    memory_adapter = MemoryAdapter(repos)
+
+    pending = {"STUDY": 0, "VALIDATE": 0, "SKIP": 0}
+    due_recalls = 0
+    for competency in repos.competencies.list_all():
+        recall_due = memory_adapter.is_recall_due(competency.id)
+        if recall_due:
+            due_recalls += 1
+        routing = decision_service.preview_routing(competency.id, memory_recall_due=recall_due)
+        pending[routing.routing.value] += 1
+
+    open_sessions = [s for s in repos.sessions.list_for_learner(learner.id) if s.status.value == "active"]
+
+    return templates.TemplateResponse(
+        request,
+        "index.html",
+        {
+            "learner": learner,
+            "pending": pending,
+            "due_recalls": due_recalls,
+            "total_competencies": len(repos.competencies.list_all()),
+            "open_session": open_sessions[0] if open_sessions else None,
+        },
+    )
+
+
+@app.post("/session/start")
+def session_start(
+    repos: Repositories = Depends(get_repos),
+    provider: Provider = Depends(get_provider),
+    rule_version: RuleVersion = Depends(get_active_rule_version),
+):
+    learner = repos.learners.list_all()[0]
+    orchestrator = _orchestrator(repos, provider, rule_version)
+    session = orchestrator.start_session(learner.id)
+    return RedirectResponse(f"/session/{session.id}", status_code=303)
+
+
+@app.get("/session/{session_id}")
+def session_view(
+    request: Request,
+    session_id: str,
+    repos: Repositories = Depends(get_repos),
+):
+    session = repos.sessions.get(session_id)
+    if session is None:
+        return RedirectResponse("/", status_code=303)
+
+    activities = repos.activities.list_for_session(session_id)
+    current_activity = None
+    interaction = None
+    if activities:
+        current_activity = activities[-1]
+        interactions = repos.raw_interactions.list_by_cluster(current_activity.id)
+        interaction = interactions[-1] if interactions else None
+
+    competency = None
+    dimension_states = {}
+    recent_decisions = []
+    if current_activity and current_activity.competency_targets:
+        target_id = current_activity.competency_targets[0]
+        competency = repos.competencies.get(target_id)
+        dimension_states = repos.competency_states.current_all_dimensions(target_id)
+        recent_decisions = repos.decision_events.list_for_competency(target_id)[-3:]
+
+    return templates.TemplateResponse(
+        request,
+        "session.html",
+        {
+            "session": session,
+            "activity": current_activity,
+            "interaction": interaction,
+            "competency": competency,
+            "dimension_states": dimension_states,
+            "recent_decisions": recent_decisions,
+            "help_levels": list(HelpLevel),
+            "production_results": list(ProductionResult),
+        },
+    )
+
+
+@app.post("/session/{session_id}/next")
+def session_next(
+    session_id: str,
+    repos: Repositories = Depends(get_repos),
+    provider: Provider = Depends(get_provider),
+    rule_version: RuleVersion = Depends(get_active_rule_version),
+):
+    session = repos.sessions.get(session_id)
+    if session is None:
+        return RedirectResponse("/", status_code=303)
+
+    orchestrator = _orchestrator(repos, provider, rule_version)
+    focus = orchestrator.choose_focus_competency(session.learner_id)
+    if focus is not None:
+        competency_id, _routing, action = focus
+        orchestrator.start_activity(session_id=session_id, competency_id=competency_id, action=action)
+    return RedirectResponse(f"/session/{session_id}", status_code=303)
+
+
+@app.post("/session/{session_id}/answer")
+def session_answer(
+    session_id: str,
+    activity_id: str = Form(...),
+    learner_input: str = Form(...),
+    help_level: str = Form(...),
+    production_result: str = Form(...),
+    idempotency_key: str = Form(...),
+    repos: Repositories = Depends(get_repos),
+    provider: Provider = Depends(get_provider),
+    rule_version: RuleVersion = Depends(get_active_rule_version),
+):
+    orchestrator = _orchestrator(repos, provider, rule_version)
+    activity = repos.activities.get(activity_id)
+    orchestrator.submit_interaction(
+        activity_id=activity_id,
+        session_id=session_id,
+        idempotency_key=idempotency_key,
+        learner_input=learner_input,
+        help_level=HelpLevel(help_level),
+        production_result=ProductionResult(production_result),
+        tutor_output_text=activity.prompt if activity else "",
+    )
+    return RedirectResponse(f"/session/{session_id}", status_code=303)
+
+
+@app.post("/session/{session_id}/end")
+def session_end(
+    session_id: str,
+    repos: Repositories = Depends(get_repos),
+    provider: Provider = Depends(get_provider),
+    rule_version: RuleVersion = Depends(get_active_rule_version),
+):
+    orchestrator = _orchestrator(repos, provider, rule_version)
+    orchestrator.end_session(session_id)
+    return RedirectResponse("/", status_code=303)
+
+
+@app.get("/map")
+def competency_map(request: Request, repos: Repositories = Depends(get_repos)):
+    rows = []
+    for competency in repos.competencies.list_all():
+        states = repos.competency_states.current_all_dimensions(competency.id)
+        rows.append({"competency": competency, "states": states})
+    return templates.TemplateResponse(
+        request, "map.html", {"rows": rows, "dimensions": ALL_DIMENSIONS}
+    )
+
+
+@app.get("/competency/{competency_id}")
+def competency_detail(request: Request, competency_id: str, repos: Repositories = Depends(get_repos)):
+    competency = repos.competencies.get(competency_id)
+    states = repos.competency_states.current_all_dimensions(competency_id)
+    memory_state = repos.memory_states.get(competency_id)
+
+    evidence_rows = []
+    for dimension in ALL_DIMENSIONS:
+        events = repos.evidence_events.list_for_competency(competency_id, dimension)
+        for event in events:
+            assessments = repos.evidence_assessments.get_for_evidence_event(event.id)
+            evidence_rows.append({"event": event, "assessments": assessments})
+
+    return templates.TemplateResponse(
+        request,
+        "competency.html",
+        {
+            "competency": competency,
+            "states": states,
+            "dimensions": ALL_DIMENSIONS,
+            "memory_state": memory_state,
+            "evidence_rows": evidence_rows,
+        },
+    )
+
+
+@app.get("/audit")
+def audit(request: Request, repos: Repositories = Depends(get_repos)):
+    report = run_integrity_checks(repos)
+    return templates.TemplateResponse(
+        request,
+        "audit.html",
+        {
+            "decisions": repos.decision_events.list_recent(50),
+            "provider_events": repos.provider_events.list_recent(50),
+            "rule_versions": repos.rule_versions.list_all(),
+            "report": report,
+            "backups": list_backups(repos),
+        },
+    )
+
+
+@app.post("/audit/backup")
+def audit_backup(
+    conn: sqlite3.Connection = Depends(get_conn),
+    repos: Repositories = Depends(get_repos),
+):
+    create_backup(conn, repos)
+    return RedirectResponse("/audit", status_code=303)

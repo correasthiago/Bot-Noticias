@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8">
+  <title>{% block title %}Central Universal de Aprendizagem{% endblock %}</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <nav>
+    <a href="/">Inicio</a>
+    <a href="/map">Mapa</a>
+    <a href="/audit">Auditoria</a>
+  </nav>
+  <hr>
+  {% block content %}{% endblock %}
+  <footer>Central Universal de Aprendizagem - V0.1 (local, MockProvider por padrao)</footer>
+</body>
+</html>

@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}Central Universal - Inicio{% endblock %}
+{% block content %}
+<h1>Ola, {{ learner.display_name }}</h1>
+
+<div class="card">
+  <p><strong>{{ total_competencies }}</strong> competencias no grafo.</p>
+  <p>
+    <span class="routing-STUDY">STUDY: {{ pending.STUDY }}</span> &middot;
+    <span class="routing-VALIDATE">VALIDATE: {{ pending.VALIDATE }}</span> &middot;
+    <span class="routing-SKIP">SKIP: {{ pending.SKIP }}</span>
+  </p>
+  <p>{{ due_recalls }} competencia(s) com recuperacao espacada agendada agora.</p>
+</div>
+
+{% if open_session %}
+  <p>Voce tem uma sessao em andamento.</p>
+  <p><a href="/session/{{ open_session.id }}">Continuar sessao</a></p>
+{% else %}
+  <form method="post" action="/session/start">
+    <button type="submit">Comecar sessao</button>
+  </form>
+{% endif %}
+{% endblock %}

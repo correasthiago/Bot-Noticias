@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}{{ competency.name }}{% endblock %}
+{% block content %}
+<h1>{{ competency.name }} <small>({{ competency.code }})</small></h1>
+<p>{{ competency.description }}</p>
+
+<h3>Estado por dimensao</h3>
+<table>
+  <tr><th>Dimensao</th><th>Estado</th><th>Regressao</th><th>Contradicao</th><th>Explicacao</th></tr>
+  {% for dim in dimensions %}
+    {% set state = states.get(dim) %}
+    <tr>
+      <td>{{ dim.value }}</td>
+      <td class="state-{{ state.state.value if state else 'not_assessed' }}">{{ state.state.value if state else 'not_assessed' }}</td>
+      <td>{% if state and state.possible_regression %}<span class="flag">sim</span>{% else %}nao{% endif %}</td>
+      <td>{% if state and state.has_unresolved_contradiction %}<span class="flag">sim</span>{% else %}nao{% endif %}</td>
+      <td>{{ state.explanation if state else '-' }}</td>
+    </tr>
+  {% endfor %}
+</table>
+
+<h3>Memoria / proximas revisoes (FSRS)</h3>
+{% if memory_state %}
+  <p>Estado do card: {{ memory_state.card_state }} &middot; Proxima recuperacao agendada: {{ memory_state.due_at }}</p>
+  <p>Estabilidade: {{ memory_state.stability }} &middot; Dificuldade: {{ memory_state.difficulty }}</p>
+{% else %}
+  <p>Ainda sem agendamento de memoria para esta competencia.</p>
+{% endif %}
+
+<h3>Evidencias</h3>
+<table>
+  <tr><th>Quando</th><th>Dimensao</th><th>Tipo</th><th>Relacao</th><th>Ajuda</th><th>Avaliacoes</th></tr>
+  {% for row in evidence_rows %}
+  <tr>
+    <td>{{ row.event.created_at }}</td>
+    <td>{{ row.event.dimension.value }}</td>
+    <td>{{ row.event.evidence_type.value }}</td>
+    <td>{{ row.event.relation.value }}</td>
+    <td>{{ row.event.help_level.value }}</td>
+    <td>
+      {% for a in row.assessments %}
+        <div>{{ a.classification.value }} (conf. {{ "%.2f"|format(a.confidence) }}) - {{ a.justification }}</div>
+      {% endfor %}
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+{% endblock %}
