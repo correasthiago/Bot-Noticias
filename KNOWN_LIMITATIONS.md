@@ -93,29 +93,38 @@ da V0, nao de principio.
   processos reais, so logicamente.
 - **Concorrencia real nao foi testada com processos separados do SO.**
   SQLite em WAL suporta um escritor por vez; para um unico usuario local
-  isso nunca e um problema. Desde v0.2.1, `restore_from_backup` DETECTA
-  uma conexao concorrente (recusando prosseguir se nao conseguir sair do
-  modo WAL com exclusividade); desde v0.2.2, a guarda (`BEGIN EXCLUSIVE`
-  mantido aberto) protege a janela INTEIRA de copia/troca, nao so o
-  instante da checagem (ver DECISIONS.md #5/Pacote v0.2.2 #3) - mas isso
-  ainda e testado com uma segunda `sqlite3.Connection` no MESMO
-  processo/thread do teste, nao um processo do SO realmente separado. O
-  timeout de espera pela exclusividade (`_LOCK_TIMEOUT_SECONDS = 5.0` em
-  `persistence/restore.py`) e um numero arbitrario, nao calibrado contra
-  nenhuma carga real.
-- **A guarda de exclusividade do restore e liberada ANTES da verificacao
-  pos-troca (migrations/integrity_check), nao durante ela (v0.2.2).**
-  Depois do `os.replace`, `_release_guard` libera o lock (preso ao
-  arquivo ANTERIOR, ja substituido) e SO ENTAO uma conexao nova e aberta
-  para rodar `run_migrations`/`integrity_check` - ha uma janela residual,
-  pequena (poucas linhas de Python, sem I/O de disco no meio) mas real,
-  em que uma conexao de terceiros poderia escrever no arquivo
-  recem-restaurado antes da verificacao terminar. Fechar essa janela por
-  completo exigiria reusar a MESMA conexao/lock para todo o restante do
-  fluxo, o que colide com `run_migrations` gerenciar suas proprias
-  transacoes (`BEGIN IMMEDIATE`/`COMMIT` por migration, desde a correcao
-  do ponto 4) - nao ha como aninhar duas transacoes na mesma conexao. Sem
-  cobertura de teste dedicada (ver TESTING.md).
+  isso nunca e um problema. `restore_from_backup` DETECTA uma conexao
+  concorrente ANTES de cada troca (recusando prosseguir se nao conseguir
+  sair do modo WAL com exclusividade), mas isso e testado com uma segunda
+  `sqlite3.Connection` no MESMO processo/thread do teste, nao um processo
+  do SO realmente separado. O timeout de espera pela exclusividade
+  (`_LOCK_TIMEOUT_SECONDS = 5.0` em `persistence/restore.py`) e um numero
+  arbitrario, nao calibrado contra nenhuma carga real.
+- **A protecao do restore contra escritores concorrentes mudou de "lock
+  do SQLite mantido durante a troca" para "portao em memoria + checagem
+  best-effort", especificamente porque a primeira quebrava no Windows -
+  a garantia contra conexoes verdadeiramente EXTERNAS ficou mais fraca.**
+  Uma correcao anterior mantinha uma conexao SQLite presa (`BEGIN
+  EXCLUSIVE`) durante toda a copia/troca de arquivo, bloqueando qualquer
+  escritor concorrente de verdade - mas um usuario reportou que isso
+  fazia `os.replace` falhar no Windows com `PermissionError: [WinError
+  5]` (o Windows recusa substituir um arquivo que qualquer processo,
+  inclusive o proprio, ainda tem aberto). A correcao trocou essa garantia
+  por duas camadas portateis: um portao em memoria
+  (`is_restore_in_progress()`), que bloqueia (503) qualquer requisicao
+  NOVA que passe por `web/deps.py:get_conn` durante toda a janela da
+  restauracao, e uma checagem de exclusividade no banco ANTES de cada
+  troca, mas sempre fechada imediatamente - nunca mais mantida presa
+  durante o `os.replace` em si. Isso significa que uma conexao
+  verdadeiramente EXTERNA (um script Python tocando o arquivo
+  diretamente, nao roteado pela aplicacao web) que abra bem no meio da
+  janela entre a checagem e a troca NAO e mais bloqueada por um lock do
+  SQLite - so o portao em memoria (que so cobre a propria aplicacao)
+  continua protegendo essa janela. Ver DECISIONS.md ("Correcao
+  pos-entrega: restore quebrava no Windows") para a decisao completa e
+  TESTING.md para o resultado por sistema operacional (a correcao foi
+  validada em Linux; a confirmacao em Windows depende do usuario que
+  reportou o bug original rodar a suite de novo).
 - **Sem autenticacao/autorizacao.** A V0 assume fisicamente um unico
   computador de um unico usuario (Secao 1). Nao ha login, nao ha
   isolamento entre "learners" alem de uma FK — se o escopo mudar para
@@ -184,6 +193,19 @@ parcialmente.
 
 ## Riscos tecnicos observados durante a implementacao
 
+- **A suite foi desenvolvida e rodada quase inteiramente em Linux; uma
+  premissa de arquivo POSIX (que `rename()`/`os.replace` nao se importa
+  com quem tem o arquivo de destino aberto) se infiltrou no codigo de
+  restore e so foi descoberta quando um usuario rodou a suite no
+  Windows.** `os.replace`/`MoveFileEx` no Windows recusa substituir um
+  arquivo aberto por qualquer processo - uma diferenca de plataforma que
+  nao aparece em NENHUM teste rodado em Linux/macOS, porque la o
+  comportamento e permissivo. Corrigido (ver DECISIONS.md, "Correcao
+  pos-entrega: restore quebrava no Windows"), mas e um lembrete de que
+  "passa na CI" (quando a CI e so Linux) nao e o mesmo que "funciona em
+  todo SO suportado" - qualquer codigo futuro que manipule arquivos
+  diretamente (nao so via SQLite) precisa considerar essa diferenca
+  deliberadamente, nao supor semantica POSIX por default.
 - **Divergencia rapida de versoes de dependencias PyPI.** A versao mais
   recente de `fastapi`/`starlette` no momento da implementacao tinha um
   bug de regressao afetando `TemplateResponse` com contexto contendo

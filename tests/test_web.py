@@ -105,3 +105,53 @@ def test_restore_failure_is_shown_to_the_user(tmp_path, monkeypatch):
         assert audit_page.status_code == 200
         assert "Restauracao" in audit_page.text
         assert 'class="error"' in audit_page.text
+
+
+def test_restore_rejects_new_requests_while_in_progress(tmp_path, monkeypatch):
+    """Quarta auditoria pos-entrega, Secao 3: 'coordene a pausa de
+    requisicoes no nivel da aplicacao'. Uma requisicao HTTP que chega
+    ENQUANTO a restauracao esta em andamento precisa ser recusada (503) -
+    a protecao portatil (funciona em Windows) que substitui manter uma
+    conexao SQLite presa durante a troca de arquivo (que quebrava com
+    `PermissionError: [WinError 5]` no Windows)."""
+
+    with _fresh_client(tmp_path, monkeypatch) as client:
+        client.get("/audit")  # garante que o app ja fez bootstrap do banco
+
+        import central_universal.persistence.backup as backup_module
+        import central_universal.persistence.restore as restore_module
+        import central_universal.web.deps as deps_module
+        from central_universal.persistence.repositories import Repositories
+
+        conn = deps_module.connect(deps_module.DB_PATH)
+        repos = Repositories(conn)
+        backup_event = backup_module.create_backup(conn, repos, backup_dir=tmp_path / "backups")
+        assert backup_event.success is True
+        conn.close()
+
+        observed: dict[str, object] = {}
+        real_copy2 = restore_module.shutil.copy2
+        staging_path = deps_module.DB_PATH.with_name(deps_module.DB_PATH.name + ".restoring")
+
+        def spy_copy2(src, dst, *args, **kwargs):
+            if str(dst) == str(staging_path) and "checked" not in observed:
+                observed["checked"] = True
+                mid_flight = client.get("/audit")
+                observed["mid_flight_status"] = mid_flight.status_code
+            return real_copy2(src, dst, *args, **kwargs)
+
+        monkeypatch.setattr(restore_module.shutil, "copy2", spy_copy2)
+
+        restore_resp = client.post(
+            "/audit/restore",
+            data={"backup_path": backup_event.backup_path},
+            follow_redirects=False,
+        )
+        assert restore_resp.status_code == 303
+
+        assert observed.get("checked") is True
+        assert observed.get("mid_flight_status") == 503
+
+        # depois da restauracao, o portao foi desligado e requisicoes voltam ao normal
+        after = client.get("/audit")
+        assert after.status_code == 200

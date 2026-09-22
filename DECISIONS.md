@@ -759,3 +759,84 @@ tentar gravar, forcando o INSERT de bookkeeping (a ULTIMA instrucao do
 script) a violar a PRIMARY KEY - confirma que nem a tabela nem os dados
 que a migration sintetica criou sobrevivem ao ROLLBACK, e que o registro
 de bookkeeping original permanece unico e intocado.
+
+---
+
+## Correcao pos-entrega: restore quebrava no Windows (quarta auditoria)
+
+Um usuario rodou a suite no Windows apos o commit que fechou a v0.2.2 e
+reportou 5 falhas, todas em `test_restore.py` - reproduzidas de forma
+isolada rodando so aquele arquivo. A causa raiz: `_acquire_exclusive_guard`
+mantinha uma conexao SQLite aberta com `BEGIN EXCLUSIVE` durante todo o
+`os.replace` (o mecanismo introduzido no pacote v0.2.2, ponto 3, para
+bloquear escritores concorrentes durante a troca de arquivo). Isso e
+correto no Linux/macOS (`rename()` nao se importa com quem tem o arquivo
+aberto), mas no Windows `os.replace`/`MoveFileEx` RECUSA substituir um
+arquivo que qualquer processo - inclusive o proprio - ainda tem aberto,
+levantando `PermissionError: [WinError 5]`. O caminho de reversao tinha o
+mesmo problema (tentava outro `os.replace` com uma guarda de reversao
+tambem aberta).
+
+**Decisao:** a protecao contra escritores concorrentes deixou de depender
+de manter uma conexao SQLite presa durante a troca - passou a ter duas
+camadas PORTATEIS entre sistemas operacionais:
+
+1. Um portao em memoria (`persistence.restore._pause_for_restore` /
+   `is_restore_in_progress()`), ligado do inicio ao fim de TODA a
+   operacao de restauracao (checagem, troca, verificacao e, se
+   necessario, reversao). `web/deps.py:get_conn` - o unico ponto por
+   onde QUALQUER requisicao HTTP abre uma conexao - consulta esse portao
+   e recusa com HTTP 503 se estiver ligado, em vez de arriscar
+   ler/escrever um banco no meio de uma troca de arquivo. Isso substitui
+   "segurar um lock do SQLite" por "coordenar no nivel da aplicacao", que
+   funciona identicamente em qualquer SO porque nao depende de nenhum
+   comportamento de arquivo especifico de plataforma.
+2. `_check_exclusive` (renomeada de `_acquire_exclusive_guard`) continua
+   confirmando exclusividade no banco (achatando o WAL, saindo do modo
+   WAL) ANTES de cada troca - mas agora SEMPRE fecha a propria conexao de
+   sondagem imediatamente, nunca a mantem presa durante a copia/`os.replace`
+   que vem a seguir. Isso significa que, no exato instante em que
+   `os.replace` e chamado, nenhuma conexao sqlite3 deste processo esta
+   aberta em `db_path` - condicao necessaria em qualquer SO, e
+   suficiente no Windows.
+
+**Tratamento de falha ficou mais defensivo:** `_revert_to_safety_copy`
+agora captura qualquer excecao da PROPRIA reversao (nunca deixa
+propagar) e devolve uma mensagem descritiva em vez de derrubar o
+processo; a copia de seguranca (`*.pre-restore-*`) so e apagada quando a
+reversao realmente terminou com sucesso - se a reversao tambem falhar,
+ela permanece no disco para recuperacao manual, e o `RestoreResult`
+descreve as DUAS falhas (a original e a da reversao).
+
+*Efeito colateral aceito, documentado:* a checagem de exclusividade
+antes da troca continua sendo best-effort contra uma conexao TRULY
+externa que abra bem no meio da janela entre a checagem e o
+`os.replace` - o portao em memoria so protege requisicoes que passam
+pela PROPRIA aplicacao (`get_conn`), nao um processo de terceiros
+tocando o arquivo diretamente. Isso e uma troca deliberada: a garantia
+mais forte da revisao anterior (lock do SQLite mantido durante toda a
+troca) e exatamente o que quebrava no Windows; a garantia atual e mais
+fraca contra terceiros externos mas funciona nos dois sistemas
+operacionais, o que e o requisito real (ver KNOWN_LIMITATIONS.md).
+
+Testado em `test_restore.py::test_restore_holds_no_sqlite_connection_open_across_os_replace`
+(intercepta `os.replace` e confirma, via uma sondagem `BEGIN
+EXCLUSIVE`/`ROLLBACK` descartavel, que nenhuma conexao deste processo
+esta presa no arquivo naquele instante exato - a mesma condicao que
+falha no Windows se violada),
+`test_restore_pauses_the_application_gate_and_always_resumes_it` (o
+portao liga durante a operacao e sempre desliga depois, inclusive apos
+sucesso), `test_restore_never_raises_when_revert_itself_also_fails`
+(dupla falha - restauracao E reversao - nunca levanta excecao, preserva
+a copia de seguranca no disco) e
+`test_web.py::test_restore_rejects_new_requests_while_in_progress`
+(uma requisicao HTTP real, disparada de DENTRO da janela de copia via um
+spy em `shutil.copy2`, recebe 503).
+
+**Limite honesto desta correcao:** os testes acima foram escritos e
+executados em Linux (o unico ambiente disponivel nesta sessao) - eles
+prova, por raciocinio direto sobre o mecanismo (nenhuma conexao aberta no
+instante do `os.replace`), que a causa raiz relatada no Windows deixou de
+existir, mas NAO substituem rodar a suite de verdade num Windows real. O
+usuario que reportou o bug e quem tem esse ambiente; a validacao final em
+Windows depende dele confirmar.

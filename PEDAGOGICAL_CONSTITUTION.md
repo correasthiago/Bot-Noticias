@@ -276,12 +276,32 @@ reforcos que essa auditoria tornou explicitos.
 
 31. **Uma janela de exclusividade protege a operacao INTEIRA, do inicio
     da checagem ate o fim de cada caminho possivel - nao so o instante em
-    que a exclusividade foi confirmada.**
-    A guarda de restauracao (`_acquire_exclusive_guard`) mantem o lock
-    aberto durante toda a copia/troca (e, best-effort, durante a
-    reversao) - uma conexao aberta DEPOIS da checagem mas ANTES da troca
-    tambem e bloqueada se tentar escrever
-    (`test_restore_blocks_a_connection_opened_after_the_check_and_before_the_swap`).
+    que a exclusividade foi confirmada - e essa protecao precisa
+    funcionar em qualquer sistema operacional, nao so no que foi testado
+    primeiro.**
+    Uma correcao inicial (v0.2.2) protegia a restauracao mantendo uma
+    conexao SQLite presa com `BEGIN EXCLUSIVE` durante toda a copia/troca
+    de arquivo - funcionava no Linux/macOS, mas quebrava no Windows
+    (`os.replace` recusa substituir um arquivo que qualquer processo,
+    inclusive o proprio, ainda tem aberto - `PermissionError: [WinError
+    5]`, reportado por um usuario rodando a suite em Windows). A protecao
+    correta e PORTATIL: um portao em memoria
+    (`persistence.restore.is_restore_in_progress`) coordena a pausa no
+    NIVEL DA APLICACAO durante toda a janela (troca ou reversao) - a
+    unica porta de entrada de conexoes da camada web (`web/deps.py:get_conn`)
+    recusa (503) qualquer requisicao nova enquanto ele estiver ligado -
+    combinada com uma checagem de exclusividade no proprio banco ANTES de
+    cada troca, mas SEMPRE fechada imediatamente, nunca mantida presa
+    durante o `os.replace` em si
+    (`test_restore_holds_no_sqlite_connection_open_across_os_replace`,
+    `test_web.py::test_restore_rejects_new_requests_while_in_progress`).
+    O mesmo principio de "nao deixar uma excecao escapar da fronteira"
+    vale para o tratamento de falha: se a PROPRIA reversao tambem falhar,
+    isso nunca propaga como excecao nao tratada - o banco original
+    permanece preservado (a copia de seguranca so e apagada quando a
+    reversao realmente terminou) e um resultado legivel descrevendo as
+    duas falhas e sempre devolvido
+    (`test_restore_never_raises_when_revert_itself_also_fails`).
     O mesmo principio vale para bookkeeping: o registro de uma migration
     em `schema_migrations` entra na MESMA transacao atomica do resto da
     migration, nunca como uma escrita separada depois que o esquema ja

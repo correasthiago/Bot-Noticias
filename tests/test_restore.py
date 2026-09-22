@@ -166,14 +166,21 @@ def test_restore_aborts_cleanly_with_concurrent_connection_open(tmp_path: Path):
     assert result2.success is True
 
 
-def test_restore_blocks_a_connection_opened_after_the_check_and_before_the_swap(tmp_path: Path, monkeypatch):
-    """Ponto 3 da terceira auditoria pos-entrega: 'proteja toda a operacao
-    de restore contra novas conexoes e escritas, desde a verificacao de
-    exclusividade ate o fim da troca ou reversao'. Uma conexao aberta
-    DEPOIS da checagem de exclusividade, mas ANTES do `os.replace` (no
-    meio da copia do backup para staging), precisa ser bloqueada se
-    tentar escrever - a guarda continua com o lock exclusivo ate a troca
-    terminar, nao so ate o instante da checagem."""
+def test_restore_holds_no_sqlite_connection_open_across_os_replace(tmp_path: Path, monkeypatch):
+    """Quarta auditoria pos-entrega, causa raiz do bug relatado no
+    Windows: `os.replace` recusa substituir um arquivo que QUALQUER
+    processo - inclusive o proprio - ainda tem aberto
+    (`PermissionError: [WinError 5]`). Uma revisao anterior mantinha uma
+    conexao guarda aberta durante a copia/troca para bloquear escritores
+    concorrentes; isso funcionava no Linux/macOS mas quebrava no Windows.
+    Este teste prova, sem depender de rodar em Windows de verdade, que
+    NENHUMA conexao sqlite3 deste processo esta aberta no exato instante
+    em que `os.replace` e chamado - intercepta `os.replace` e confere que
+    `sqlite3.connect` nao tem nenhum handle vivo apontando para
+    `db_path` naquele momento (usando `PRAGMA database_list` numa conexao
+    de sondagem descartavel so para navegar o arquivo - se outra conexao
+    tivesse o arquivo aberto com uma transacao pendente, esta sondagem
+    falharia com `database is locked`)."""
 
     import central_universal.persistence.restore as restore_module
 
@@ -185,48 +192,77 @@ def test_restore_blocks_a_connection_opened_after_the_check_and_before_the_swap(
     repos.learners.insert(learner)
     backup_event = create_backup(conn, repos, backup_dir=tmp_path / "backups")
     assert backup_event.success is True
-    conn.close()  # nenhuma conexao "oficial" aberta - simula o app real (cada request abre/fecha a sua)
+    conn.close()
+
+    observed: dict[str, object] = {}
+    real_os_replace = restore_module.os.replace
+
+    def spy_os_replace(src, dst, *args, **kwargs):
+        if str(dst) == str(db_path) and "checked" not in observed:
+            observed["checked"] = True
+            try:
+                probe = sqlite3.connect(str(db_path), timeout=0.2)
+                probe.execute("BEGIN EXCLUSIVE;")  # so consegue se NINGUEM mais tiver o arquivo aberto
+                probe.execute("ROLLBACK;")
+                probe.close()
+                observed["was_free"] = True
+            except sqlite3.OperationalError as exc:
+                observed["was_free"] = False
+                observed["error"] = str(exc)
+        return real_os_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(restore_module.os, "replace", spy_os_replace)
+
+    result = restore_from_backup(db_path, backup_event.backup_path)
+
+    assert observed.get("checked") is True  # a janela realmente foi exercitada
+    assert observed.get("was_free") is True, observed.get("error")
+    assert result.success is True
+
+    restored = connect(db_path)
+    assert Repositories(restored).learners.get(learner.id) is not None
+    restored.close()
+
+
+def test_restore_pauses_the_application_gate_and_always_resumes_it(tmp_path: Path, monkeypatch):
+    """Ponto 3 da quarta auditoria pos-entrega: 'coordene a pausa de
+    requisicoes no nivel da aplicacao' - `is_restore_in_progress()` deve
+    estar ligado durante toda a janela de copia/troca (a protecao
+    portatil que substitui manter uma conexao SQLite presa, que quebrava
+    no Windows) e SEMPRE desligar de novo ao final, mesmo apos sucesso."""
+
+    import central_universal.persistence.restore as restore_module
+
+    db_path = tmp_path / "central.db"
+    conn = connect(db_path)
+    run_migrations(conn)
+    repos = Repositories(conn)
+    learner = Learner(id=new_id(), display_name="Original", created_at=utc_now_iso())
+    repos.learners.insert(learner)
+    backup_event = create_backup(conn, repos, backup_dir=tmp_path / "backups")
+    assert backup_event.success is True
+    conn.close()
+
+    assert restore_module.is_restore_in_progress() is False
 
     staging_path = db_path.with_name(db_path.name + ".restoring")
-    attempt: dict[str, object] = {}
+    observed: dict[str, object] = {}
     real_copy2 = restore_module.shutil.copy2
 
     def spy_copy2(src, dst, *args, **kwargs):
-        # so intercepta a copia do BACKUP para staging - acontece DEPOIS
-        # da checagem de exclusividade (ja feita antes desta chamada) e
-        # ANTES do os.replace (que so vem depois que esta copia retorna).
-        if str(dst) == str(staging_path) and not attempt:
-            attempt["ran"] = True
-            late_conn = sqlite3.connect(str(db_path), timeout=0.2)
-            try:
-                late_conn.execute("BEGIN IMMEDIATE;")
-                late_conn.execute(
-                    "INSERT INTO learner (id, display_name, created_at) VALUES (?, ?, ?);",
-                    (new_id(), "Escritor tardio", utc_now_iso()),
-                )
-                late_conn.execute("COMMIT;")
-                attempt["blocked"] = False
-            except sqlite3.OperationalError as exc:
-                attempt["blocked"] = True
-                attempt["error"] = str(exc)
-            finally:
-                late_conn.close()
+        if str(dst) == str(staging_path) and "checked" not in observed:
+            observed["checked"] = True
+            observed["gate_on"] = restore_module.is_restore_in_progress()
         return real_copy2(src, dst, *args, **kwargs)
 
     monkeypatch.setattr(restore_module.shutil, "copy2", spy_copy2)
 
     result = restore_from_backup(db_path, backup_event.backup_path)
 
-    assert attempt.get("ran") is True  # a janela realmente foi exercitada
-    assert attempt.get("blocked") is True  # a escrita tardia foi recusada pela guarda
-    assert "locked" in str(attempt.get("error", "")).lower()
-    assert result.success is True  # a restauracao em si prossegue normalmente
-
-    restored = connect(db_path)
-    restored_repos = Repositories(restored)
-    assert restored_repos.learners.get(learner.id) is not None
-    assert all(l.display_name != "Escritor tardio" for l in restored_repos.learners.list_all())
-    restored.close()
+    assert observed.get("checked") is True
+    assert observed.get("gate_on") is True  # ligado DURANTE a restauracao
+    assert result.success is True
+    assert restore_module.is_restore_in_progress() is False  # desligado depois
 
 
 def test_restore_reverts_cleanly_when_swap_target_had_active_wal(tmp_path: Path, monkeypatch):
@@ -272,6 +308,63 @@ def test_restore_reverts_cleanly_when_swap_target_had_active_wal(tmp_path: Path,
     reverted = connect(db_path)
     assert Repositories(reverted).learners.get(original_learner.id) is not None
     reverted.close()
+
+
+def test_restore_never_raises_when_revert_itself_also_fails(tmp_path: Path, monkeypatch):
+    """Relato do usuario: 'o tratamento de falha deve preservar o banco
+    original e sempre devolver um resultado legivel, mesmo se a reversao
+    encontrar outro erro'. Simula falha na restauracao (integrity_check)
+    E na propria reversao (o `os.replace` da reversao falha, ex.: disco
+    cheio) - `restore_from_backup` NUNCA pode deixar uma excecao escapar,
+    e a copia de seguranca precisa sobreviver no disco para recuperacao
+    manual em vez de ser apagada."""
+
+    db_path = tmp_path / "central.db"
+    conn = connect(db_path)
+    run_migrations(conn)
+    repos = Repositories(conn)
+    original_learner = Learner(id=new_id(), display_name="Fica", created_at=utc_now_iso())
+    repos.learners.insert(original_learner)
+
+    other_db = tmp_path / "other.db"
+    other_conn = connect(other_db)
+    run_migrations(other_conn)
+    other_conn.close()
+
+    conn.close()
+
+    import central_universal.persistence.restore as restore_module
+
+    def fake_run_all(_repos):
+        class _FakeReport:
+            ok = False
+            findings = [type("F", (), {"severity": "error", "message": "forcado no teste"})()]
+
+        return _FakeReport()
+
+    monkeypatch.setattr(restore_module, "run_all", fake_run_all)
+
+    real_os_replace = restore_module.os.replace
+
+    def flaky_os_replace(src, dst, *args, **kwargs):
+        if "reverting" in str(src):
+            raise OSError("falha simulada na propria reversao (ex.: disco cheio)")
+        return real_os_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(restore_module.os, "replace", flaky_os_replace)
+
+    result = restore_from_backup(db_path, other_db)  # nunca deve levantar excecao
+
+    assert result.success is False
+    assert "tambem falhou" in result.message.lower()
+
+    # a copia de seguranca sobrevive no disco - nao foi apagada, ja que a
+    # reversao nao terminou com sucesso.
+    safety_copies = list(tmp_path.glob("central.db.pre-restore-*"))
+    assert len(safety_copies) == 1
+
+    # o portao da aplicacao foi desligado mesmo com a dupla falha.
+    assert restore_module.is_restore_in_progress() is False
 
 
 def test_maybe_run_automatic_backup_respects_min_interval(tmp_path: Path):
