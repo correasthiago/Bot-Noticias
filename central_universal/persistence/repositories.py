@@ -543,6 +543,20 @@ class EvidenceEventRepository:
         rows = self.conn.execute("SELECT * FROM evidence_event ORDER BY created_at;").fetchall()
         return [self._map(r) for r in rows]
 
+    def first_created_at_for_competency(self, competency_id: str) -> str | None:
+        """A data/hora da PRIMEIRA evidencia ja registrada para esta
+        competencia, em qualquer dimensao - usada como proxy observavel de
+        "quando o aprendiz comecou a aprender isto" (Secao 2 da terceira
+        auditoria pos-entrega: o intervalo desde a aprendizagem tambem
+        precisa ser verificado na PRIMEIRA revisao de memoria, nao so
+        entre revisoes subsequentes)."""
+
+        row = self.conn.execute(
+            "SELECT MIN(created_at) AS first_created_at FROM evidence_event WHERE competency_id = ?;",
+            (competency_id,),
+        ).fetchone()
+        return row["first_created_at"] if row else None
+
     def list_by_raw_interaction(self, raw_interaction_id: str) -> list[EvidenceEvent]:
         rows = self.conn.execute(
             "SELECT * FROM evidence_event WHERE raw_interaction_id = ?;",
@@ -681,13 +695,27 @@ class CompetencyStateRepository:
         self.conn = conn
 
     def insert(self, state: CompetencyState) -> None:
+        # Secao 1 da terceira auditoria pos-entrega: `sequence_number` e
+        # SEMPRE atribuido aqui, dentro da mesma escrita, como o proximo
+        # inteiro apos o maximo ja gravado - nunca informado pelo
+        # chamador (o `0` no dataclass e so um placeholder). Como o SQLite
+        # so permite UM escritor por vez (serializado pelo lock de escrita
+        # da conexao), este SELECT+INSERT e atomico entre si mesmo sem uma
+        # transacao explicita adicional aqui - qualquer chamador que
+        # precise agrupar isto com outras escritas ja usa
+        # `with transaction(self.repos.conn):` por fora.
+        next_sequence = self.conn.execute(
+            "SELECT COALESCE(MAX(sequence_number), 0) + 1 AS next_seq FROM competency_state;"
+        ).fetchone()["next_seq"]
+        state.sequence_number = next_sequence
         self.conn.execute(
             "INSERT INTO competency_state "
-            "(id, generation_id, competency_id, dimension, state, possible_regression, "
+            "(id, sequence_number, generation_id, competency_id, dimension, state, possible_regression, "
             "has_unresolved_contradiction, last_evidence_assessment_id, rule_version_id, "
-            "computed_at, explanation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+            "computed_at, explanation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
             (
                 state.id,
+                state.sequence_number,
                 state.generation_id,
                 state.competency_id,
                 state.dimension.value,
@@ -705,14 +733,18 @@ class CompetencyStateRepository:
         """Estado "atual": a linha mais recente por (competency, dimension)
         DENTRO de uma geracao especifica. Sem `generation_id` explicito,
         usa a geracao ATIVA agora - nunca mistura linhas de geracoes
-        diferentes."""
+        diferentes. "Mais recente" e decidido EXCLUSIVAMENTE por
+        `sequence_number` (inteiro monotonico explicito, atribuido em
+        `insert()`) - nunca por `computed_at` (que pode colidir sob
+        escritas rapidas) nem por `id` (aleatorio, Secao 1 da terceira
+        auditoria pos-entrega)."""
 
         gen_id = generation_id if generation_id is not None else self._active_generation_id()
         if gen_id is None:
             return None
         row = self.conn.execute(
             "SELECT * FROM competency_state WHERE generation_id = ? AND competency_id = ? "
-            "AND dimension = ? ORDER BY computed_at DESC, id DESC LIMIT 1;",
+            "AND dimension = ? ORDER BY sequence_number DESC LIMIT 1;",
             (gen_id, competency_id, dimension.value),
         ).fetchone()
         return self._map(row) if row else None
@@ -727,18 +759,19 @@ class CompetencyStateRepository:
 
     def history(self, competency_id: str, dimension: Dimension) -> list[CompetencyState]:
         """Historico COMPLETO, atravessando todas as geracoes (para
-        auditoria) - ordenado por tempo de computo."""
+        auditoria) - ordenado por `sequence_number` (ordem real de
+        gravacao), nunca por `computed_at`."""
 
         rows = self.conn.execute(
             "SELECT * FROM competency_state WHERE competency_id = ? AND dimension = ? "
-            "ORDER BY computed_at;",
+            "ORDER BY sequence_number;",
             (competency_id, dimension.value),
         ).fetchall()
         return [self._map(r) for r in rows]
 
     def list_by_generation(self, generation_id: str) -> list[CompetencyState]:
         rows = self.conn.execute(
-            "SELECT * FROM competency_state WHERE generation_id = ? ORDER BY computed_at;",
+            "SELECT * FROM competency_state WHERE generation_id = ? ORDER BY sequence_number;",
             (generation_id,),
         ).fetchall()
         return [self._map(r) for r in rows]

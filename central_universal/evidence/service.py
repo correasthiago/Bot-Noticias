@@ -160,6 +160,7 @@ class EvidenceService:
         evaluator_output: EvaluatorOutput,
         rule_version: RuleVersion,
         evaluator_provider_event_id: str | None = None,
+        recorded_at: str | None = None,
     ) -> EvaluationRecordResult:
         # Idempotencia real (Secao 5, T8): a transicao pending->completed e
         # atomica e so pode acontecer uma vez. Se outra chamada ja
@@ -172,6 +173,13 @@ class EvidenceService:
 
         touched: set[tuple[str, Dimension]] = set()
         assessments_created: list[EvidenceAssessment] = []
+        # Secao 2 da terceira auditoria pos-entrega: permite ao chamador
+        # (via `SessionOrchestrator.submit_interaction(now=...)`) controlar
+        # o timestamp desta evidencia, para que testes possam simular um
+        # intervalo real desde a aprendizagem sem depender do relogio real
+        # da maquina (a mesma logica ja usada por `record_interaction`'s
+        # `occurred_at`). Sem override, usa o tempo real de sempre.
+        event_created_at = recorded_at or utc_now_iso()
 
         for finding in evaluator_output.findings:
             event = EvidenceEvent(
@@ -183,7 +191,7 @@ class EvidenceService:
                 help_level=raw_interaction.help_level,
                 production_result=raw_interaction.production_result,
                 evidence_cluster_id=raw_interaction.evidence_cluster_id,
-                created_at=utc_now_iso(),
+                created_at=event_created_at,
             )
             self.repos.evidence_events.insert(event)
 
@@ -198,7 +206,7 @@ class EvidenceService:
                 alternative_cause=finding.alternative_cause,
                 inconclusive=finding.inconclusive,
                 evaluator_provider_event_id=evaluator_provider_event_id,
-                created_at=utc_now_iso(),
+                created_at=event_created_at,
             )
             self.repos.evidence_assessments.insert(assessment)
             assessments_created.append(assessment)

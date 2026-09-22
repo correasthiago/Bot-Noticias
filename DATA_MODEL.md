@@ -78,9 +78,19 @@ v0.2:
 ## `competency_state`: por que append-only E organizado em geracoes (v0.2)
 
 Cada recomputo INCREMENTAL de `(competency_id, dimension)` insere uma
-NOVA linha na geracao ATIVA; o "estado atual" e sempre a linha de
-`computed_at` mais recente DENTRO da geracao ativa (nunca misturando
-geracoes). Isso da, de graca:
+NOVA linha na geracao ATIVA; o "estado atual" e sempre a linha de maior
+`sequence_number` DENTRO da geracao ativa (nunca misturando geracoes).
+`sequence_number` e um `INTEGER` monotonico explicito
+(migration `0003_monotonic_projection_sequence.sql`), atribuido pelo
+REPOSITORIO na propria escrita (`MAX(sequence_number) + 1`) - NUNCA por
+`computed_at` (terceira auditoria pos-entrega: `computed_at` e um
+timestamp de texto que pode colidir entre duas linhas sob escritas
+rapidas quando a resolucao do relogio do SO e mais grosseira que o tempo
+entre elas; o desempate anterior por `id` - um `uuid4()` aleatorio -
+tornava a escolha da linha "atual" nao-deterministica, produzindo uma
+falha de teste intermitente). `computed_at` continua existindo como o
+"quando" (exibicao/auditoria), mas nunca mais decide ordem. Isso da, de
+graca:
 
 - historico completo de como o estado evoluiu (Principio 3);
 - recalculabilidade total SEM PERDA: `evidence.service.recompute_all_from_log`
@@ -156,15 +166,21 @@ qual for o texto exato do prompt.
 - `rule_version.config_json` — a UNICA fonte de thresholds de agregacao
   (`AggregationConfig`); nada mais no codigo hardcoda esses numeros.
   `rule_version.algorithm_version` documenta qual forma de codigo sabe
-  interpretar aquele JSON. Desde v0.2.1, tambem carrega a politica de
-  revisao de memoria: `recall_min_confidence`,
-  `recall_min_interval_seconds`, `recall_rating_easy_min_confidence` e
-  `recall_rating_good_min_confidence` - os limiares que
-  `memory.fsrs_adapter.derive_recall_rating`/`evaluate_recall_eligibility`
-  usam para transformar a `EvidenceAssessment` de RETENTION de uma
-  tentativa em elegibilidade + nota FSRS. Antes da v0.2.1 esses numeros so
+  interpretar aquele JSON. Desde v0.2.1/v0.2.2, tambem carrega a politica
+  de revisao de memoria: `recall_min_confidence` (filtro de elegibilidade
+  - NUNCA usado para decidir a nota, so para aceitar/rejeitar a
+  observacao), `recall_min_interval_seconds` (intervalo minimo entre
+  revisoes) e `first_review_min_interval_since_learning_seconds`
+  (v0.2.2 - o mesmo tipo de intervalo, mas para a PRIMEIRA revisao de uma
+  competencia, medido desde a primeira evidencia registrada). A nota FSRS
+  em si (Easy/Good/Hard) NAO vem de um limiar de confianca (os campos
+  `recall_rating_easy_min_confidence`/`..._good_min_confidence` da
+  v0.2.1 foram REMOVIDOS na v0.2.2 por medirem a coisa errada - ver
+  DECISIONS.md) - vem de `help_level`/`production_result` da propria
+  tentativa, sinais observaveis que ja existem no dominio e nao precisam
+  de limiar configuravel adicional. Antes da v0.2.1 esses numeros so
   existiam como defaults implicitos da dataclass `AggregationConfig`;
-  agora sao explicitos em `evidence.rule_versions.build_v0_2_1_rule_version`.
+  agora sao explicitos em `evidence.rule_versions.build_v0_2_2_rule_version`.
 - `raw_interaction`/`activity`/`learner_input`/`help_level`/`production_result`
   identificam uma submissao junto com `idempotency_key`: desde v0.2.1,
   `EvidenceService.record_interaction` rejeita
@@ -178,7 +194,20 @@ qual for o texto exato do prompt.
   especifica, calculado ANTES dela alterar qualquer coisa. Por exemplo,
   quantas linhas de `evidence_assessment` de um banco v0.1 precisaram ser
   normalizadas (nunca descartadas) para respeitar o novo `CHECK` de
-  consistencia `inconclusive`/`classification` da migration 0002.
+  consistencia `inconclusive`/`classification` da migration 0002. Desde
+  v0.2.2, a propria linha de bookkeeping (`filename`/`applied_at`/`notes`)
+  e inserida DENTRO da mesma transacao atomica da migration
+  (`persistence.migrations._inject_bookkeeping_before_final_commit`) -
+  uma falha ao grava-la reverte a migration inteira, nunca deixa o
+  esquema migrado sem o registro correspondente.
+- `competency_state.sequence_number` (coluna nova em v0.2.2, migration
+  `0003_monotonic_projection_sequence.sql`) — inteiro monotonico
+  explicito, atribuido pelo repositorio a cada `insert()` como
+  `MAX(sequence_number) + 1`. E a UNICA fonte de verdade sobre qual linha
+  e "a mais recente" dentro de uma geracao (`CompetencyStateRepository.current`/
+  `history`) - substituiu `ORDER BY computed_at DESC, id DESC`, que podia
+  produzir uma escolha nao-deterministica sob escritas rapidas (ver
+  DECISIONS.md, Pacote de correcao v0.2.2 #1).
 
 ## Por que "versao ativa" e "geracao ativa" vivem em tabelas-ponteiro separadas
 

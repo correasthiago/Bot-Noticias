@@ -16,6 +16,7 @@ from central_universal.evidence.aggregation import AggregationConfig
 V0_1_0_VERSION = "v0.1.0"
 V0_2_0_VERSION = "v0.2.0"
 V0_2_1_VERSION = "v0.2.1"
+V0_2_2_VERSION = "v0.2.2"
 
 # Algoritmo original (pre Red Team): thresholds hardcoded em
 # aggregation.py, corroboracao de regressao por 2-de-3 recentes, cluster
@@ -118,6 +119,76 @@ def build_v0_2_1_rule_version() -> RuleVersion:
             "alvo) - nunca pelo texto do prompt, o que permitia que exercicios com "
             "textos superficialmente distintos mas pedagogicamente previsiveis "
             "forjassem independencia."
+        ),
+        created_at=utc_now_iso(),
+        config_json=config.to_json(),
+        algorithm_version=ALGORITHM_V2,
+    )
+
+
+def build_v0_2_2_rule_version() -> RuleVersion:
+    """RuleVersion da terceira auditoria pos-entrega (pacote de correcao
+    v0.2.2). Corrige um erro de categoria que sobreviveu a v0.2.1: usar
+    `EvidenceAssessment.confidence` para decidir Easy/Good/Hard era, na
+    pratica, o MESMO tipo de problema que a v0.2.1 ja tinha corrigido uma
+    vez (usar um sinal que nao mede o que precisa medir) - `confidence`
+    mede o quanto o AVALIADOR confia no proprio julgamento de
+    classificacao, nunca o quao FACIL foi para o APRENDIZ recuperar a
+    informacao. Uma avaliacao positiva de alta confianca virava "Easy"
+    automaticamente mesmo quando a resposta so saiu certa com uma pista
+    explicita.
+
+    Mudancas de politica desta versao (Secao 2 da terceira auditoria
+    pos-entrega):
+
+    - A nota FSRS (Easy/Good/Hard) passa a vir EXCLUSIVAMENTE de dois
+      sinais OBSERVAVEIS do processo de recuperacao da propria tentativa -
+      `help_level` (quanto suporte foi dado ANTES da resposta) e
+      `production_result` (como a resposta correta foi alcancada) - nunca
+      de `confidence` (ver `memory.fsrs_adapter.derive_recall_rating` para
+      a tabela completa de decisao). `confidence` continua sendo usada,
+      mas SO como filtro de elegibilidade (`recall_min_confidence`) -
+      nunca mais como sinal de facilidade. Os dois limiares de confianca
+      que a v0.2.1 introduzira para isso
+      (`recall_rating_easy_min_confidence`/`..._good_min_confidence`)
+      foram REMOVIDOS de `AggregationConfig` - nao fazem mais sentido.
+    - `first_review_min_interval_since_learning_seconds` (NOVO): a
+      PRIMEIRA revisao de uma competencia (quando ainda nao existe
+      `memory_state.last_review_at` para comparar) tambem precisa de um
+      intervalo minimo verificado - antes, essa checagem simplesmente nao
+      acontecia na primeira revisao. O intervalo e medido desde a
+      PRIMEIRA evidencia ja registrada para a competencia (proxy
+      observavel de "quando o aprendiz comecou a aprender isto").
+
+    Os VALORES continuam sendo defaults provisorios (nenhuma calibracao
+    real com aprendizes existe ainda) - o que muda e a formula que os usa,
+    nao um ajuste fino de numeros."""
+
+    config = AggregationConfig()
+    return RuleVersion(
+        id=new_id(),
+        version=V0_2_2_VERSION,
+        description=(
+            "Terceira auditoria pos-entrega: (1) o 'estado atual' de uma projecao "
+            "(CompetencyState) e escolhido por sequence_number - um inteiro "
+            "monotonico explicito atribuido pelo repositorio na propria escrita - "
+            "nunca mais por computed_at+id (que podia empatar sob escritas rapidas "
+            "e ser desempatado por um uuid aleatorio, produzindo uma escolha "
+            "nao-deterministica); (2) a nota FSRS de uma recuperacao vem "
+            "exclusivamente de sinais OBSERVAVEIS da propria tentativa "
+            "(help_level + production_result) - nunca da confianca do avaliador, "
+            "que mede outra coisa (o quanto o avaliador confia no julgamento de "
+            "classificacao, nao o quao facil foi a recuperacao); a PRIMEIRA "
+            "revisao de uma competencia tambem verifica o intervalo desde a "
+            "primeira evidencia/aprendizagem, nao so entre revisoes subsequentes; "
+            "(3) a restauracao de backup mantem exclusividade no banco ativo do "
+            "inicio da checagem ate o fim da troca OU reversao - uma conexao "
+            "aberta durante a janela de copia/troca tambem aborta a restauracao, "
+            "nao so uma aberta antes de comecar; (4) o registro de aplicacao da "
+            "migration 0002 em schema_migrations entra na MESMA transacao atomica "
+            "do resto da migration - uma falha ao gravar esse registro reverte o "
+            "esquema inteiro para a versao anterior, nunca deixa a migration "
+            "'quase aplicada'."
         ),
         created_at=utc_now_iso(),
         config_json=config.to_json(),

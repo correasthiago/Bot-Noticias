@@ -63,26 +63,40 @@ class AggregationConfig:
     min_confidence_for_aggregation: float = 0.5
 
     # Politica de revisao de memoria (Secao 2 do pacote de correcao
-    # v0.2.1) - documentada aqui, na RuleVersion, e NAO mais hardcoded em
+    # v0.2.1, refinada na Secao 2 da terceira auditoria pos-entrega) -
+    # documentada aqui, na RuleVersion, e NAO mais hardcoded em
     # memory/fsrs_adapter.py:
-    #  - `recall_min_confidence`: confianca minima da avaliacao de
-    #    RETENTION/target para sequer considerar a tentativa como
-    #    observacao de memoria valida.
-    #  - `recall_min_interval_seconds`: intervalo minimo desde a ultima
-    #    revisao para a nova tentativa contar como uma observacao
+    #  - `recall_min_confidence`: confianca minima da AVALIACAO (o quanto
+    #    o avaliador confia no proprio julgamento de classificacao) para
+    #    sequer considerar a tentativa como observacao de memoria valida.
+    #    Isto e um filtro de ELEGIBILIDADE, NUNCA um sinal de facilidade
+    #    de recuperacao - confianca do avaliador e facilidade de
+    #    recuperacao do aprendiz sao grandezas diferentes (Secao 2 da
+    #    terceira auditoria: confundir as duas fazia qualquer avaliacao
+    #    positiva de alta confianca virar "Easy" automaticamente, mesmo
+    #    quando a resposta so saiu certa com pista/correcao explicita).
+    #  - `recall_min_interval_seconds`: intervalo minimo desde a ULTIMA
+    #    REVISAO para a nova tentativa contar como uma observacao
     #    DISTINTA (evita que dois cliques em sequencia, segundos depois
     #    um do outro, sejam tratados como duas revisoes espacadas).
-    #  - `recall_rating_easy_min_confidence` / `..._good_min_confidence`:
-    #    limiares de confianca que convertem uma avaliacao POSITIVE em
-    #    nota FSRS Easy/Good/Hard (ver `memory.fsrs_adapter.derive_recall_rating`).
-    #    Uma avaliacao NEGATIVE sempre vira "Again", independente de
-    #    confianca. O rating NUNCA e derivado do ProductionResult bruto -
-    #    so da classificacao e confianca que o avaliador atribuiu aquela
-    #    tentativa especifica de recuperacao.
+    #  - `first_review_min_interval_since_learning_seconds`: o
+    #    equivalente, mas para a PRIMEIRA revisao de uma competencia
+    #    (quando ainda nao existe `memory_state.last_review_at` para
+    #    comparar) - o intervalo e medido desde a PRIMEIRA evidencia
+    #    registrada para a competencia (proxy observavel de "quando o
+    #    aprendiz comecou a aprender isto"), nunca deixado sem checagem
+    #    (Secao 2 da terceira auditoria pos-entrega).
+    #
+    # A NOTA FSRS (Easy/Good/Hard/Again) e derivada em
+    # `memory.fsrs_adapter.derive_recall_rating` EXCLUSIVAMENTE de sinais
+    # OBSERVAVEIS do processo de recuperacao da propria tentativa -
+    # `help_level` (quanto suporte foi dado) e `production_result` (como a
+    # resposta foi alcancada) - nunca da confianca do avaliador. Esses
+    # dois sinais ja sao bem definidos no dominio (Secao 10) e nao
+    # precisam de limiares configuraveis adicionais aqui.
     recall_min_confidence: float = 0.5
     recall_min_interval_seconds: float = 3600.0
-    recall_rating_easy_min_confidence: float = 0.85
-    recall_rating_good_min_confidence: float = 0.65
+    first_review_min_interval_since_learning_seconds: float = 3600.0
 
     @classmethod
     def from_json(cls, config_json: str | None) -> "AggregationConfig":
@@ -104,8 +118,7 @@ class AggregationConfig:
                 "min_confidence_for_aggregation": self.min_confidence_for_aggregation,
                 "recall_min_confidence": self.recall_min_confidence,
                 "recall_min_interval_seconds": self.recall_min_interval_seconds,
-                "recall_rating_easy_min_confidence": self.recall_rating_easy_min_confidence,
-                "recall_rating_good_min_confidence": self.recall_rating_good_min_confidence,
+                "first_review_min_interval_since_learning_seconds": self.first_review_min_interval_since_learning_seconds,
             },
             sort_keys=True,
         )

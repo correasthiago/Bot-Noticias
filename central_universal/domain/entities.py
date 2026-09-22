@@ -208,6 +208,13 @@ class CompetencyState:
     rule_version_id: str
     computed_at: str
     explanation: str = ""
+    # Atribuido SEMPRE por `CompetencyStateRepository.insert` (nunca pelo
+    # chamador) como o proximo inteiro apos o maximo ja gravado - a UNICA
+    # fonte de verdade sobre "qual linha e mais recente" (Secao 1 da
+    # terceira auditoria pos-entrega: `computed_at` + `id` aleatorio nao
+    # bastam sob escritas rapidas com o mesmo timestamp). O default 0 aqui
+    # e so um placeholder ate o insert real atribuir o valor definitivo.
+    sequence_number: int = 0
 
 
 @dataclass

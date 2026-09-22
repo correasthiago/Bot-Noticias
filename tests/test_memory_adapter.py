@@ -215,12 +215,30 @@ def test_low_confidence_assessment_is_never_eligible():
     assert "confianca" in result.reason
 
 
+def test_missing_observable_signals_is_never_eligible():
+    """Terceira auditoria pos-entrega, ponto 2: sem `help_level`/
+    `production_result` (os sinais observaveis que decidem a nota), a
+    observacao NUNCA e aceita - nunca cai de volta para confianca."""
+
+    result = evaluate_recall_eligibility(
+        activity=_planned_activity("s1"),
+        evidence_relation=EvidenceRelation.TARGET,
+        evidence_dimension=Dimension.RETENTION,
+        assessment=_valid_assessment(confidence=0.99),
+        memory_state=None,
+    )
+    assert result.eligible is False
+    assert "observaveis" in result.reason
+
+
 def test_first_observation_with_no_prior_state_is_eligible():
     result = evaluate_recall_eligibility(
         activity=_planned_activity("s1"),
         evidence_relation=EvidenceRelation.TARGET,
         evidence_dimension=Dimension.RETENTION,
         assessment=_valid_assessment(confidence=0.9),
+        help_level=HelpLevel.A0,
+        production_result=ProductionResult.SPONTANEOUS_CORRECT,
         memory_state=None,
     )
     assert result.eligible is True
@@ -230,29 +248,58 @@ def test_first_observation_with_no_prior_state_is_eligible():
 def test_negative_evaluation_is_eligible_with_again_rating():
     """Ponto 2 da correcao v0.2.1: uma avaliacao NEGATIVE, conclusiva e
     confiante, ainda produz uma observacao valida - so que com nota
-    "Again", nunca derivada do ProductionResult bruto."""
+    "Again", nunca derivada do ProductionResult bruto ou da confianca."""
 
     result = evaluate_recall_eligibility(
         activity=_planned_activity("s1"),
         evidence_relation=EvidenceRelation.TARGET,
         evidence_dimension=Dimension.RETENTION,
         assessment=_valid_assessment(classification=EvidenceType.NEGATIVE, result="incorrect", confidence=0.9),
+        help_level=HelpLevel.A0,
+        production_result=ProductionResult.INCORRECT,
         memory_state=None,
     )
     assert result.eligible is True
     assert result.rating == int(fsrs.Rating.Again)
 
 
-def test_derive_recall_rating_uses_confidence_thresholds_not_production_result():
-    config = AggregationConfig()
-    assert derive_recall_rating(_valid_assessment(confidence=0.95), config) == int(fsrs.Rating.Easy)
-    assert derive_recall_rating(_valid_assessment(confidence=0.7), config) == int(fsrs.Rating.Good)
-    assert derive_recall_rating(_valid_assessment(confidence=0.55), config) == int(fsrs.Rating.Hard)
+def test_derive_recall_rating_uses_observable_signals_not_confidence():
+    """Terceira auditoria pos-entrega, ponto 2: confianca do avaliador
+    NUNCA decide Easy/Good/Hard - so os sinais observaveis da propria
+    tentativa (help_level, production_result). Uma avaliacao POSITIVE de
+    confianca altissima que so saiu certa depois de uma pista explicita
+    tem que virar Hard, nunca Easy."""
+
+    high_confidence_but_hinted = _valid_assessment(confidence=0.99)
     assert derive_recall_rating(
-        _valid_assessment(classification=EvidenceType.NEGATIVE, confidence=0.55), config
+        high_confidence_but_hinted, help_level=HelpLevel.A2, production_result=ProductionResult.SPONTANEOUS_CORRECT
+    ) == int(fsrs.Rating.Hard)
+    assert derive_recall_rating(
+        high_confidence_but_hinted, help_level=HelpLevel.A0, production_result=ProductionResult.CORRECT_AFTER_HINT
+    ) == int(fsrs.Rating.Hard)
+
+    low_confidence_but_spontaneous = _valid_assessment(confidence=0.51)
+    assert derive_recall_rating(
+        low_confidence_but_spontaneous, help_level=HelpLevel.A0, production_result=ProductionResult.SPONTANEOUS_CORRECT
+    ) == int(fsrs.Rating.Easy)
+
+    assert derive_recall_rating(
+        _valid_assessment(), help_level=HelpLevel.A0, production_result=ProductionResult.SPONTANEOUS_SELF_CORRECTION
+    ) == int(fsrs.Rating.Good)
+    assert derive_recall_rating(
+        _valid_assessment(), help_level=HelpLevel.A1, production_result=ProductionResult.SPONTANEOUS_CORRECT
+    ) == int(fsrs.Rating.Good)
+    assert derive_recall_rating(
+        _valid_assessment(), help_level=HelpLevel.A3, production_result=ProductionResult.SPONTANEOUS_CORRECT
+    ) == int(fsrs.Rating.Hard)
+
+    assert derive_recall_rating(
+        _valid_assessment(classification=EvidenceType.NEGATIVE),
+        help_level=HelpLevel.A0, production_result=ProductionResult.INCORRECT,
     ) == int(fsrs.Rating.Again)
     assert derive_recall_rating(
-        _valid_assessment(classification=EvidenceType.INCONCLUSIVE, confidence=0.95), config
+        _valid_assessment(classification=EvidenceType.INCONCLUSIVE),
+        help_level=HelpLevel.A0, production_result=ProductionResult.INCONCLUSIVE,
     ) is None
 
 
@@ -276,6 +323,8 @@ def test_attempts_seconds_apart_are_not_independent_observations():
         evidence_relation=EvidenceRelation.TARGET,
         evidence_dimension=Dimension.RETENTION,
         assessment=_valid_assessment(confidence=0.9),
+        help_level=HelpLevel.A0,
+        production_result=ProductionResult.SPONTANEOUS_CORRECT,
         memory_state=memory_state,
         config=config,
         now=seconds_later,
@@ -299,12 +348,61 @@ def test_attempts_far_apart_are_independent_observations():
         evidence_relation=EvidenceRelation.TARGET,
         evidence_dimension=Dimension.RETENTION,
         assessment=_valid_assessment(confidence=0.9),
+        help_level=HelpLevel.A0,
+        production_result=ProductionResult.SPONTANEOUS_CORRECT,
         memory_state=memory_state,
         config=config,
         now=days_later,
     )
     assert result.eligible is True
     assert result.interval_days == pytest.approx(3.0)
+
+
+def test_first_review_too_soon_after_learning_is_never_eligible():
+    """Terceira auditoria pos-entrega, ponto 2, ultima frase: a PRIMEIRA
+    revisao (sem memory_state ainda) tambem precisa verificar o intervalo
+    desde a aprendizagem - nao pode ficar sem NENHUMA checagem so porque
+    nao ha uma revisao anterior para comparar."""
+
+    config = AggregationConfig(first_review_min_interval_since_learning_seconds=3600.0)
+    first_evidence_at = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    minutes_later = first_evidence_at + timedelta(minutes=5)
+
+    result = evaluate_recall_eligibility(
+        activity=_planned_activity("s1"),
+        evidence_relation=EvidenceRelation.TARGET,
+        evidence_dimension=Dimension.RETENTION,
+        assessment=_valid_assessment(confidence=0.9),
+        help_level=HelpLevel.A0,
+        production_result=ProductionResult.SPONTANEOUS_CORRECT,
+        memory_state=None,
+        first_evidence_at=to_utc_iso(first_evidence_at),
+        config=config,
+        now=minutes_later,
+    )
+    assert result.eligible is False
+    assert "aprendizagem" in result.reason
+
+
+def test_first_review_long_after_learning_is_eligible():
+    config = AggregationConfig(first_review_min_interval_since_learning_seconds=3600.0)
+    first_evidence_at = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    days_later = first_evidence_at + timedelta(days=2)
+
+    result = evaluate_recall_eligibility(
+        activity=_planned_activity("s1"),
+        evidence_relation=EvidenceRelation.TARGET,
+        evidence_dimension=Dimension.RETENTION,
+        assessment=_valid_assessment(confidence=0.9),
+        help_level=HelpLevel.A0,
+        production_result=ProductionResult.SPONTANEOUS_CORRECT,
+        memory_state=None,
+        first_evidence_at=to_utc_iso(first_evidence_at),
+        config=config,
+        now=days_later,
+    )
+    assert result.eligible is True
+    assert result.interval_days == pytest.approx(2.0)
 
 
 # --- observe_and_review: escrita atomica ------------------------------
@@ -316,7 +414,9 @@ def test_observe_and_review_creates_state_log_and_observation(repos: Repositorie
     eligibility = evaluate_recall_eligibility(
         activity=activity, evidence_relation=EvidenceRelation.TARGET,
         evidence_dimension=Dimension.RETENTION,
-        assessment=assessment, memory_state=None,
+        assessment=assessment,
+        help_level=HelpLevel.A0, production_result=ProductionResult.SPONTANEOUS_CORRECT,
+        memory_state=None,
     )
     now = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
@@ -347,7 +447,9 @@ def test_ineligible_observation_never_calls_fsrs(repos: Repositories, make_compe
     ineligible = evaluate_recall_eligibility(
         activity=_planned_activity("s1", planned=False), evidence_relation=EvidenceRelation.TARGET,
         evidence_dimension=Dimension.RETENTION,
-        assessment=assessment, memory_state=None,
+        assessment=assessment,
+        help_level=HelpLevel.A0, production_result=ProductionResult.SPONTANEOUS_CORRECT,
+        memory_state=None,
     )
     result = adapter.observe_and_review(
         competency_id=competency_id, raw_interaction_id=interaction.id, evidence_assessment_id=assessment.id,
@@ -374,7 +476,9 @@ def test_failure_at_each_write_leaves_prior_state_byte_identical(
     eligibility = evaluate_recall_eligibility(
         activity=activity, evidence_relation=EvidenceRelation.TARGET,
         evidence_dimension=Dimension.RETENTION,
-        assessment=assessment, memory_state=None,
+        assessment=assessment,
+        help_level=HelpLevel.A0, production_result=ProductionResult.SPONTANEOUS_CORRECT,
+        memory_state=None,
     )
     adapter.observe_and_review(
         competency_id=competency_id, raw_interaction_id=interaction.id, evidence_assessment_id=assessment.id,
@@ -399,7 +503,9 @@ def test_failure_at_each_write_leaves_prior_state_byte_identical(
     second_eligibility = evaluate_recall_eligibility(
         activity=activity, evidence_relation=EvidenceRelation.TARGET,
         evidence_dimension=Dimension.RETENTION,
-        assessment=assessment2, memory_state=before_state, now=datetime(2026, 1, 5, tzinfo=timezone.utc),
+        assessment=assessment2,
+        help_level=HelpLevel.A0, production_result=ProductionResult.SPONTANEOUS_CORRECT,
+        memory_state=before_state, now=datetime(2026, 1, 5, tzinfo=timezone.utc),
     )
     outcome = adapter.observe_and_review(
         competency_id=competency_id, raw_interaction_id=interaction2.id, evidence_assessment_id=assessment2.id,
@@ -425,7 +531,9 @@ def test_is_recall_due_reflects_scheduler(repos: Repositories, make_competency):
     eligibility = evaluate_recall_eligibility(
         activity=activity, evidence_relation=EvidenceRelation.TARGET,
         evidence_dimension=Dimension.RETENTION,
-        assessment=assessment, memory_state=None,
+        assessment=assessment,
+        help_level=HelpLevel.A0, production_result=ProductionResult.SPONTANEOUS_CORRECT,
+        memory_state=None,
     )
     adapter.observe_and_review(
         competency_id=competency_id, raw_interaction_id=interaction.id, evidence_assessment_id=assessment.id,

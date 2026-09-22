@@ -234,3 +234,55 @@ reforcos que essa auditoria tornou explicitos.
     tratar o WAL e seus arquivos auxiliares - e seu resultado (sucesso ou
     falha, com o motivo) e sempre mostrado ao usuario, nunca descartado
     apos o redirect.
+
+## Principios adicionados pelo pacote de correcao v0.2.2
+
+Uma terceira auditoria pos-entrega, sobre o commit que fechou a v0.2.1,
+encontrou que os principios acima ainda eram satisfeitos so parcialmente
+em quatro pontos. Estes principios nao substituem os 27 anteriores - sao
+reforcos que essa auditoria tornou explicitos.
+
+28. **"Mais recente" e sempre uma ordem monotonica explicita, nunca um
+    timestamp de texto desempatado por um identificador aleatorio.**
+    `CompetencyState.sequence_number` e um inteiro atribuido pelo
+    REPOSITORIO na propria escrita (`MAX(sequence_number) + 1`), nunca
+    informado por um chamador nem derivado de `computed_at`/`id`.
+    `computed_at` continua existindo como o "quando" (para exibicao e
+    auditoria), mas nunca mais decide qual linha e a atual - um timestamp
+    de texto pode empatar sob escritas rapidas, e desempatar por um
+    `uuid4()` aleatorio torna a escolha nao-deterministica
+    (`test_competency_state_current_and_history_use_monotonic_sequence_frozen_clock`,
+    reproduzido explicitamente com o relogio congelado).
+
+29. **Um sinal so decide o que ele de fato mede - confianca do avaliador
+    nunca e usada como substituto de facilidade de recuperacao.**
+    A nota FSRS de uma recuperacao (Easy/Good/Hard) vem exclusivamente de
+    sinais OBSERVAVEIS do processo de recuperacao da propria tentativa
+    (`help_level`, `production_result`) - nunca de `confidence`, que mede
+    o quanto o avaliador confia no proprio julgamento de classificacao,
+    uma grandeza diferente. `confidence` continua sendo usada, mas
+    exclusivamente como filtro de elegibilidade
+    (`derive_recall_rating`/`evaluate_recall_eligibility` em
+    `memory/fsrs_adapter.py`).
+
+30. **A PRIMEIRA observacao de um fenomeno temporal tambem precisa de um
+    intervalo minimo verificado - "nao ha revisao anterior para comparar"
+    nunca e motivo para pular a checagem.**
+    A primeira revisao de memoria de uma competencia (sem
+    `memory_state.last_review_at` ainda) verifica o intervalo desde a
+    PRIMEIRA evidencia registrada para a competencia
+    (`first_review_min_interval_since_learning_seconds`), nao fica sem
+    nenhuma checagem so por nao ter uma revisao anterior.
+
+31. **Uma janela de exclusividade protege a operacao INTEIRA, do inicio
+    da checagem ate o fim de cada caminho possivel - nao so o instante em
+    que a exclusividade foi confirmada.**
+    A guarda de restauracao (`_acquire_exclusive_guard`) mantem o lock
+    aberto durante toda a copia/troca (e, best-effort, durante a
+    reversao) - uma conexao aberta DEPOIS da checagem mas ANTES da troca
+    tambem e bloqueada se tentar escrever
+    (`test_restore_blocks_a_connection_opened_after_the_check_and_before_the_swap`).
+    O mesmo principio vale para bookkeeping: o registro de uma migration
+    em `schema_migrations` entra na MESMA transacao atomica do resto da
+    migration, nunca como uma escrita separada depois que o esquema ja
+    commitou.

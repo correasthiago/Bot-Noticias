@@ -89,7 +89,7 @@ def test_first_fsrs_card_is_born_through_normal_application_flow(
 
     assert repos.memory_states.get(competency_id) is None  # banco novo: nenhum card ainda
 
-    session, activity, tutor_output = drive_to_schedule_recall(orchestrator, learner.id, competency_id)
+    session, activity, tutor_output, now = drive_to_schedule_recall(orchestrator, learner.id, competency_id)
     assert activity.is_planned_recall is True
 
     outcome = orchestrator.submit_interaction(
@@ -97,6 +97,7 @@ def test_first_fsrs_card_is_born_through_normal_application_flow(
         learner_input="She has gone to school before.", help_level=HelpLevel.A0,
         production_result=ProductionResult.SPONTANEOUS_CORRECT,
         tutor_output_text=tutor_output.utterance if tutor_output else "",
+        now=now,
     )
 
     assert outcome.memory_eligibility is not None

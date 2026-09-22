@@ -129,6 +129,25 @@ def _apply_migration_atomically(conn: sqlite3.Connection, filename: str, sql: st
 
     diagnostic_note = _diagnose_migration(conn, filename)
 
+    # Secao 4 da terceira auditoria pos-entrega: o registro de bookkeeping
+    # em `schema_migrations` entra na MESMA transacao atomica do resto da
+    # migration - nunca como um INSERT separado depois que o script ja
+    # commitou. Sem isso, uma falha ao gravar esse registro (disco cheio,
+    # por exemplo) deixava o ESQUEMA ja migrado mas sem o registro de
+    # que foi aplicado: na proxima execucao, `run_migrations` tentaria
+    # aplicar a MESMA migration de novo sobre um banco que ja a tinha -
+    # tipicamente falhando de forma confusa (ex.: "duplicate column
+    # name"). Injetamos o INSERT diretamente no texto do script, logo
+    # ANTES do `COMMIT;` final dele (ver `_inject_bookkeeping_before_final_commit`)
+    # - assim uma falha nesse INSERT participa do MESMO rollback que
+    # qualquer outra instrucao do script, e o esquema inteiro permanece na
+    # versao anterior.
+    bookkeeping_sql = (
+        "INSERT INTO schema_migrations (filename, applied_at, notes) VALUES "
+        f"({_sql_quote(filename)}, {_sql_quote(utc_now_iso())}, {_sql_quote(diagnostic_note)});\n"
+    )
+    sql = _inject_bookkeeping_before_final_commit(sql, bookkeeping_sql)
+
     conn.execute("PRAGMA foreign_keys = OFF;")
     try:
         conn.executescript(sql)
@@ -142,10 +161,32 @@ def _apply_migration_atomically(conn: sqlite3.Connection, filename: str, sql: st
     finally:
         conn.execute("PRAGMA foreign_keys = ON;")
 
-    conn.execute(
-        "INSERT INTO schema_migrations (filename, applied_at, notes) VALUES (?, ?, ?);",
-        (filename, utc_now_iso(), diagnostic_note),
-    )
+
+def _sql_quote(value: str) -> str:
+    """Formata `value` como um literal de string SQL seguro (aspas
+    simples duplicadas). Usado so para os poucos valores que ESTE modulo
+    mesmo gera (nome de arquivo de migration, timestamp ISO, diagnostico
+    textual) e injeta no proprio script - nunca para dado vindo de fora,
+    ja que `executescript()` nao aceita parametros bindados."""
+
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _inject_bookkeeping_before_final_commit(sql: str, bookkeeping_sql: str) -> str:
+    """Insere `bookkeeping_sql` IMEDIATAMENTE ANTES do ultimo `COMMIT;` do
+    script - garantindo que o registro em `schema_migrations` entre na
+    MESMA transacao atomica do resto da migration. Migrations sem
+    `BEGIN`/`COMMIT` proprio (ex.: 0001, que roda em modo autocommit por
+    instrucao - nao ha nenhum passo arriscado o bastante para justificar
+    a transacao explicita) nao tem um `COMMIT;` final para achar; para
+    elas o bookkeeping e simplesmente ACRESCENTADO ao final do script,
+    preservando o comportamento anterior."""
+
+    marker = "COMMIT;"
+    idx = sql.rfind(marker)
+    if idx == -1:
+        return sql + "\n" + bookkeeping_sql
+    return sql[:idx] + bookkeeping_sql + sql[idx:]
 
 
 def _diagnose_migration(conn: sqlite3.Connection, filename: str) -> str:

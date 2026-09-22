@@ -76,15 +76,26 @@ def drive_to_schedule_recall():
     sessao para a MESMA competencia conta como um cluster so - precisa de
     sessoes distintas para produzir evidencia genuinamente independente.
 
-    Devolve (session, activity, tutor_output) da atividade de
-    SCHEDULE_RECALL, ainda SEM resposta submetida - o teste decide o que
-    submeter."""
+    Cada submissao usa um `now` explicito, avancando 2h por iteracao a
+    partir de uma data fixa - nunca o relogio real da maquina (Secao 2 da
+    terceira auditoria pos-entrega: a PRIMEIRA revisao de memoria verifica
+    o intervalo desde a primeira evidencia/aprendizagem; sem um relogio
+    controlado, esse intervalo dependeria de quao rapido o teste roda,
+    exatamente o tipo de fragilidade que esta auditoria pede para
+    eliminar).
+
+    Devolve (session, activity, tutor_output, now) da atividade de
+    SCHEDULE_RECALL, ainda SEM resposta submetida - `now` e o mesmo
+    relogio controlado, para o teste reusar na sua propria submissao."""
+
+    from datetime import datetime, timedelta, timezone
 
     from central_universal.domain.enums import HelpLevel, ProductionResult
     from central_universal.domain.ids import new_id as _new_id
 
     def _drive(orchestrator, learner_id: str, competency_id: str):
-        for _ in range(30):
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        for i in range(30):
             session = orchestrator.start_session(learner_id)
             focus = orchestrator.choose_focus_competency(learner_id)
             assert focus is not None, "competencia foi pulada (SKIP) antes de alcancar SCHEDULE_RECALL"
@@ -94,14 +105,16 @@ def drive_to_schedule_recall():
             activity, tutor_output = orchestrator.start_activity(
                 session_id=session.id, competency_id=competency_id, action=action
             )
+            now = base + timedelta(hours=2 * i)
             if activity.is_planned_recall:
-                return session, activity, tutor_output
+                return session, activity, tutor_output, now
 
             orchestrator.submit_interaction(
                 activity_id=activity.id, session_id=session.id, idempotency_key=_new_id(),
                 learner_input="resposta espontanea correta", help_level=HelpLevel.A0,
                 production_result=ProductionResult.SPONTANEOUS_CORRECT,
                 tutor_output_text=tutor_output.utterance if tutor_output else "",
+                now=now,
             )
         raise AssertionError("nao alcancou SCHEDULE_RECALL em tempo habil (possivel regressao na ladder do Decisor)")
 

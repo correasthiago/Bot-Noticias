@@ -47,6 +47,31 @@ da V0, nao de principio.
 - **Um card FSRS por competencia, nao por dimensao.** Ver DECISIONS.md
   #4. Se experiencia real mostrar que dimensoes esquecem em ritmos muito
   diferentes, isso e uma mudanca aditiva no adapter, nao uma reescrita.
+  Este continua sendo o UNICO ponto pendente da pergunta "um card por
+  competencia ou por dimensao?" apos a terceira auditoria pos-entrega -
+  nao foi revisitado nesta rodada, e permanece a decisao original.
+- **A politica Easy/Good/Hard e uma heuristica MECANICA sobre dois sinais
+  discretos, nao uma medida continua de esforco (v0.2.2).** Desde a
+  terceira auditoria pos-entrega, `derive_recall_rating` usa
+  EXCLUSIVAMENTE `help_level`/`production_result` da propria tentativa -
+  nunca confianca do avaliador (Secao 2, DECISIONS.md). Isso corrige o
+  erro de categoria anterior, mas a politica resultante ainda e uma
+  tabela de decisao fixa (2 sinais discretos -> 4 notas), nao uma medida
+  continua de esforco de recuperacao (tempo de resposta, numero de
+  tentativas, hesitacao) - esses sinais mais ricos so existem para voz
+  (ver "O que falta para voz" abaixo). A politica em si (quais
+  combinacoes viram Easy/Good/Hard) e um ponto de partida auditavel, nao
+  uma calibracao com dados reais de aprendizes.
+- **`first_review_min_interval_since_learning_seconds` usa a PRIMEIRA
+  evidencia de QUALQUER dimensao como proxy de "aprendizagem" (v0.2.2).**
+  `EvidenceEventRepository.first_created_at_for_competency` nao distingue
+  uma evidencia de ensino genuino (ex.: `comprehension`) de uma incidental
+  (`qualified_incidental`/`mere_presence`) ou de uma avaliacao que falhou
+  e foi reprocessada - qualquer evento conta como "o momento em que o
+  aprendiz comecou a aprender isto". Na pratica isso e conservador (tende
+  a marcar a aprendizagem mais cedo, nunca mais tarde, entao o intervalo
+  medido tende a ser maior, nao menor, que o real) mas nao e uma medida
+  pedagogicamente precisa de "primeira exposicao ao conteudo".
 
 ## Tecnicas
 
@@ -68,14 +93,29 @@ da V0, nao de principio.
   processos reais, so logicamente.
 - **Concorrencia real nao foi testada com processos separados do SO.**
   SQLite em WAL suporta um escritor por vez; para um unico usuario local
-  isso nunca e um problema. Desde v0.2.1, `restore_from_backup` pelo
-  menos DETECTA uma conexao concorrente (recusando prosseguir se nao
-  conseguir sair do modo WAL com exclusividade - ver DECISIONS.md #5) e
-  isso e testado com uma segunda `sqlite3.Connection`, mas ainda no MESMO
-  processo/thread do teste - nao ha teste com processos do SO realmente
-  separados disputando o mesmo arquivo. O timeout de espera pela
-  exclusividade (`_LOCK_TIMEOUT_SECONDS = 5.0` em `persistence/restore.py`)
-  e um numero arbitrario, nao calibrado contra nenhuma carga real.
+  isso nunca e um problema. Desde v0.2.1, `restore_from_backup` DETECTA
+  uma conexao concorrente (recusando prosseguir se nao conseguir sair do
+  modo WAL com exclusividade); desde v0.2.2, a guarda (`BEGIN EXCLUSIVE`
+  mantido aberto) protege a janela INTEIRA de copia/troca, nao so o
+  instante da checagem (ver DECISIONS.md #5/Pacote v0.2.2 #3) - mas isso
+  ainda e testado com uma segunda `sqlite3.Connection` no MESMO
+  processo/thread do teste, nao um processo do SO realmente separado. O
+  timeout de espera pela exclusividade (`_LOCK_TIMEOUT_SECONDS = 5.0` em
+  `persistence/restore.py`) e um numero arbitrario, nao calibrado contra
+  nenhuma carga real.
+- **A guarda de exclusividade do restore e liberada ANTES da verificacao
+  pos-troca (migrations/integrity_check), nao durante ela (v0.2.2).**
+  Depois do `os.replace`, `_release_guard` libera o lock (preso ao
+  arquivo ANTERIOR, ja substituido) e SO ENTAO uma conexao nova e aberta
+  para rodar `run_migrations`/`integrity_check` - ha uma janela residual,
+  pequena (poucas linhas de Python, sem I/O de disco no meio) mas real,
+  em que uma conexao de terceiros poderia escrever no arquivo
+  recem-restaurado antes da verificacao terminar. Fechar essa janela por
+  completo exigiria reusar a MESMA conexao/lock para todo o restante do
+  fluxo, o que colide com `run_migrations` gerenciar suas proprias
+  transacoes (`BEGIN IMMEDIATE`/`COMMIT` por migration, desde a correcao
+  do ponto 4) - nao ha como aninhar duas transacoes na mesma conexao. Sem
+  cobertura de teste dedicada (ver TESTING.md).
 - **Sem autenticacao/autorizacao.** A V0 assume fisicamente um unico
   computador de um unico usuario (Secao 1). Nao ha login, nao ha
   isolamento entre "learners" alem de uma FK — se o escopo mudar para
@@ -137,8 +177,10 @@ parcialmente.
    prosodica.
 3. Uma interface de captura de audio no navegador (Web Audio API) —
    nada disso existe na V0 textual.
-4. Recalibrar `rating_from_production_result` para considerar fluencia
-   oral, nao so corretude textual.
+4. Estender `memory.fsrs_adapter.derive_recall_rating` (desde v0.2.2, a
+   funcao que deriva Easy/Good/Hard de `help_level`/`production_result`)
+   para tambem considerar fluencia oral - tempo de resposta, pausas,
+   hesitacao - nao so corretude textual e nivel de suporte.
 
 ## Riscos tecnicos observados durante a implementacao
 
@@ -169,15 +211,23 @@ parcialmente.
   (normalizadas, nunca descartadas).
 - **A atomicidade explicita (`BEGIN IMMEDIATE`/`COMMIT` dentro do proprio
   arquivo .sql) e o diagnostico auditavel em `schema_migrations.notes`
-  foram aplicados especificamente a migration 0002 (v0.2.1), nao a TODA
-  migration presente ou futura.** `migrations/0001_init.sql` continua
-  rodando em modo autocommit por instrucao (e so cria tabelas com
-  `CREATE TABLE IF NOT EXISTS` - baixo risco de falha parcial
-  problematica). `persistence/migrations._diagnose_migration` hoje so
-  reconhece o nome `0002_v0_2_corrections.sql`; uma migration futura que
-  precise do mesmo tipo de diagnostico vai precisar do proprio ramo
-  explicito ali (documentado no docstring da funcao) - nao ha (ainda) um
-  mecanismo generico de "toda migration declara seu proprio diagnostico".
+  foram aplicados especificamente as migrations 0002 e 0003 (v0.2.1/
+  v0.2.2), nao a TODA migration presente ou futura.**
+  `migrations/0001_init.sql` continua rodando em modo autocommit por
+  instrucao (e so cria tabelas com `CREATE TABLE IF NOT EXISTS` - baixo
+  risco de falha parcial problematica). `persistence/migrations._diagnose_migration`
+  hoje so reconhece o nome `0002_v0_2_corrections.sql`; uma migration
+  futura que precise do mesmo tipo de diagnostico vai precisar do proprio
+  ramo explicito ali (documentado no docstring da funcao) - nao ha
+  (ainda) um mecanismo generico de "toda migration declara seu proprio
+  diagnostico". Desde v0.2.2, o PROPRIO registro de bookkeeping em
+  `schema_migrations` (nao so o diagnostico) entra na mesma transacao
+  atomica de QUALQUER migration com `BEGIN`/`COMMIT` proprio
+  (`_inject_bookkeeping_before_final_commit` localiza o `COMMIT;` final
+  do texto por busca de substring - um script que, por algum motivo
+  futuro, precisasse literalmente da string `"COMMIT;"` dentro de uma
+  string SQL ou comentario DEPOIS do seu proprio COMMIT de fechamento
+  confundiria essa busca; nenhuma migration atual faz isso).
 - **Ambiguidade original entre "EvidenceEvent" e "EvidenceAssessment" -
   RESOLVIDA no pacote de correcao v0.2.** A V0.1 tinha uma coluna
   `evidence_type` duplicada em `EvidenceEvent`; o pacote de correcao a

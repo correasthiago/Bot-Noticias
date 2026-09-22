@@ -23,9 +23,30 @@ que:
 
 v0.2.1 (auditoria pos-correcao): a NOTA FSRS (1-4) deixou de vir de
 `ProductionResult` (removido - `rating_from_production_result` nao
-existe mais). Ela e derivada EXCLUSIVAMENTE de
+existe mais). Nessa primeira correcao ela passou a vir da
 `EvidenceAssessment.classification`/`confidence` da propria avaliacao de
-recuperacao, via `derive_recall_rating`.
+recuperacao.
+
+Terceira auditoria pos-entrega (Secao 2): usar `confidence` para decidir
+Easy/Good/Hard era, na pratica, o MESMO erro de categoria de novo -
+`confidence` mede o quanto o AVALIADOR confia no proprio julgamento de
+classificacao (correto/incorreto), nunca o quao FACIL foi para o
+APRENDIZ recuperar a informacao. Uma avaliacao positiva de alta confianca
+virava "Easy" automaticamente mesmo quando a resposta so saiu certa com
+uma pista explicita. `derive_recall_rating` agora deriva Easy/Good/Hard
+EXCLUSIVAMENTE de dois sinais OBSERVAVEIS do processo de recuperacao da
+propria tentativa - `help_level` (quanto suporte foi dado ANTES da
+resposta) e `production_result` (COMO a resposta correta foi alcancada) -
+nunca de `confidence`. `confidence` continua sendo usada, mas SO como
+filtro de elegibilidade (`recall_min_confidence`), nunca como sinal de
+facilidade.
+
+A mesma auditoria tambem fechou uma lacuna na PRIMEIRA revisao de uma
+competencia: como nao existe `memory_state.last_review_at` para comparar,
+o intervalo minimo simplesmente nao era verificado. Agora ele e verificado
+contra a PRIMEIRA evidencia ja registrada para a competencia (proxy
+observavel de "quando o aprendiz comecou a aprender isto") via
+`first_review_min_interval_since_learning_seconds`.
 
 `memory_state` (o "card atual") e `memory_review_log` (o historico) sao
 escritos numa UNICA transacao junto com o proprio `MemoryObservation`:
@@ -48,7 +69,14 @@ from central_universal.domain.entities import (
     MemoryReviewLog,
     MemoryState,
 )
-from central_universal.domain.enums import Dimension, EvidenceRelation, MemoryCardState
+from central_universal.domain.enums import (
+    Dimension,
+    EvidenceRelation,
+    EvidenceType,
+    HelpLevel,
+    MemoryCardState,
+    ProductionResult,
+)
 from central_universal.domain.ids import new_id
 from central_universal.evidence.aggregation import AggregationConfig
 from central_universal.persistence.db import transaction
@@ -61,29 +89,78 @@ _STATE_MAP = {
 }
 
 
-def derive_recall_rating(assessment: EvidenceAssessment, config: AggregationConfig) -> int | None:
-    """Deriva a nota FSRS (1-4) EXCLUSIVAMENTE da avaliacao especifica de
-    recuperacao (classificacao + confianca) - nunca do `ProductionResult`
-    bruto da interacao (Secao 2 do pacote de correcao v0.2.1).
+def derive_recall_rating(
+    assessment: EvidenceAssessment,
+    *,
+    help_level: HelpLevel,
+    production_result: ProductionResult,
+) -> int | None:
+    """Deriva a nota FSRS (1-4) de SINAIS OBSERVAVEIS do processo de
+    recuperacao da propria tentativa - NUNCA da confianca do avaliador
+    (Secao 2 da terceira auditoria pos-entrega).
+
+    `confidence` mede o quanto o avaliador confia no proprio julgamento de
+    CLASSIFICACAO (a resposta estava certa ou errada?), nunca o quao facil
+    foi para o aprendiz RECUPERAR a informacao - uma avaliacao positiva de
+    alta confianca nao pode virar "Easy" so por isso (era exatamente o
+    erro que a versao anterior desta funcao cometia). `confidence` continua
+    relevante, mas so como filtro de ELEGIBILIDADE em
+    `evaluate_recall_eligibility` (`recall_min_confidence`).
 
     Uma avaliacao NEGATIVE sempre vira "Again" (o FSRS precisa desse sinal
-    para modelar esquecimento). Uma avaliacao POSITIVE vira Easy/Good/Hard
-    conforme a confianca do avaliador, usando os limiares configurados na
-    RuleVersion. Contraditoria/inconclusiva nunca chegam aqui - ja sao
-    filtradas por `evaluate_recall_eligibility`.
-    """
+    para modelar esquecimento). Uma avaliacao POSITIVE deriva Easy/Good/Hard
+    de dois sinais diretamente observaveis sobre COMO a resposta foi
+    produzida:
 
-    from central_universal.domain.enums import EvidenceType
+    - `help_level`: quanto suporte foi dado ANTES da resposta (A0 nenhum,
+      A1 contexto conduz a resposta, A2 pista explicita, A3 modelo/resposta
+      parcial ou total fornecida).
+    - `production_result`: como a resposta correta foi alcancada
+      (espontanea, com autocorrecao, apos pista, apos correcao externa).
+
+    Politica - CONSERVADORA quando os sinais nao apontam claramente para
+    "facil" (nunca assume Easy por omissao ou por ambiguidade):
+
+    - **Easy**: SEM nenhum suporte (`help_level=A0`) E resposta
+      espontaneamente correta na primeira tentativa
+      (`production_result=SPONTANEOUS_CORRECT`). O UNICO caso que conta
+      como recuperacao genuinamente sem esforco - os dois sinais tem que
+      concordar.
+    - **Hard**: houve suporte explicito ANTES da resposta (`help_level`
+      em A2/A3) OU a resposta so veio certa depois de uma pista/correcao
+      (`production_result` em CORRECT_AFTER_HINT/
+      CORRECT_AFTER_EXTERNAL_CORRECTION) - recuperacao aconteceu, mas com
+      esforco/apoio real. Isto vale mesmo se o OUTRO sinal parecer
+      favoravel (ex.: `help_level=A0` mas `production_result` registrado
+      como apos correcao e uma inconsistencia de dados - tratada pelo
+      caminho MENOS otimista, nunca o mais).
+    - **Good**: qualquer outro caso POSITIVE que nao se encaixe nos dois
+      acima (ex.: espontanea mas com autocorrecao propria, ou contexto
+      conduziu a resposta sem pista explicita) - a politica conservadora
+      para sinal ambiguo: nunca "Easy", mas tambem nao pune como "Hard"
+      quando houve sucesso razoavelmente independente.
+
+    Contraditoria/inconclusiva nunca chegam aqui - ja sao filtradas por
+    `evaluate_recall_eligibility`.
+    """
 
     if assessment.classification == EvidenceType.NEGATIVE:
         return int(fsrs.Rating.Again)
-    if assessment.classification == EvidenceType.POSITIVE:
-        if assessment.confidence >= config.recall_rating_easy_min_confidence:
-            return int(fsrs.Rating.Easy)
-        if assessment.confidence >= config.recall_rating_good_min_confidence:
-            return int(fsrs.Rating.Good)
+    if assessment.classification != EvidenceType.POSITIVE:
+        return None
+
+    needed_explicit_support = help_level in (HelpLevel.A2, HelpLevel.A3)
+    needed_correction = production_result in (
+        ProductionResult.CORRECT_AFTER_HINT,
+        ProductionResult.CORRECT_AFTER_EXTERNAL_CORRECTION,
+    )
+    if needed_explicit_support or needed_correction:
         return int(fsrs.Rating.Hard)
-    return None
+
+    if help_level == HelpLevel.A0 and production_result == ProductionResult.SPONTANEOUS_CORRECT:
+        return int(fsrs.Rating.Easy)
+
+    return int(fsrs.Rating.Good)
 
 
 @dataclass(frozen=True)
@@ -109,19 +186,25 @@ def evaluate_recall_eligibility(
     evidence_relation: EvidenceRelation | None,
     evidence_dimension: Dimension | None,
     assessment: EvidenceAssessment | None,
+    help_level: HelpLevel | None = None,
+    production_result: ProductionResult | None = None,
     memory_state: MemoryState | None,
+    first_evidence_at: str | None = None,
     config: AggregationConfig | None = None,
     now: datetime | None = None,
 ) -> MemoryObservationEligibility:
     """Decide se esta interacao pode gerar um MemoryObservation.
 
-    Cobre explicitamente a Secao 2 do pacote de correcao v0.2/v0.2.1: nao
-    revisa quando o avaliador falhou (assessment is None), a evidencia nao
-    e da dimensao RETENTION, a relacao nao e `target` (evidencia
-    incidental/mere_presence NUNCA conta), a classificacao e inconclusiva,
-    a confianca e baixa demais, ha causa alternativa pendente, a atividade
-    nao e uma recuperacao planejada, ou o intervalo desde a ultima revisao
-    e menor que o minimo definido na regra.
+    Cobre explicitamente a Secao 2 do pacote de correcao v0.2/v0.2.1/
+    terceira auditoria: nao revisa quando o avaliador falhou (assessment
+    is None), a evidencia nao e da dimensao RETENTION, a relacao nao e
+    `target` (evidencia incidental/mere_presence NUNCA conta), a
+    classificacao e inconclusiva, a confianca e baixa demais, ha causa
+    alternativa pendente, a atividade nao e uma recuperacao planejada, os
+    sinais observaveis (`help_level`/`production_result`) da propria
+    tentativa estao ausentes, ou o intervalo desde a ultima revisao (ou,
+    na PRIMEIRA revisao, desde a primeira evidencia/aprendizagem) e menor
+    que o minimo definido na regra.
     """
 
     config = config or AggregationConfig()
@@ -157,19 +240,39 @@ def evaluate_recall_eligibility(
             f"({config.recall_min_confidence:.2f})",
         )
 
-    rating = derive_recall_rating(assessment, config)
+    if help_level is None or production_result is None:
+        return MemoryObservationEligibility(
+            False,
+            "sinais observaveis da tentativa (help_level/production_result) ausentes - "
+            "impossivel derivar uma nota de recuperacao com a politica conservadora vigente",
+        )
+
+    rating = derive_recall_rating(assessment, help_level=help_level, production_result=production_result)
     if rating is None:
         return MemoryObservationEligibility(False, "classificacao da avaliacao nao produz uma nota de recuperacao valida")
 
+    reference = now or utc_now()
     interval_seconds: float | None = None
     if memory_state is not None and memory_state.last_review_at:
-        reference = now or utc_now()
         interval_seconds = (reference - parse_iso(memory_state.last_review_at)).total_seconds()
         if interval_seconds < config.recall_min_interval_seconds:
             return MemoryObservationEligibility(
                 False,
                 f"intervalo de {interval_seconds:.1f}s desde a ultima revisao e menor que o minimo "
                 f"definido pela regra ({config.recall_min_interval_seconds:.1f}s)",
+            )
+    elif first_evidence_at is not None:
+        # PRIMEIRA revisao desta competencia (sem memory_state ainda): o
+        # intervalo e verificado desde a PRIMEIRA evidencia registrada -
+        # nunca deixado sem checagem so porque nao ha uma revisao anterior
+        # para comparar (Secao 2 da terceira auditoria pos-entrega).
+        interval_seconds = (reference - parse_iso(first_evidence_at)).total_seconds()
+        if interval_seconds < config.first_review_min_interval_since_learning_seconds:
+            return MemoryObservationEligibility(
+                False,
+                f"intervalo de {interval_seconds:.1f}s desde a primeira evidencia (aprendizagem) e menor "
+                f"que o minimo exigido pela regra para a primeira revisao "
+                f"({config.first_review_min_interval_since_learning_seconds:.1f}s)",
             )
 
     interval_days = interval_seconds / 86400.0 if interval_seconds is not None else None

@@ -6,30 +6,32 @@
 python -m pytest -q
 ```
 
-Resultado atual: **119 testes, 119 passando, 0 falhando**, tempo total
-< 2s, 100% offline (nenhum teste faz chamada de rede — `MockProvider` e
+Resultado atual: **125 testes, 125 passando, 0 falhando**, tempo total
+< 3s, 100% offline (nenhum teste faz chamada de rede — `MockProvider` e
 usado em todos os cenarios que envolvem "IA", e
 `test_P11_offline_execution_fails_if_network_is_attempted` ativamente
 bloqueia qualquer tentativa de `socket.connect`/`create_connection`
-durante o ciclo completo, falhando o teste se algo tentar).
+durante o ciclo completo, falhando o teste se algo tentar). A suite
+inteira foi rodada 10 vezes consecutivas (e o teste antes-flaky de P3, 20
+vezes) para confirmar a ausencia de intermitencia apos a correcao v0.2.2.
 
 ## Camadas de teste
 
 | Arquivo | O que cobre | Testes |
 |---|---|---|
-| `test_persistence.py` | foreign keys, migrations idempotentes, roundtrip de entidades, imutabilidade de `raw_interaction` (incluindo a UNICA transicao permitida, `pending->completed`) | 6 |
+| `test_persistence.py` | foreign keys, migrations idempotentes, roundtrip de entidades, imutabilidade de `raw_interaction` (incluindo a UNICA transicao permitida, `pending->completed`), `sequence_number` monotonico com RELOGIO CONGELADO (`current`/`history` deterministicos mesmo com todas as linhas no mesmo `computed_at`) | 7 |
 | `test_evidence_aggregation.py` | `classify_dimension` pura: todos os limiares de estado (config-driven), retencao longitudinal, independencia A0/A1, contradicao, cap de contribuicao por cluster, exclusao por confianca baixa, ausencia TOTAL de rebaixamento automatico, thresholds nao hardcoded | 17 |
 | `test_evidence_service.py` | idempotencia, rejeicao de `idempotency_key` reutilizada com conteudo diferente (inclusive apos reinicio do processo), reprocessamento a partir da `RawInteraction` persistida, `mere_presence`, payload invalido, reconstrucao completa preservando geracoes, reprocessamento idempotente de interacao `pending`, exclusao de `inconclusive`/`alternative_cause` | 10 |
 | `test_clustering.py` | cluster computado no servidor a partir de `(activity_type, competency_targets)` - nunca do prompt: mesmo contexto/sessao colide (mesmo com prompts textualmente diferentes mas previsiveis), contextos/competencias/sessoes diferentes nao colidem, API nao aceita cluster id do chamador | 6 |
 | `test_decision_engine.py` | as 9 regras da Secao 17 (`choose_next_action`) e o roteamento SKIP/VALIDATE/STUDY (Secao 18), incluindo prioridade entre regras | 14 |
 | `test_decision_service.py` | integracao do Decisor com o banco: `DecisionEvent` gravado com justificativa | 1 |
-| `test_memory_adapter.py` | criacao/idempotencia de card, elegibilidade de observacao (dimensao RETENTION + relacao target + confianca + intervalo minimo, config-driven), nota FSRS derivada exclusivamente da EvidenceAssessment (nunca do ProductionResult) com casos explicitos de avaliacao negativa/baixa confianca/evidencia incidental/tentativas segundos-apartadas, review avanca due date, escrita atomica card+log+observation (falha em CADA uma das tres gravacoes testada via parametrize, byte a byte), reconstrucao do Card a partir do JSON, `is_recall_due` | 20 (18 defs, 1 parametrizado em 3) |
-| `test_migrations.py` | migration 0002 atomica (rollback completo diante de falha sintetica no meio do script), preserva TODAS as avaliacoes v0.1 (normalizando em vez de descartar as incompativeis com o novo CHECK), backup automatico antes de atualizar um banco existente, banco novo vazio nao dispara backup | 4 |
+| `test_memory_adapter.py` | criacao/idempotencia de card, elegibilidade de observacao (dimensao RETENTION + relacao target + confianca + intervalo minimo, config-driven), nota FSRS derivada EXCLUSIVAMENTE de sinais observaveis (help_level/production_result, nunca confianca nem ProductionResult bruto - alta confianca + pista explicita = Hard, nunca Easy), intervalo desde a aprendizagem verificado tambem na PRIMEIRA revisao, review avanca due date, escrita atomica card+log+observation (falha em CADA uma das tres gravacoes testada via parametrize, byte a byte), reconstrucao do Card a partir do JSON, `is_recall_due` | 23 (21 defs, 1 parametrizado em 3) |
+| `test_migrations.py` | migration 0002 atomica (rollback completo diante de falha sintetica no meio do script), preserva TODAS as avaliacoes v0.1 (normalizando em vez de descartar as incompativeis com o novo CHECK), backup automatico antes de atualizar um banco existente, banco novo vazio nao dispara backup, falha ao GRAVAR o registro em schema_migrations reverte o esquema inteiro | 5 |
 | `test_providers.py` | MockProvider produz tutor/evaluator validos (avaliando a dimensao que a atividade foi desenhada para exercitar); falha de provider e payload malformado nunca alteram estado | 4 |
-| `test_orchestration.py` | ciclo completo via `SessionOrchestrator` com MockProvider; primeiro card FSRS nasce pelo fluxo NORMAL da aplicacao (banco novo, sem `is_planned_recall=True` setado no teste, so a sequencia real de chamadas ate o Decisor escolher SCHEDULE_RECALL); atividade comum NAO chama FSRS; double-submit no nivel de orquestracao | 3 |
+| `test_orchestration.py` | ciclo completo via `SessionOrchestrator` com MockProvider; primeiro card FSRS nasce pelo fluxo NORMAL da aplicacao (banco novo, sem `is_planned_recall=True` setado no teste, so a sequencia real de chamadas ate o Decisor escolher SCHEDULE_RECALL, com relogio controlado via `now=`); atividade comum NAO chama FSRS; double-submit no nivel de orquestracao | 3 |
 | `test_integrity.py` | ciclo de pre-requisitos rejeitado na escrita (+ defesa por integrity_check contra bypass via SQL bruto), referencia pendurada, consistencia de geracao (multiplas geracoes 'active'), consistencia memory_state x memory_review_log | 6 |
 | `test_backup.py` | snapshot consistente e restauravel, falha de backup nao apaga estado, retencao mantem so os N mais recentes | 3 |
-| `test_restore.py` | restore real substitui e recupera o banco, snapshot invalido e rejeitado sem tocar no banco ativo, falha pos-troca reverte automaticamente, politica de backup automatico respeita intervalo minimo, WAL genuinamente ativo e achatado antes da troca, conexao concorrente bloqueia a restauracao sem tocar em arquivos, reversao limpa com WAL ativo | 7 |
+| `test_restore.py` | restore real substitui e recupera o banco, snapshot invalido e rejeitado sem tocar no banco ativo, falha pos-troca reverte automaticamente, politica de backup automatico respeita intervalo minimo, WAL genuinamente ativo e achatado antes da troca, conexao concorrente bloqueia a restauracao sem tocar em arquivos, reversao limpa com WAL ativo, uma conexao aberta DEPOIS da checagem de exclusividade e ANTES do `os.replace` e bloqueada ao tentar escrever | 8 |
 | `test_seed_english_graph.py` | seed idempotente, sem ciclos, todas as referencias validas | 3 |
 | `test_web.py` | fluxo HTTP completo (start -> next -> answer -> next -> end), paginas de mapa/auditoria, backup manual via UI, falha de restore mostrada ao usuario na pagina de auditoria | 4 |
 | `test_redteam.py` | **P1-P11**, um teste por item do pacote de correcao v0.2 (ver abaixo) | 11 |
@@ -92,6 +94,20 @@ menos um teste que exercita o fluxo REAL, nao um atalho:
 | 5 | Restore impede escritas concorrentes, trata WAL/sidecars, mostra falha ao usuario | `test_restore.py::test_restore_aborts_cleanly_with_concurrent_connection_open`, `test_web.py::test_restore_failure_is_shown_to_the_user` |
 | 6 | Prompts diferentes mas previsiveis na mesma sessao nao promovem competencia sozinhos | `test_clustering.py::test_predictable_template_variation_does_not_prove_independence` |
 
+## Terceira auditoria pos-entrega — pacote de correcao v0.2.2
+
+Uma terceira auditoria sobre o commit que fechou a v0.2.1 encontrou
+quatro pontos, incluindo uma falha intermitente que o proprio auditor
+reproduziu rodando a suite duas vezes seguidas (ver secao "Pacote de
+correcao v0.2.2" em `DECISIONS.md` para a decisao completa de cada um):
+
+| # | Requisito | Teste principal |
+|---|---|---|
+| 1 | "Estado atual" escolhido por sequence_number monotonico, nunca por computed_at+id aleatorio; reproduzido com relogio congelado | `test_persistence.py::test_competency_state_current_and_history_use_monotonic_sequence_frozen_clock` |
+| 2 | Nota FSRS de sinais observaveis (help_level/production_result), nunca de confianca; primeira revisao verifica intervalo desde a aprendizagem | `test_memory_adapter.py::test_derive_recall_rating_uses_observable_signals_not_confidence`, `test_first_review_too_soon_after_learning_is_never_eligible` |
+| 3 | Guarda de exclusividade do restore protege ate o fim da troca - conexao aberta depois da checagem e antes do os.replace e bloqueada | `test_restore.py::test_restore_blocks_a_connection_opened_after_the_check_and_before_the_swap` |
+| 4 | Registro em schema_migrations na mesma transacao atomica da migration; falha ao grava-lo reverte o esquema inteiro | `test_migrations.py::test_migration_bookkeeping_failure_leaves_whole_schema_at_previous_version` |
+
 ## O que NAO esta coberto (limitacoes de teste, nao so de produto)
 
 - Nao ha teste de carga/concorrencia real (multiplos processos escrevendo
@@ -100,11 +116,22 @@ menos um teste que exercita o fluxo REAL, nao um atalho:
   avaliacao (`try_claim_evaluation`) e desenhada para ser segura sob
   concorrencia gracas ao lock `BEGIN IMMEDIATE` do SQLite, mas isso nao
   foi exercitado com threads/processos reais. O mesmo vale para
-  `test_restore.py::test_restore_aborts_cleanly_with_concurrent_connection_open`:
-  a "conexao concorrente" e uma segunda `sqlite3.Connection` no MESMO
-  processo/thread do teste, nao um processo separado de verdade - prova
-  o mecanismo (o proprio SQLite recusa sair do modo WAL com outra conexao
-  aberta), mas nao testa contencao real entre processos do SO.
+  `test_restore.py::test_restore_aborts_cleanly_with_concurrent_connection_open`
+  e `test_restore_blocks_a_connection_opened_after_the_check_and_before_the_swap`:
+  a "conexao concorrente"/"escritor tardio" e uma segunda
+  `sqlite3.Connection` no MESMO processo/thread do teste, nao um processo
+  separado de verdade - prova o mecanismo (o proprio SQLite recusa sair
+  do modo WAL com outra conexao aberta, e uma `BEGIN EXCLUSIVE` mantida
+  aberta pela guarda bloqueia escritas concorrentes de verdade), mas nao
+  testa contencao real entre processos do SO.
+- A guarda de exclusividade do restore (`_acquire_exclusive_guard`) e
+  liberada IMEDIATAMENTE apos o `os.replace` (antes de reabrir o banco
+  para `run_migrations`/`integrity_check`, que gerenciam suas proprias
+  transacoes) - ha uma janela residual, pequena mas real, entre liberar a
+  guarda antiga e abrir a conexao de verificacao, sem cobertura de teste
+  dedicada. Fechar essa janela por completo exigiria reusar a MESMA
+  conexao para o restante da verificacao (nao testado; ver
+  KNOWN_LIMITATIONS.md).
 - Nao ha teste de UI automatizado com navegador real (Playwright/Selenium);
   a cobertura de `/session`, `/map`, `/audit` e via `TestClient` do
   FastAPI (HTTP direto), o que valida rotas e HTML gerado mas nao

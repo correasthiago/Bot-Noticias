@@ -601,3 +601,161 @@ Testado em `test_clustering.py::test_predictable_template_variation_does_not_pro
 (tres prompts textualmente distintos, mesma competencia/sessao/tipo,
 `len(cluster_ids) == 1`) e em
 `test_redteam.py::test_P4_different_activity_ids_same_context_collapse_into_one_cluster`.
+
+---
+
+## Pacote de correcao v0.2.2 (terceira auditoria pos-entrega)
+
+Uma terceira auditoria, sobre o commit que fechou o pacote v0.2.1,
+encontrou quatro pontos: um bug de nao-determinismo intermitente (P3
+falhava de vez em quando), um erro de categoria que sobreviveu a
+correcao anterior (confianca do avaliador usada como sinal de facilidade
+de recuperacao), e duas janelas de exclusividade/atomicidade que nao
+cobriam a operacao inteira (restore, migration 0002). A nova politica de
+rating/intervalo esta registrada em `RuleVersion` via
+`evidence.rule_versions.build_v0_2_2_rule_version` - ver
+PEDAGOGICAL_CONSTITUTION.md (Principio 28) e DATA_MODEL.md.
+
+### #1. `sequence_number` monotonico e explicito substitui `computed_at`+`id` para "estado atual"
+
+**Problema:** `CompetencyStateRepository.current()` escolhia a linha mais
+recente por `ORDER BY computed_at DESC, id DESC`. `computed_at` e um
+timestamp de texto; sob escritas rapidas (o proprio
+`test_P3_two_negatives_from_same_cluster_never_corroborate_regression`
+grava varias avaliacoes em sequencia) duas linhas podiam receber o MESMO
+`computed_at` se a resolucao do relogio do SO fosse mais grosseira que o
+tempo entre duas gravacoes. Quando isso acontecia, o desempate caia para
+`id DESC` - e `id` e um `uuid4().hex` ALEATORIO, entao qual linha
+"vencia" variava de execucao para execucao: a mesma suite passava ou
+falhava dependendo so da sorte do UUID (reproduzido pelo auditor: 118/119
+numa execucao, 119/119 na seguinte).
+
+**Decisao:** `competency_state` ganhou `sequence_number INTEGER NOT
+NULL` (migration `0003_monotonic_projection_sequence.sql`, com
+`UNIQUE INDEX` proprio). `CompetencyStateRepository.insert` atribui o
+proximo valor (`MAX(sequence_number) + 1`) DENTRO da mesma escrita -
+nunca informado pelo chamador. `current()`/`history()`/`list_by_generation()`
+passaram a ordenar EXCLUSIVAMENTE por `sequence_number` - `computed_at`
+continua existindo (e o "quando", para exibicao/auditoria), mas nunca
+mais decide ordem. O backfill da migration usa `ROW_NUMBER() OVER (ORDER
+BY rowid)` - `competency_state` nunca permite `DELETE` (trigger de
+imutabilidade), entao `rowid` nunca foi reciclado e reflete fielmente a
+ordem de criacao original.
+
+Testado com o RELOGIO CONGELADO (nunca dependendo da velocidade real da
+maquina, ao contrario do bug original):
+`test_persistence.py::test_competency_state_current_and_history_use_monotonic_sequence_frozen_clock`
+grava 30 linhas com o MESMO `computed_at` e confirma que `current()`
+devolve sempre a ULTIMA gravada e `history()` preserva a ordem real de
+insercao - 20 execucoes consecutivas de
+`test_P3_two_negatives_from_same_cluster_never_corroborate_regression` e
+10 execucoes consecutivas da suite inteira (125/125) confirmaram o fim da
+intermitencia.
+
+### #2. Nota FSRS derivada de sinais observaveis, nunca de confianca; primeira revisao tambem verifica intervalo desde a aprendizagem
+
+**Problema:** a v0.2.1 corrigiu o mapeamento direto `ProductionResult ->
+Rating`, mas cometeu o MESMO tipo de erro de novo: `derive_recall_rating`
+usava `EvidenceAssessment.confidence` para decidir Easy/Good/Hard.
+`confidence` mede o quanto o AVALIADOR confia no proprio julgamento de
+classificacao (a resposta estava certa?), nunca o quao FACIL foi para o
+APRENDIZ recuperar a informacao - uma avaliacao positiva de alta
+confianca virava "Easy" automaticamente mesmo quando a resposta so saiu
+certa com uma pista explicita. Alem disso, a PRIMEIRA revisao de uma
+competencia (sem `memory_state.last_review_at` para comparar) nunca
+verificava intervalo nenhum.
+
+**Decisao dupla:**
+
+1. `derive_recall_rating` deixou de receber `confidence`/`AggregationConfig`
+   e passou a exigir `help_level`/`production_result` - os dois sinais
+   OBSERVAVEIS do processo de recuperacao da propria tentativa. Politica
+   conservadora (nunca assume Easy por omissao): **Easy** exige
+   `help_level=A0` E `production_result=SPONTANEOUS_CORRECT` ao MESMO
+   tempo; **Hard** se houve suporte explicito (`A2`/`A3`) OU a resposta
+   so veio certa apos pista/correcao; **Good** para qualquer outro caso
+   POSITIVE (ex.: autocorrecao espontanea, ou contexto levou a resposta
+   sem pista explicita). `confidence` continua existindo, mas SO como
+   filtro de ELEGIBILIDADE (`recall_min_confidence`) - os dois limiares
+   que a v0.2.1 introduzira para converter confianca em rating
+   (`recall_rating_easy_min_confidence`/`..._good_min_confidence`) foram
+   REMOVIDOS de `AggregationConfig`.
+2. `first_review_min_interval_since_learning_seconds` (novo campo):
+   `evaluate_recall_eligibility`, quando `memory_state is None` (primeira
+   revisao), agora verifica o intervalo desde a PRIMEIRA evidencia ja
+   registrada para a competencia (`EvidenceEventRepository.first_created_at_for_competency`,
+   um proxy observavel de "quando o aprendiz comecou a aprender isto"),
+   contra este novo limiar - nunca mais deixado sem checagem so porque
+   nao ha uma revisao anterior para comparar.
+
+Para permitir testar o intervalo desde a aprendizagem sem depender da
+velocidade real da maquina (o MESMO tipo de fragilidade do ponto #1
+acima), `SessionOrchestrator.submit_interaction` ganhou um parametro
+opcional `now` que, quando informado, substitui o relogio real para
+TODOS os timestamps daquela submissao (`RawInteraction.occurred_at`,
+`EvidenceEvent`/`EvidenceAssessment.created_at`, o `review_datetime` da
+revisao FSRS) - omitido, usa sempre o relogio real de sempre (chamadores
+web nunca o passam). A fixture `drive_to_schedule_recall` usa isso para
+avancar um relogio controlado (2h por iteracao) em vez do relogio real.
+
+Testado em `test_memory_adapter.py::test_derive_recall_rating_uses_observable_signals_not_confidence`
+(confianca altissima + pista explicita = Hard, nunca Easy),
+`test_first_review_too_soon_after_learning_is_never_eligible` e
+`test_first_review_long_after_learning_is_eligible`.
+
+### #3. Guarda de exclusividade do restore protege ate o fim da troca ou reversao, nao so o instante da checagem
+
+**Problema:** `restore_from_backup` abria uma conexao de sondagem,
+conferia exclusividade (achatando o WAL) e FECHAVA essa conexao
+imediatamente, so entao copiando/trocando os arquivos. Entre o fechamento
+da sondagem e o `os.replace`, nada segurava nenhum lock - uma conexao
+NOVA, aberta nesse meio-tempo, podia escrever livremente no banco ativo
+exatamente durante a janela de copia/troca.
+
+**Decisao:** `_acquire_exclusive_guard` agora MANTEM a conexao aberta com
+uma transacao `BEGIN EXCLUSIVE` (apos achatar o WAL e sair do modo WAL)
+ate o chamador liberar explicitamente (`_release_guard`) - o lock
+continua valendo durante toda a copia do backup para staging e o
+`os.replace`. So e liberado IMEDIATAMENTE apos a troca (o lock, preso ao
+arquivo ANTERIOR ja substituido, deixa de proteger algo util a partir
+dai). No caminho de FALHA, a reversao tambem tenta (best-effort) a mesma
+exclusividade antes de copiar a copia de seguranca de volta - e passou a
+usar copia-para-staging + `os.replace` atomico, nunca mais sobrescrevendo
+`db_path` com bytes soltos via `shutil.copy2` direto (o que podia expor
+um leitor concorrente a um arquivo pela metade).
+
+Testado em
+`test_restore.py::test_restore_blocks_a_connection_opened_after_the_check_and_before_the_swap`:
+intercepta `shutil.copy2` bem no meio do fluxo real (a copia do backup
+para staging, que acontece DEPOIS da checagem de exclusividade e ANTES
+do `os.replace`) e abre uma conexao nova ali dentro, confirmando que a
+escrita dela e recusada (`OperationalError: database is locked`) e que a
+restauracao em si conclui normalmente, sem o dado do "escritor tardio".
+
+### #4. Registro em `schema_migrations` entra na mesma transacao atomica da propria migration
+
+**Problema:** o `INSERT INTO schema_migrations` de bookkeeping acontecia
+DEPOIS que `executescript()` retornava - ou seja, depois que o `COMMIT;`
+embutido no proprio arquivo .sql ja tinha comitado toda a migration. Uma
+falha nesse INSERT (disco cheio, por exemplo) deixava o ESQUEMA ja
+migrado mas SEM o registro de que a migration tinha sido aplicada: na
+proxima execucao, `run_migrations` tentaria aplicar a MESMA migration de
+novo sobre um banco que ja a tinha, tipicamente falhando de forma confusa
+(ex.: coluna/tabela ja existe).
+
+**Decisao:** `_apply_migration_atomically` agora injeta o `INSERT INTO
+schema_migrations` diretamente no TEXTO do script, IMEDIATAMENTE antes do
+`COMMIT;` final dele (`_inject_bookkeeping_before_final_commit`, que
+localiza a ultima ocorrencia literal de `COMMIT;` no texto) - o registro
+passa a fazer parte da MESMA transacao SQL que o resto da migration.
+Migrations sem `BEGIN`/`COMMIT` proprio (0001, que roda em modo
+autocommit por instrucao) continuam recebendo o bookkeeping acrescentado
+ao final, sem mudanca de comportamento.
+
+Testado em
+`test_migrations.py::test_migration_bookkeeping_failure_leaves_whole_schema_at_previous_version`:
+pre-semeia uma linha com o MESMO filename que uma migration sintetica vai
+tentar gravar, forcando o INSERT de bookkeeping (a ULTIMA instrucao do
+script) a violar a PRIMARY KEY - confirma que nem a tabela nem os dados
+que a migration sintetica criou sobrevivem ao ROLLBACK, e que o registro
+de bookkeeping original permanece unico e intocado.

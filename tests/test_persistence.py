@@ -26,6 +26,67 @@ def test_migrations_idempotent(conn: sqlite3.Connection) -> None:
     assert len(available_migrations()) >= 1
 
 
+def test_competency_state_current_and_history_use_monotonic_sequence_frozen_clock(
+    repos: Repositories, make_competency, make_rule_version
+) -> None:
+    """Terceira auditoria pos-entrega, ponto 1: reproduz a falha
+    intermitente de `test_P3_two_negatives_from_same_cluster_never_corroborate_regression`
+    com o RELOGIO CONGELADO - todas as linhas gravadas com o MESMO
+    `computed_at`, exatamente a condicao (resolucao de relogio do SO mais
+    grosseira que o tempo entre duas gravacoes) que produzia uma escolha
+    de "estado atual" nao-deterministica (desempate por `id`, um
+    `uuid4().hex` aleatorio). `current()`/`history()` agora decidem
+    exclusivamente por `sequence_number` (inteiro monotonico explicito) -
+    o resultado abaixo precisa ser o MESMO em toda execucao, nunca
+    depender de qual UUID "ganhou" o sorteio."""
+
+    from central_universal.domain.entities import CompetencyState
+    from central_universal.domain.enums import CompetencyDimensionState, Dimension
+    from central_universal.evidence.service import ensure_active_generation
+
+    competency_id = make_competency()
+    rule_version = make_rule_version()
+    generation_id = ensure_active_generation(repos, rule_version)
+
+    frozen_computed_at = "2026-01-01T00:00:00.000000+00:00"
+    states_in_order = [
+        CompetencyDimensionState.NOT_ASSESSED,
+        CompetencyDimensionState.INSUFFICIENT_EVIDENCE,
+        CompetencyDimensionState.ACQUIRING,
+        CompetencyDimensionState.DEMONSTRATED,
+        CompetencyDimensionState.CONSOLIDATED,
+    ] * 6  # 30 gravacoes seguidas, todas com o MESMO computed_at
+
+    inserted_ids: list[str] = []
+    for state_value in states_in_order:
+        row = CompetencyState(
+            id=new_id(),
+            generation_id=generation_id,
+            competency_id=competency_id,
+            dimension=Dimension.ACCURACY,
+            state=state_value,
+            possible_regression=False,
+            has_unresolved_contradiction=False,
+            last_evidence_assessment_id=None,
+            rule_version_id=rule_version.id,
+            computed_at=frozen_computed_at,  # relogio congelado: NUNCA muda entre gravacoes
+        )
+        repos.competency_states.insert(row)
+        inserted_ids.append(row.id)
+
+    current = repos.competency_states.current(competency_id, Dimension.ACCURACY)
+    assert current is not None
+    assert current.id == inserted_ids[-1]  # a ULTIMA linha gravada, nunca uma escolhida por sorteio de id
+    assert current.state == states_in_order[-1]
+
+    history = repos.competency_states.history(competency_id, Dimension.ACCURACY)
+    assert [row.id for row in history] == inserted_ids  # ordem de insercao real, preservada
+
+    sequence_numbers = [row.sequence_number for row in history]
+    assert sequence_numbers == sorted(sequence_numbers)
+    assert len(set(sequence_numbers)) == len(sequence_numbers)  # estritamente unicos, nunca repetidos
+
+
 def test_learner_roundtrip(repos: Repositories) -> None:
     learner = Learner(id=new_id(), display_name="Aluno Um", created_at=utc_now_iso())
     repos.learners.insert(learner)

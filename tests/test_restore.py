@@ -166,6 +166,69 @@ def test_restore_aborts_cleanly_with_concurrent_connection_open(tmp_path: Path):
     assert result2.success is True
 
 
+def test_restore_blocks_a_connection_opened_after_the_check_and_before_the_swap(tmp_path: Path, monkeypatch):
+    """Ponto 3 da terceira auditoria pos-entrega: 'proteja toda a operacao
+    de restore contra novas conexoes e escritas, desde a verificacao de
+    exclusividade ate o fim da troca ou reversao'. Uma conexao aberta
+    DEPOIS da checagem de exclusividade, mas ANTES do `os.replace` (no
+    meio da copia do backup para staging), precisa ser bloqueada se
+    tentar escrever - a guarda continua com o lock exclusivo ate a troca
+    terminar, nao so ate o instante da checagem."""
+
+    import central_universal.persistence.restore as restore_module
+
+    db_path = tmp_path / "central.db"
+    conn = connect(db_path)
+    run_migrations(conn)
+    repos = Repositories(conn)
+    learner = Learner(id=new_id(), display_name="Original", created_at=utc_now_iso())
+    repos.learners.insert(learner)
+    backup_event = create_backup(conn, repos, backup_dir=tmp_path / "backups")
+    assert backup_event.success is True
+    conn.close()  # nenhuma conexao "oficial" aberta - simula o app real (cada request abre/fecha a sua)
+
+    staging_path = db_path.with_name(db_path.name + ".restoring")
+    attempt: dict[str, object] = {}
+    real_copy2 = restore_module.shutil.copy2
+
+    def spy_copy2(src, dst, *args, **kwargs):
+        # so intercepta a copia do BACKUP para staging - acontece DEPOIS
+        # da checagem de exclusividade (ja feita antes desta chamada) e
+        # ANTES do os.replace (que so vem depois que esta copia retorna).
+        if str(dst) == str(staging_path) and not attempt:
+            attempt["ran"] = True
+            late_conn = sqlite3.connect(str(db_path), timeout=0.2)
+            try:
+                late_conn.execute("BEGIN IMMEDIATE;")
+                late_conn.execute(
+                    "INSERT INTO learner (id, display_name, created_at) VALUES (?, ?, ?);",
+                    (new_id(), "Escritor tardio", utc_now_iso()),
+                )
+                late_conn.execute("COMMIT;")
+                attempt["blocked"] = False
+            except sqlite3.OperationalError as exc:
+                attempt["blocked"] = True
+                attempt["error"] = str(exc)
+            finally:
+                late_conn.close()
+        return real_copy2(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(restore_module.shutil, "copy2", spy_copy2)
+
+    result = restore_from_backup(db_path, backup_event.backup_path)
+
+    assert attempt.get("ran") is True  # a janela realmente foi exercitada
+    assert attempt.get("blocked") is True  # a escrita tardia foi recusada pela guarda
+    assert "locked" in str(attempt.get("error", "")).lower()
+    assert result.success is True  # a restauracao em si prossegue normalmente
+
+    restored = connect(db_path)
+    restored_repos = Repositories(restored)
+    assert restored_repos.learners.get(learner.id) is not None
+    assert all(l.display_name != "Escritor tardio" for l in restored_repos.learners.list_all())
+    restored.close()
+
+
 def test_restore_reverts_cleanly_when_swap_target_had_active_wal(tmp_path: Path, monkeypatch):
     """Combina reversao (integrity_check falha apos a troca) com um WAL
     ativo no banco original - a reversao precisa devolver exatamente o

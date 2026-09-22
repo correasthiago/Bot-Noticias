@@ -382,12 +382,16 @@ def test_P6_two_rule_versions_with_different_config_diverge(repos, make_competen
 def test_P7_memory_review_log_failure_never_alters_memory_state(repos, make_competency, make_rule_version, orchestrator_factory, monkeypatch):
     competency_id = make_competency()
     learner = _learner(repos)
-    # `recall_min_interval_seconds=0` isola este teste do relogio real:
-    # a segunda tentativa de recuperacao (segundos depois da primeira, em
-    # tempo de execucao do teste) precisa continuar elegivel para exercitar
-    # a falha de escrita - o intervalo minimo entre revisoes e o que a
-    # Secao 2 da correcao v0.2.1 testa em test_memory_adapter.py.
-    rule_version = make_rule_version(config=AggregationConfig(recall_min_interval_seconds=0.0))
+    # `recall_min_interval_seconds=0`/`first_review_min_interval_since_learning_seconds=0`
+    # isolam este teste do relogio real: a atividade1 e a PRIMEIRA
+    # evidencia desta competencia (intervalo desde a aprendizagem ~0s) e a
+    # atividade2 e a segunda tentativa de recuperacao (segundos depois da
+    # primeira, em tempo de execucao do teste) - ambas precisam continuar
+    # elegiveis para exercitar a falha de escrita; a politica de intervalo
+    # em si e o que `test_memory_adapter.py` testa isoladamente.
+    rule_version = make_rule_version(config=AggregationConfig(
+        recall_min_interval_seconds=0.0, first_review_min_interval_since_learning_seconds=0.0,
+    ))
     orchestrator = orchestrator_factory(MockProvider(), rule_version)
     session = orchestrator.start_session(learner.id)
 

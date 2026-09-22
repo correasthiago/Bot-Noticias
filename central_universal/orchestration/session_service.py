@@ -12,11 +12,12 @@ na ordem certa, os modulos que ja a implementam.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from central_universal.decision.engine import ActionOutcome, RoutingOutcome
 from central_universal.decision.service import DecisionService
-from central_universal.domain.clock import utc_now_iso
+from central_universal.domain.clock import to_utc_iso, utc_now_iso
 from central_universal.domain.entities import (
     Activity,
     CompetencyState,
@@ -216,10 +217,22 @@ class SessionOrchestrator:
         help_level: HelpLevel,
         production_result: ProductionResult,
         tutor_output_text: str = "",
+        now: datetime | None = None,
     ) -> InteractionOutcome:
+        """`now`, quando informado, substitui o relogio real para TODOS os
+        timestamps que esta submissao produz (RawInteraction.occurred_at,
+        EvidenceEvent/EvidenceAssessment.created_at, o `review_datetime`
+        da revisao FSRS). Existe para permitir testar o intervalo
+        desde-a-ultima-revisao/desde-a-aprendizagem (Secao 2 da terceira
+        auditoria pos-entrega) sem depender da velocidade real da maquina
+        - em producao (chamadores web) e sempre omitido, usando o relogio
+        real de sempre."""
+
         activity = self.repos.activities.get(activity_id)
         if activity is None:
             raise ValueError(f"atividade desconhecida: {activity_id}")
+
+        now_iso = to_utc_iso(now) if now is not None else None
 
         # Secao 3 do pacote de correcao v0.2.1: uma idempotency_key
         # reutilizada com atividade/sessao/conteudo DIFERENTE e rejeitada
@@ -233,6 +246,7 @@ class SessionOrchestrator:
             tutor_output=tutor_output_text,
             help_level=help_level,
             production_result=production_result,
+            occurred_at=now_iso,
         )
 
         if raw_interaction.evaluation_status == EvaluationStatus.COMPLETED:
@@ -281,6 +295,7 @@ class SessionOrchestrator:
                     evaluator_output=evaluator_output,
                     rule_version=self.rule_version,
                     evaluator_provider_event_id=eval_provider_event.id,
+                    recorded_at=now_iso,
                 )
             competency_states = eval_result.competency_states
         # Se evaluator_output for None (avaliador falhou ou devolveu algo
@@ -310,13 +325,25 @@ class SessionOrchestrator:
 
             memory_state_before = self.repos.memory_states.get(target_id)
             config = AggregationConfig.from_json(self.rule_version.config_json)
+            # Secao 2 da terceira auditoria pos-entrega: a nota FSRS vem
+            # dos sinais OBSERVAVEIS desta tentativa especifica
+            # (help_level/production_result da RawInteraction PERSISTIDA -
+            # nunca de parametros frescos, mesmo motivo do ponto 3), nunca
+            # da confianca do avaliador. Na PRIMEIRA revisao (sem
+            # memory_state ainda), o intervalo e verificado desde a
+            # primeira evidencia registrada para a competencia.
+            first_evidence_at = self.repos.evidence_events.first_created_at_for_competency(target_id)
             memory_eligibility = evaluate_recall_eligibility(
                 activity=activity,
                 evidence_relation=matching_event.relation if matching_event else None,
                 evidence_dimension=matching_event.dimension if matching_event else None,
                 assessment=matching_assessment,
+                help_level=raw_interaction.help_level,
+                production_result=raw_interaction.production_result,
                 memory_state=memory_state_before,
+                first_evidence_at=first_evidence_at,
                 config=config,
+                now=now,
             )
             # Secao 2 do pacote de correcao v0.2: se nao for elegivel, o
             # FSRS NUNCA e chamado - nem para avaliador que falhou, nem
@@ -329,13 +356,14 @@ class SessionOrchestrator:
                     raw_interaction_id=raw_interaction.id,
                     evidence_assessment_id=matching_assessment.id,
                     eligibility=memory_eligibility,
+                    review_datetime=now,
                 )
 
         next_routing: RoutingOutcome | None = None
         next_action: ActionOutcome | None = None
         if target_id is not None:
             session = self.repos.sessions.get(session_id)
-            recall_due = self.memory_adapter.is_recall_due(target_id)
+            recall_due = self.memory_adapter.is_recall_due(target_id, now=now)
             next_routing, next_action = self.decision_service.decide(
                 competency_id=target_id,
                 learner_id=session.learner_id if session else "",

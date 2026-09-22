@@ -109,7 +109,7 @@ def test_migration_0002_preserves_all_v01_evaluations_including_incompatible_one
     # "reinicio"/upgrade: conexao nova, migrations pendentes aplicadas.
     upgraded = connect(db_path)
     applied = run_migrations(upgraded, backup_dir=tmp_path / "backups")
-    assert applied == ["0002_v0_2_corrections.sql"]
+    assert applied == ["0002_v0_2_corrections.sql", "0003_monotonic_projection_sequence.sql"]
 
     after_count = upgraded.execute("SELECT COUNT(*) AS n FROM evidence_assessment;").fetchone()["n"]
     assert after_count == before_count  # nenhuma avaliacao foi descartada
@@ -158,7 +158,7 @@ def test_migration_pending_on_fresh_empty_database_does_not_trigger_backup(tmp_p
     conn = connect(db_path)
 
     applied = run_migrations(conn, backup_dir=backup_dir)
-    assert applied == ["0001_init.sql", "0002_v0_2_corrections.sql"]
+    assert applied == ["0001_init.sql", "0002_v0_2_corrections.sql", "0003_monotonic_projection_sequence.sql"]
     assert not backup_dir.exists() or not any(backup_dir.glob("central-*.db"))
     conn.close()
 
@@ -192,6 +192,53 @@ def test_migration_atomic_rollback_on_mid_script_failure(conn: sqlite3.Connectio
     # PRAGMA foreign_keys foi restaurado mesmo apos a falha.
     fk_state = conn.execute("PRAGMA foreign_keys;").fetchone()[0]
     assert fk_state == 1
+
+    # a conexao continua utilizavel normalmente depois do rollback.
+    conn.execute("SELECT 1;")
+
+
+def test_migration_bookkeeping_failure_leaves_whole_schema_at_previous_version(conn: sqlite3.Connection) -> None:
+    """Ponto 4 da terceira auditoria pos-entrega: 'inclua o registro em
+    schema_migrations na mesma transacao da migracao 0002. Teste falha ao
+    gravar esse registro e confirme que o esquema inteiro permanece na
+    versao anterior.'
+
+    Pre-semeia uma linha com o MESMO filename que a migration sintetica
+    vai tentar gravar - o INSERT de bookkeeping (agora dentro do proprio
+    script, injetado logo antes do COMMIT final) viola a PRIMARY KEY de
+    `schema_migrations.filename` exatamente na ULTIMA instrucao do
+    script, depois que toda a DDL/DML ja rodou - exercitando
+    especificamente uma falha NA GRAVACAO DO REGISTRO, nao no resto da
+    migration."""
+
+    conn.execute(
+        "INSERT INTO schema_migrations (filename, applied_at, notes) VALUES (?, ?, '');",
+        ("9999_fake_bookkeeping_failure.sql", utc_now_iso()),
+    )
+
+    synthetic_sql = """
+    BEGIN IMMEDIATE;
+    CREATE TABLE probe_bookkeeping_failure (id TEXT PRIMARY KEY);
+    INSERT INTO probe_bookkeeping_failure (id) VALUES ('x');
+    COMMIT;
+    """
+
+    with pytest.raises(MigrationError):
+        _apply_migration_atomically(conn, "9999_fake_bookkeeping_failure.sql", synthetic_sql)
+
+    # o esquema inteiro voltou para a versao anterior: nem a tabela nem a
+    # linha que a migration sintetica criou sobreviveram...
+    tables = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='probe_bookkeeping_failure';"
+    ).fetchall()
+    assert tables == []
+
+    # ...e o registro de bookkeeping continua sendo exatamente o UNICO
+    # pre-semeado - nunca duplicado, nunca "quase" atualizado.
+    rows = conn.execute(
+        "SELECT applied_at FROM schema_migrations WHERE filename = '9999_fake_bookkeeping_failure.sql';"
+    ).fetchall()
+    assert len(rows) == 1
 
     # a conexao continua utilizavel normalmente depois do rollback.
     conn.execute("SELECT 1;")
