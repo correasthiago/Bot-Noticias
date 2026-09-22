@@ -1,4 +1,4 @@
-# Central Universal de Aprendizagem — V0.1
+# Central Universal de Aprendizagem — V0.2
 
 Motor pedagogico local-first que prova um ciclo completo de aprendizagem
 adaptativa: **diagnostico -> competencia -> atividade -> interacao ->

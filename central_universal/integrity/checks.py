@@ -1,4 +1,5 @@
-"""Verificacoes automaticas de integridade (Secao 23).
+"""Verificacoes automaticas de integridade (Secao 23; ampliadas pelo
+pacote de correcao v0.2, Secao 15).
 
 Cada funcao `check_*` cobre um item explicito da especificacao e devolve
 uma lista de `IntegrityFinding` (vazia se tudo estiver ok). `run_all`
@@ -12,9 +13,15 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
-from central_universal.domain.enums import CompetencyDimensionState, Dimension, EvidenceRelation, HelpLevel
-from central_universal.evidence.aggregation import UsableEvidence, classify_dimension
 from central_universal.domain.clock import parse_iso
+from central_universal.domain.enums import (
+    CompetencyDimensionState,
+    Dimension,
+    EvidenceRelation,
+    HelpLevel,
+    ProjectionGenerationStatus,
+)
+from central_universal.evidence.aggregation import AggregationConfig, UsableEvidence, classify_dimension
 from central_universal.persistence.repositories import Repositories
 
 
@@ -36,6 +43,11 @@ class IntegrityReport:
 
 
 def check_prerequisite_cycles(repos: Repositories) -> list[IntegrityFinding]:
+    """Defesa em profundidade (Secao 12 do pacote de correcao v0.2): a
+    escrita normal ja bloqueia ciclos em `PrerequisiteRepository.insert`;
+    esta checagem pega qualquer ciclo que tenha entrado por outro caminho
+    (SQL bruto, migration futura malfeita)."""
+
     edges: dict[str, list[str]] = {}
     for rel in repos.prerequisites.list_all():
         edges.setdefault(rel.competency_id, []).append(rel.prerequisite_id)
@@ -93,8 +105,8 @@ def check_dangling_references(repos: Repositories) -> list[IntegrityFinding]:
 
 def check_orphan_events(repos: Repositories) -> list[IntegrityFinding]:
     """EvidenceEvent sem nenhuma EvidenceAssessment: nosso EvidenceService
-    sempre cria os dois juntos, entao um evento orfao indica corrupcao ou
-    escrita fora do caminho oficial."""
+    sempre cria os dois juntos (Secao 4 do pacote de correcao v0.2), entao
+    um evento orfao indica corrupcao ou escrita fora do caminho oficial."""
 
     findings: list[IntegrityFinding] = []
     for event in repos.evidence_events.list_all():
@@ -112,6 +124,11 @@ def check_orphan_events(repos: Repositories) -> list[IntegrityFinding]:
 
 
 def check_immutability_triggers_present(repos: Repositories) -> list[IntegrityFinding]:
+    """Secao 13 do pacote de correcao v0.2: RuleVersion, DecisionEvent,
+    ProviderEvent, MemoryReviewLog e BackupEvent, alem das tabelas de
+    evidencia originais e de competency_state (agora append-only por
+    geracao), precisam ter trigger de imutabilidade no banco."""
+
     required = {
         "trg_raw_interaction_immutable_update",
         "trg_raw_interaction_immutable_delete",
@@ -119,6 +136,20 @@ def check_immutability_triggers_present(repos: Repositories) -> list[IntegrityFi
         "trg_evidence_event_immutable_delete",
         "trg_evidence_assessment_immutable_update",
         "trg_evidence_assessment_immutable_delete",
+        "trg_competency_state_immutable_update",
+        "trg_competency_state_immutable_delete",
+        "trg_rule_version_immutable_update",
+        "trg_rule_version_immutable_delete",
+        "trg_decision_event_immutable_update",
+        "trg_decision_event_immutable_delete",
+        "trg_provider_event_immutable_update",
+        "trg_provider_event_immutable_delete",
+        "trg_memory_review_log_immutable_update",
+        "trg_memory_review_log_immutable_delete",
+        "trg_memory_observation_immutable_update",
+        "trg_memory_observation_immutable_delete",
+        "trg_backup_event_immutable_update",
+        "trg_backup_event_immutable_delete",
     }
     rows = repos.conn.execute(
         "SELECT name FROM sqlite_master WHERE type = 'trigger';"
@@ -136,6 +167,36 @@ def check_immutability_triggers_present(repos: Repositories) -> list[IntegrityFi
     return []
 
 
+def _usable_evidence_for(repos: Repositories, competency_id: str, dimension: Dimension) -> list[UsableEvidence]:
+    """Reproduz EXATAMENTE o filtro que `evidence.service.recompute_state`
+    aplica antes de agregar - incluindo a exclusao de achados inconclusive/
+    com causa alternativa pendente (Secao 11 do pacote de correcao v0.2).
+    Usada tanto pelos checks especificos abaixo quanto pela recomputacao
+    de auditoria."""
+
+    usable: list[UsableEvidence] = []
+    for event in repos.evidence_events.list_for_competency(competency_id, dimension):
+        if event.relation == EvidenceRelation.MERE_PRESENCE:
+            continue
+        assessments = repos.evidence_assessments.get_for_evidence_event(event.id)
+        if not assessments:
+            continue
+        latest = max(assessments, key=lambda a: a.created_at)
+        if latest.inconclusive or latest.alternative_cause:
+            continue
+        usable.append(
+            UsableEvidence(
+                evidence_type=latest.classification,
+                relation=event.relation,
+                help_level=event.help_level,
+                evidence_cluster_id=event.evidence_cluster_id,
+                confidence=latest.confidence,
+                created_at=parse_iso(event.created_at),
+            )
+        )
+    return usable
+
+
 def check_retention_same_day_promotion(repos: Repositories) -> list[IntegrityFinding]:
     """Nenhuma competency_state de RETENTION pode estar demonstrated/
     consolidated com evidencia forte de um unico dia (Principio 10)."""
@@ -148,20 +209,13 @@ def check_retention_same_day_promotion(repos: Repositories) -> list[IntegrityFin
             CompetencyDimensionState.CONSOLIDATED,
         ):
             continue
-        events = repos.evidence_events.list_for_competency(competency.id, Dimension.RETENTION)
-        strong_days = set()
-        for event in events:
-            if event.relation != EvidenceRelation.TARGET or event.help_level not in (
-                HelpLevel.A0,
-                HelpLevel.A1,
-            ):
-                continue
-            assessments = repos.evidence_assessments.get_for_evidence_event(event.id)
-            if not assessments:
-                continue
-            latest = max(assessments, key=lambda a: a.created_at)
-            if latest.classification.value == "positive":
-                strong_days.add(parse_iso(event.created_at).date())
+        usable = _usable_evidence_for(repos, competency.id, Dimension.RETENTION)
+        strong_days = {
+            e.created_at.date()
+            for e in usable
+            if e.evidence_type.value == "positive" and e.relation == EvidenceRelation.TARGET
+            and e.help_level in (HelpLevel.A0, HelpLevel.A1)
+        }
         min_days = 3 if state.state == CompetencyDimensionState.CONSOLIDATED else 2
         if len(strong_days) < min_days:
             findings.append(
@@ -190,17 +244,13 @@ def check_retrieval_independence(repos: Repositories) -> list[IntegrityFinding]:
             CompetencyDimensionState.CONSOLIDATED,
         ):
             continue
-        events = repos.evidence_events.list_for_competency(competency.id, Dimension.RETRIEVAL)
-        independent_clusters = set()
-        for event in events:
-            if event.relation != EvidenceRelation.TARGET or event.help_level not in (
-                HelpLevel.A0,
-                HelpLevel.A1,
-            ):
-                continue
-            assessments = repos.evidence_assessments.get_for_evidence_event(event.id)
-            if assessments and max(assessments, key=lambda a: a.created_at).classification.value == "positive":
-                independent_clusters.add(event.evidence_cluster_id)
+        usable = _usable_evidence_for(repos, competency.id, Dimension.RETRIEVAL)
+        independent_clusters = {
+            e.evidence_cluster_id
+            for e in usable
+            if e.evidence_type.value == "positive" and e.relation == EvidenceRelation.TARGET
+            and e.help_level in (HelpLevel.A0, HelpLevel.A1)
+        }
         min_clusters = 3 if state.state == CompetencyDimensionState.CONSOLIDATED else 2
         if len(independent_clusters) < min_clusters:
             findings.append(
@@ -273,45 +323,215 @@ def check_decision_events_without_justification(repos: Repositories) -> list[Int
     return findings
 
 
-def check_state_matches_recomputation(repos: Repositories) -> list[IntegrityFinding]:
-    """Estado derivado incompativel com historico: recalcula cada
-    (competencia, dimensao) a partir do event log e compara com o que
-    esta persistido como 'atual'. Qualquer divergencia e um estado
-    impossivel/corrompido."""
+def check_generation_consistency(repos: Repositories) -> list[IntegrityFinding]:
+    """Secao 15 do pacote de correcao v0.2: 'geracao ativa' consistente -
+    no maximo uma geracao com status 'active', o ponteiro
+    active_projection_generation (se existir) aponta para uma geracao que
+    realmente existe e esta com status 'active', e nenhuma
+    competency_state referencia uma geracao inexistente."""
+
+    findings: list[IntegrityFinding] = []
+    generations = repos.projection_generations.list_all()
+    generation_ids = {g.id for g in generations}
+    active_generations = [g for g in generations if g.status == ProjectionGenerationStatus.ACTIVE]
+
+    if len(active_generations) > 1:
+        findings.append(
+            IntegrityFinding(
+                check="generation_consistency",
+                severity="error",
+                message=(
+                    f"{len(active_generations)} geracoes marcadas como 'active' simultaneamente: "
+                    f"{', '.join(g.id for g in active_generations)}"
+                ),
+            )
+        )
+
+    pointer_id = repos.active_projection_generation.get_id()
+    if pointer_id is not None:
+        if pointer_id not in generation_ids:
+            findings.append(
+                IntegrityFinding(
+                    check="generation_consistency",
+                    severity="error",
+                    message=f"active_projection_generation aponta para geracao inexistente {pointer_id}",
+                )
+            )
+        else:
+            pointed = next(g for g in generations if g.id == pointer_id)
+            if pointed.status != ProjectionGenerationStatus.ACTIVE:
+                findings.append(
+                    IntegrityFinding(
+                        check="generation_consistency",
+                        severity="error",
+                        message=(
+                            f"active_projection_generation aponta para {pointer_id}, "
+                            f"mas o status dela e '{pointed.status.value}', nao 'active'"
+                        ),
+                    )
+                )
+
+    orphan_generation_ids = {
+        row["generation_id"]
+        for row in repos.conn.execute("SELECT DISTINCT generation_id FROM competency_state;").fetchall()
+    } - generation_ids
+    for gen_id in orphan_generation_ids:
+        findings.append(
+            IntegrityFinding(
+                check="generation_consistency",
+                severity="error",
+                message=f"competency_state referencia geracao inexistente {gen_id}",
+                ref_id=gen_id,
+            )
+        )
+
+    return findings
+
+
+def check_assessment_origin_consistency(repos: Repositories) -> list[IntegrityFinding]:
+    """Secao 15: `CompetencyState.last_evidence_assessment_id`, quando
+    presente, precisa apontar para uma EvidenceAssessment que exista e
+    cujo EvidenceEvent seja da MESMA (competencia, dimensao) do
+    CompetencyState - nunca uma avaliacao de outra competencia/dimensao."""
 
     findings: list[IntegrityFinding] = []
     for competency in repos.competencies.list_all():
         for dimension in Dimension:
-            events = repos.evidence_events.list_for_competency(competency.id, dimension)
-            usable = []
-            for event in events:
-                if event.relation == EvidenceRelation.MERE_PRESENCE:
-                    continue
-                assessments = repos.evidence_assessments.get_for_evidence_event(event.id)
-                if not assessments:
-                    continue
-                latest = max(assessments, key=lambda a: a.created_at)
-                usable.append(
-                    UsableEvidence(
-                        evidence_type=latest.classification,
-                        relation=event.relation,
-                        help_level=event.help_level,
-                        evidence_cluster_id=event.evidence_cluster_id,
-                        created_at=parse_iso(event.created_at),
+            state = repos.competency_states.current(competency.id, dimension)
+            if state is None or state.last_evidence_assessment_id is None:
+                continue
+            assessment = repos.evidence_assessments.get(state.last_evidence_assessment_id)
+            if assessment is None:
+                findings.append(
+                    IntegrityFinding(
+                        check="assessment_origin_consistency",
+                        severity="error",
+                        message=(
+                            f"CompetencyState {state.id} ({competency.code}/{dimension.value}) "
+                            f"aponta para EvidenceAssessment inexistente {state.last_evidence_assessment_id}"
+                        ),
+                        ref_id=state.id,
                     )
                 )
-            recomputed = classify_dimension(dimension, usable)
+                continue
+            origin_event = repos.evidence_events.get(assessment.evidence_event_id)
+            if origin_event is None or origin_event.competency_id != competency.id or origin_event.dimension != dimension:
+                findings.append(
+                    IntegrityFinding(
+                        check="assessment_origin_consistency",
+                        severity="error",
+                        message=(
+                            f"CompetencyState {state.id} ({competency.code}/{dimension.value}) "
+                            f"aponta para uma avaliacao de origem que nao pertence a esta "
+                            "(competencia, dimensao)."
+                        ),
+                        ref_id=state.id,
+                    )
+                )
+    return findings
+
+
+def check_memory_card_review_log_consistency(repos: Repositories) -> list[IntegrityFinding]:
+    """Secao 15: consistencia entre o card FSRS 'atual' (memory_state) e
+    o historico de reviews (memory_review_log) - o card so pode ter
+    last_review_at vazio se nao houver NENHUM review logado, e se houver
+    reviews, last_review_at deve bater com o review mais recente."""
+
+    findings: list[IntegrityFinding] = []
+    for state in repos.memory_states.list_all():
+        latest_log = repos.memory_review_logs.latest_for_competency(state.competency_id)
+        if latest_log is None:
+            if state.last_review_at is not None:
+                findings.append(
+                    IntegrityFinding(
+                        check="memory_card_review_log_consistency",
+                        severity="error",
+                        message=(
+                            f"MemoryState da competencia {state.competency_id} tem last_review_at "
+                            "mas nao ha nenhum MemoryReviewLog correspondente."
+                        ),
+                        ref_id=state.competency_id,
+                    )
+                )
+            continue
+        if state.last_review_at is None:
+            findings.append(
+                IntegrityFinding(
+                    check="memory_card_review_log_consistency",
+                    severity="error",
+                    message=(
+                        f"MemoryState da competencia {state.competency_id} nao tem last_review_at "
+                        "mas ha MemoryReviewLog registrado."
+                    ),
+                    ref_id=state.competency_id,
+                )
+            )
+        elif parse_iso(state.last_review_at) != parse_iso(latest_log.review_datetime):
+            findings.append(
+                IntegrityFinding(
+                    check="memory_card_review_log_consistency",
+                    severity="error",
+                    message=(
+                        f"MemoryState.last_review_at ({state.last_review_at}) diverge do "
+                        f"MemoryReviewLog mais recente ({latest_log.review_datetime}) para "
+                        f"a competencia {state.competency_id}."
+                    ),
+                    ref_id=state.competency_id,
+                )
+            )
+    return findings
+
+
+def check_state_matches_recomputation(repos: Repositories) -> list[IntegrityFinding]:
+    """Estado derivado incompativel com historico: recalcula cada
+    (competencia, dimensao) a partir do event log - usando a MESMA
+    RuleVersion (e portanto a mesma AggregationConfig) que o estado
+    persistido diz ter usado - e compara estado, regressao e contradicao
+    com o que esta persistido como 'atual'. Qualquer divergencia e um
+    estado impossivel/corrompido (Secao 15 do pacote de correcao v0.2)."""
+
+    findings: list[IntegrityFinding] = []
+    for competency in repos.competencies.list_all():
+        for dimension in Dimension:
             current = repos.competency_states.current(competency.id, dimension)
+            usable = _usable_evidence_for(repos, competency.id, dimension)
+
+            if current is None:
+                rule_version = repos.active_rule_version.get()
+            else:
+                rule_version = repos.rule_versions.get(current.rule_version_id)
+
+            config = (
+                AggregationConfig.from_json(rule_version.config_json)
+                if rule_version is not None
+                else AggregationConfig()
+            )
+            recomputed = classify_dimension(dimension, usable, config)
+
             current_state = current.state if current else CompetencyDimensionState.NOT_ASSESSED
+            current_regression = current.possible_regression if current else False
+            current_contradiction = current.has_unresolved_contradiction if current else False
+
+            mismatches = []
             if current_state != recomputed.state:
+                mismatches.append(f"state persistido={current_state.value} vs recalculado={recomputed.state.value}")
+            if current_regression != recomputed.possible_regression:
+                mismatches.append(
+                    f"possible_regression persistido={current_regression} vs recalculado={recomputed.possible_regression}"
+                )
+            if current_contradiction != recomputed.has_unresolved_contradiction:
+                mismatches.append(
+                    f"has_unresolved_contradiction persistido={current_contradiction} "
+                    f"vs recalculado={recomputed.has_unresolved_contradiction}"
+                )
+
+            if mismatches:
                 findings.append(
                     IntegrityFinding(
                         check="state_matches_recomputation",
                         severity="error",
                         message=(
-                            f"Competencia {competency.code}/{dimension.value}: estado "
-                            f"persistido={current_state.value} diverge do recalculado="
-                            f"{recomputed.state.value}."
+                            f"Competencia {competency.code}/{dimension.value}: " + "; ".join(mismatches)
                         ),
                         ref_id=competency.id,
                     )
@@ -329,6 +549,9 @@ ALL_CHECKS = (
     check_mere_presence_promotion,
     check_evaluations_without_rule_version,
     check_decision_events_without_justification,
+    check_generation_consistency,
+    check_assessment_origin_consistency,
+    check_memory_card_review_log_consistency,
     check_state_matches_recomputation,
 )
 

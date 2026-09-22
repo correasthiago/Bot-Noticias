@@ -1,1 +1,1 @@
-"""Central Universal de Aprendizagem - V0.1."""
+"""Central Universal de Aprendizagem - V0.2."""

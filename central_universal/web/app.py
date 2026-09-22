@@ -23,9 +23,17 @@ from central_universal.memory.fsrs_adapter import MemoryAdapter
 from central_universal.orchestration.session_service import SessionOrchestrator
 from central_universal.persistence.backup import create_backup, list_backups
 from central_universal.persistence.repositories import Repositories
+from central_universal.persistence.restore import restore_from_backup
 from central_universal.providers.base import Provider
 from central_universal.web.bootstrap import ensure_bootstrapped
-from central_universal.web.deps import DB_PATH, get_active_rule_version, get_conn, get_provider, get_repos
+from central_universal.web.deps import (
+    BACKUP_DIR,
+    DB_PATH,
+    get_active_rule_version,
+    get_conn,
+    get_provider,
+    get_repos,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
@@ -37,12 +45,12 @@ async def _lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="Central Universal de Aprendizagem - V0.1", lifespan=_lifespan)
+app = FastAPI(title="Central Universal de Aprendizagem - V0.2", lifespan=_lifespan)
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
 
 def _orchestrator(repos: Repositories, provider: Provider, rule_version: RuleVersion) -> SessionOrchestrator:
-    return SessionOrchestrator(repos, provider, rule_version)
+    return SessionOrchestrator(repos, provider, rule_version, backup_dir=BACKUP_DIR)
 
 
 @app.get("/")
@@ -102,7 +110,7 @@ def session_view(
     interaction = None
     if activities:
         current_activity = activities[-1]
-        interactions = repos.raw_interactions.list_by_cluster(current_activity.id)
+        interactions = repos.raw_interactions.list_by_activity(current_activity.id)
         interaction = interactions[-1] if interactions else None
 
     competency = None
@@ -144,8 +152,10 @@ def session_next(
     orchestrator = _orchestrator(repos, provider, rule_version)
     focus = orchestrator.choose_focus_competency(session.learner_id)
     if focus is not None:
-        competency_id, _routing, action = focus
-        orchestrator.start_activity(session_id=session_id, competency_id=competency_id, action=action)
+        competency_id, _routing, action, recall_due = focus
+        orchestrator.start_activity(
+            session_id=session_id, competency_id=competency_id, action=action, is_planned_recall=recall_due
+        )
     return RedirectResponse(f"/session/{session_id}", status_code=303)
 
 
@@ -234,6 +244,7 @@ def audit(request: Request, repos: Repositories = Depends(get_repos)):
             "decisions": repos.decision_events.list_recent(50),
             "provider_events": repos.provider_events.list_recent(50),
             "rule_versions": repos.rule_versions.list_all(),
+            "active_rule_version": repos.active_rule_version.get(),
             "report": report,
             "backups": list_backups(repos),
         },
@@ -245,5 +256,16 @@ def audit_backup(
     conn: sqlite3.Connection = Depends(get_conn),
     repos: Repositories = Depends(get_repos),
 ):
-    create_backup(conn, repos)
+    create_backup(conn, repos, backup_dir=BACKUP_DIR)
+    return RedirectResponse("/audit", status_code=303)
+
+
+@app.post("/audit/restore")
+def audit_restore(backup_path: str = Form(...)):
+    # Secao 14 do pacote de correcao v0.2: restore real, nao so uma copia
+    # de arquivo. `restore_from_backup` valida o snapshot, troca o banco
+    # atomicamente, roda migrations+integrity_check e reverte sozinho se
+    # algo falhar - nao ha conexao de longa duracao aqui para fechar (cada
+    # requisicao HTTP ja abre/fecha a sua).
+    restore_from_backup(DB_PATH, backup_path)
     return RedirectResponse("/audit", status_code=303)

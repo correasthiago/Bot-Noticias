@@ -11,7 +11,8 @@ na ordem certa, os modulos que ja a implementam.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 
 from central_universal.decision.engine import ActionOutcome, RoutingOutcome
 from central_universal.decision.service import DecisionService
@@ -19,6 +20,7 @@ from central_universal.domain.clock import utc_now_iso
 from central_universal.domain.entities import (
     Activity,
     CompetencyState,
+    EvidenceAssessment,
     LearningSession,
     ProviderEvent,
     RawInteraction,
@@ -26,6 +28,7 @@ from central_universal.domain.entities import (
 )
 from central_universal.domain.enums import (
     DecisionType,
+    EvaluationStatus,
     HelpLevel,
     ProductionResult,
     RoutingDecision,
@@ -37,9 +40,11 @@ from central_universal.evaluator.service import EvaluatorService
 from central_universal.evidence.service import EvidenceService
 from central_universal.memory.fsrs_adapter import (
     MemoryAdapter,
+    MemoryObservationEligibility,
     MemoryReviewError,
-    rating_from_production_result,
+    evaluate_recall_eligibility,
 )
+from central_universal.persistence.backup import DEFAULT_BACKUP_DIR, maybe_run_automatic_backup
 from central_universal.persistence.db import transaction
 from central_universal.persistence.repositories import Repositories
 from central_universal.providers.base import Provider
@@ -66,16 +71,24 @@ class InteractionOutcome:
     evaluator_output: EvaluatorOutput | None
     competency_states: list[CompetencyState]
     memory_result: object | None
+    memory_eligibility: MemoryObservationEligibility | None = None
     evaluator_provider_event: ProviderEvent | None = None
     next_routing: RoutingOutcome | None = None
     next_action: ActionOutcome | None = None
 
 
 class SessionOrchestrator:
-    def __init__(self, repos: Repositories, provider: Provider, rule_version: RuleVersion) -> None:
+    def __init__(
+        self,
+        repos: Repositories,
+        provider: Provider,
+        rule_version: RuleVersion,
+        backup_dir: Path | None = None,
+    ) -> None:
         self.repos = repos
         self.provider = provider
         self.rule_version = rule_version
+        self.backup_dir = backup_dir or DEFAULT_BACKUP_DIR
         self.evidence_service = EvidenceService(repos)
         self.decision_service = DecisionService(repos)
         self.memory_adapter = MemoryAdapter(repos)
@@ -93,14 +106,25 @@ class SessionOrchestrator:
 
     def end_session(self, session_id: str) -> None:
         self.repos.sessions.end_session(session_id, utc_now_iso())
+        # Secao 14 do pacote de correcao v0.2: politica simples de backup
+        # automatico, disparada no fim da sessao (no maximo um por hora -
+        # ver AUTOMATIC_BACKUP_MIN_INTERVAL_HOURS). Falha de backup nunca
+        # derruba a aplicacao (Secao 25) - maybe_run_automatic_backup ja
+        # captura qualquer excecao internamente via create_backup.
+        maybe_run_automatic_backup(self.repos.conn, self.repos, backup_dir=self.backup_dir)
 
     # ---- escolha de foco (Secao 18: SKIP/VALIDATE/STUDY) -----------
 
     def choose_focus_competency(
         self, learner_id: str
-    ) -> tuple[str, RoutingOutcome, ActionOutcome | None] | None:
+    ) -> tuple[str, RoutingOutcome, ActionOutcome | None, bool] | None:
         """Percorre as competencias do grafo e devolve a primeira que NAO
-        pode ser pulada. Retorna None se tudo puder ser pulado agora."""
+        pode ser pulada. Retorna None se tudo puder ser pulado agora. O
+        ultimo item do tuplo (`memory_recall_due`) diz se esta competencia
+        foi escolhida (ao menos em parte) porque o FSRS tem uma
+        recuperacao agendada agora - usado para marcar a atividade
+        resultante como `is_planned_recall` (Secao 1 do pacote de
+        correcao v0.2)."""
 
         for competency in self.repos.competencies.list_all():
             recall_due = self.memory_adapter.is_recall_due(competency.id)
@@ -114,13 +138,18 @@ class SessionOrchestrator:
                     rule_version=self.rule_version,
                     memory_recall_due=recall_due,
                 )
-                return competency.id, routing, action
+                return competency.id, routing, action, recall_due
         return None
 
     # ---- atividade ----------------------------------------------------
 
     def start_activity(
-        self, *, session_id: str, competency_id: str, action: ActionOutcome | None
+        self,
+        *,
+        session_id: str,
+        competency_id: str,
+        action: ActionOutcome | None,
+        is_planned_recall: bool = False,
     ) -> tuple[Activity, TutorOutput | None]:
         competency = self.repos.competencies.get(competency_id)
         if competency is None:
@@ -148,6 +177,7 @@ class SessionOrchestrator:
             support_level=support_level,
             created_at=utc_now_iso(),
             tutor_provider_event_id=(tutor_output.provider_event_id if tutor_output else None),
+            is_planned_recall=is_planned_recall,
         )
         # Secao 25: "Se Tutor falhar, sessao permanece recuperavel" - mesmo
         # sem tutor_output a atividade e criada (com prompt de fallback),
@@ -172,33 +202,30 @@ class SessionOrchestrator:
         if activity is None:
             raise ValueError(f"atividade desconhecida: {activity_id}")
 
-        # Secao 11: interacoes da mesma atividade compartilham cluster de
-        # evidencia, para nao contar respostas quase identicas como provas
-        # independentes.
-        cluster_id = activity_id
-
         raw_interaction, created_now = self.evidence_service.record_interaction(
-            activity_id=activity_id,
+            activity=activity,
             session_id=session_id,
             idempotency_key=idempotency_key,
             learner_input=learner_input,
             tutor_output=tutor_output_text,
             help_level=help_level,
             production_result=production_result,
-            evidence_cluster_id=cluster_id,
         )
 
-        if not created_now:
-            # Secao 24 / T8: submissao repetida nao duplica nada. Devolvemos
-            # a interacao ja existente sem reavaliar.
+        if raw_interaction.evaluation_status == EvaluationStatus.COMPLETED:
+            # Ja foi avaliada ate o fim antes (submissao repetida de uma
+            # interacao ja concluida, T8) - nao ha nada a reprocessar.
             return InteractionOutcome(
                 raw_interaction=raw_interaction,
-                created_now=False,
+                created_now=created_now,
                 evaluator_output=None,
                 competency_states=[],
                 memory_result=None,
             )
 
+        # Uma interacao PENDING (nova, ou uma reenviada cuja avaliacao
+        # nunca completou antes) sempre pode ser (re)processada - Secao 5
+        # do pacote de correcao v0.2.
         evaluator_input = EvaluatorInput(
             raw_interaction_id=raw_interaction.id,
             learner_input=learner_input,
@@ -214,33 +241,66 @@ class SessionOrchestrator:
         )
 
         competency_states: list[CompetencyState] = []
+        assessments: list[EvidenceAssessment] = []
         if evaluator_output is not None:
             # Secao 25 / T9: todo o lote de evidencia desta submissao e
-            # atomico - ou entra inteiro, ou nao entra nada.
+            # atomico - ou entra inteiro, ou nao entra nada. A propria
+            # transicao pending->completed (idempotencia) tambem esta
+            # dentro desta transacao.
             with transaction(self.repos.conn):
-                competency_states = self.evidence_service.record_evaluation(
+                eval_result = self.evidence_service.record_evaluation(
                     raw_interaction=raw_interaction,
                     evaluator_output=evaluator_output,
                     rule_version=self.rule_version,
                     evaluator_provider_event_id=eval_provider_event.id,
                 )
+            competency_states = eval_result.competency_states
+            assessments = eval_result.assessments
         # Se evaluator_output for None (avaliador falhou ou devolveu algo
         # invalido), a RawInteraction ja gravada permanece como esta e a
         # avaliacao fica pendente (Secao 25) - nada mais e feito aqui.
 
         memory_result: object | None = None
-        rating = rating_from_production_result(production_result)
-        if rating is not None and activity.competency_targets:
-            # Falha do FSRS nao apaga evidencia (T14): review() ja isola a
-            # falha internamente e retorna um MemoryReviewError em vez de
-            # levantar excecao ate aqui.
-            memory_result = self.memory_adapter.review(activity.competency_targets[0], rating=rating)
+        memory_eligibility: MemoryObservationEligibility | None = None
+        target_id = activity.competency_targets[0] if activity.competency_targets else None
+        if target_id is not None:
+            matching_event = next(
+                (
+                    e
+                    for e in self.repos.evidence_events.list_by_raw_interaction(raw_interaction.id)
+                    if e.competency_id == target_id
+                ),
+                None,
+            )
+            matching_assessment = None
+            if matching_event is not None:
+                candidates = self.repos.evidence_assessments.get_for_evidence_event(matching_event.id)
+                matching_assessment = max(candidates, key=lambda a: a.created_at) if candidates else None
+
+            memory_state_before = self.repos.memory_states.get(target_id)
+            memory_eligibility = evaluate_recall_eligibility(
+                activity=activity,
+                evidence_relation=matching_event.relation if matching_event else None,
+                assessment=matching_assessment,
+                production_result=production_result,
+                memory_state=memory_state_before,
+            )
+            # Secao 2 do pacote de correcao v0.2: se nao for elegivel, o
+            # FSRS NUNCA e chamado - nem para avaliador que falhou, nem
+            # payload invalido, nem inconclusive, nem mere_presence, nem
+            # atividade que nao e uma recuperacao planejada.
+            if memory_eligibility.eligible and matching_assessment is not None:
+                memory_result = self.memory_adapter.observe_and_review(
+                    competency_id=target_id,
+                    raw_interaction_id=raw_interaction.id,
+                    evidence_assessment_id=matching_assessment.id,
+                    eligibility=memory_eligibility,
+                )
 
         next_routing: RoutingOutcome | None = None
         next_action: ActionOutcome | None = None
-        if activity.competency_targets:
+        if target_id is not None:
             session = self.repos.sessions.get(session_id)
-            target_id = activity.competency_targets[0]
             recall_due = self.memory_adapter.is_recall_due(target_id)
             next_routing, next_action = self.decision_service.decide(
                 competency_id=target_id,
@@ -256,6 +316,7 @@ class SessionOrchestrator:
             evaluator_output=evaluator_output,
             competency_states=competency_states,
             memory_result=memory_result,
+            memory_eligibility=memory_eligibility,
             evaluator_provider_event=eval_provider_event,
             next_routing=next_routing,
             next_action=next_action,

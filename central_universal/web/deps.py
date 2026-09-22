@@ -18,6 +18,7 @@ from central_universal.providers.mock import MockProvider
 from central_universal.web.bootstrap import DEFAULT_RULE_VERSION
 
 DB_PATH = Path(os.environ.get("CENTRAL_DB_PATH", str(DEFAULT_DB_PATH)))
+BACKUP_DIR = DB_PATH.parent / "backups"
 
 # Principio 17: trocar de fornecedor nunca e automatico. O provider ativo
 # e uma unica linha de configuracao explicita, nao uma descoberta em
@@ -44,9 +45,7 @@ def get_provider() -> Provider:
 
 
 def get_active_rule_version(repos: Repositories = Depends(get_repos)) -> RuleVersion:
-    rule_version = repos.rule_versions.get_by_version(DEFAULT_RULE_VERSION)
+    rule_version = repos.active_rule_version.get()
     if rule_version is None:
-        rule_version = repos.rule_versions.get_active()
-    if rule_version is None:
-        raise RuntimeError("Nenhuma RuleVersion configurada - rode o bootstrap primeiro.")
+        raise RuntimeError("Nenhuma RuleVersion ativa configurada - rode o bootstrap primeiro.")
     return rule_version

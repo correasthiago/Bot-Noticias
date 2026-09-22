@@ -5,14 +5,15 @@ ativa e seed do grafo de ingles."""
 from __future__ import annotations
 
 from central_universal.domain.clock import utc_now_iso
-from central_universal.domain.entities import Learner, RuleVersion
+from central_universal.domain.entities import Learner
 from central_universal.domain.ids import new_id
+from central_universal.evidence.rule_versions import V0_2_0_VERSION, build_v0_2_0_rule_version
 from central_universal.persistence.db import connect
 from central_universal.persistence.migrations import run_migrations
 from central_universal.persistence.repositories import Repositories
 from seed.english_graph import seed as seed_english_graph
 
-DEFAULT_RULE_VERSION = "v0.1.0"
+DEFAULT_RULE_VERSION = V0_2_0_VERSION
 DEFAULT_LEARNER_NAME = "Aprendiz"
 
 
@@ -22,15 +23,12 @@ def ensure_bootstrapped(db_path) -> None:
         run_migrations(conn)
         repos = Repositories(conn)
 
-        if repos.rule_versions.get_by_version(DEFAULT_RULE_VERSION) is None:
-            repos.rule_versions.insert(
-                RuleVersion(
-                    id=new_id(),
-                    version=DEFAULT_RULE_VERSION,
-                    description="Regras pedagogicas iniciais da Central Universal V0.1.",
-                    created_at=utc_now_iso(),
-                )
-            )
+        rule_version = repos.rule_versions.get_by_version(DEFAULT_RULE_VERSION)
+        if rule_version is None:
+            rule_version = build_v0_2_0_rule_version()
+            repos.rule_versions.insert(rule_version)
+        if repos.active_rule_version.get() is None or repos.active_rule_version.get().version != DEFAULT_RULE_VERSION:
+            repos.active_rule_version.set(rule_version.id)
 
         if not repos.learners.list_all():
             repos.learners.insert(

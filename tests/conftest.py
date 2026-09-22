@@ -5,8 +5,10 @@ from pathlib import Path
 
 import pytest
 
-from central_universal.domain.entities import Competency, LearningDomain
+from central_universal.domain.clock import utc_now_iso
+from central_universal.domain.entities import Competency, LearningDomain, RuleVersion
 from central_universal.domain.ids import new_id
+from central_universal.evidence.aggregation import AggregationConfig
 from central_universal.persistence.db import connect
 from central_universal.persistence.migrations import run_migrations
 from central_universal.persistence.repositories import Repositories
@@ -44,5 +46,39 @@ def make_competency(repos: Repositories):
         )
         repos.competencies.insert(competency)
         return competency.id
+
+    return _make
+
+
+@pytest.fixture()
+def orchestrator_factory(repos: Repositories, tmp_path: Path):
+    """Fabrica um SessionOrchestrator com backup_dir isolado em tmp_path,
+    para que testes que chamam end_session() (e disparam o backup
+    automatico) nunca escrevam no data/backups real do repositorio."""
+
+    from central_universal.orchestration.session_service import SessionOrchestrator
+
+    def _make(provider, rule_version) -> SessionOrchestrator:
+        return SessionOrchestrator(repos, provider, rule_version, backup_dir=tmp_path / "backups")
+
+    return _make
+
+
+@pytest.fixture()
+def make_rule_version(repos: Repositories):
+    """Fabrica e insere uma RuleVersion valida (config_json default) e
+    devolve o objeto. Cada chamada cria uma versao nova (version unica)."""
+
+    def _make(version: str | None = None, config: AggregationConfig | None = None) -> RuleVersion:
+        rv = RuleVersion(
+            id=new_id(),
+            version=version or f"v-test-{new_id()[:8]}",
+            description="RuleVersion de teste",
+            created_at=utc_now_iso(),
+            config_json=(config or AggregationConfig()).to_json(),
+            algorithm_version="v2-config-driven-clusters-no-autodowngrade",
+        )
+        repos.rule_versions.insert(rv)
+        return rv
 
     return _make

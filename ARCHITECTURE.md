@@ -96,14 +96,24 @@ vem de graca para essa integracao futura.
    acao escolhida, chama `TutorService` (que chama o `Provider` e grava
    `ProviderEvent`) e persiste a `Activity`.
 4. O aprendiz responde. `SessionOrchestrator.submit_interaction`:
-   a. grava a `RawInteraction` (idempotente pela `idempotency_key`);
-   b. chama `EvaluatorService` (que valida a resposta do provider antes
+   a. grava a `RawInteraction` (idempotente pela `idempotency_key`; o
+      cluster de evidencia e resolvido no SERVIDOR a partir de sessao +
+      atividade, nunca informado pelo chamador — Secao 6 do pacote de
+      correcao v0.2);
+   b. se a interacao ja estiver `evaluation_status='completed'`, para por
+      aqui — nada a reprocessar. Senao (interacao nova ou `pending`),
+      chama `EvaluatorService` (que valida a resposta do provider antes
       de aceitar qualquer coisa);
-   c. se valida, grava `EvidenceEvent` + `EvidenceAssessment` +
-      recomputa `CompetencyState` DENTRO de uma transacao SQL explicita
-      (tudo ou nada);
-   d. chama `MemoryAdapter.review` (FSRS) — falha aqui nunca desfaz o
-      passo anterior;
+   c. se valida, grava `EvidenceEvent` (fatos) + `EvidenceAssessment`
+      (classificacao) + recomputa `CompetencyState` na geracao ATIVA,
+      tudo DENTRO de uma transacao SQL explicita que tambem faz a
+      transicao atomica `pending->completed` (tudo ou nada);
+   d. chama `evaluate_recall_eligibility` para decidir se esta interacao
+      e uma observacao de memoria legitima (recuperacao planejada,
+      intervalo relevante, avaliacao valida e conclusiva); se for, chama
+      `MemoryAdapter.observe_and_review` (FSRS) — falha aqui nunca desfaz
+      os passos anteriores, e a propria escrita de memoria e atomica
+      (card + log + observation numa unica transacao);
    e. chama `DecisionService.decide` de novo para a proxima acao.
 5. A interface web renderiza o resultado e oferece "proxima atividade" ou
    "encerrar sessao".

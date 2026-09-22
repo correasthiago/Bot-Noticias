@@ -54,9 +54,10 @@ def test_session_roundtrip(repos: Repositories) -> None:
     assert ended.ended_at is not None
 
 
-def test_raw_interaction_is_immutable(conn: sqlite3.Connection, repos: Repositories) -> None:
-    from central_universal.domain.entities import Activity, RawInteraction
+def _bootstrap_interaction(repos: Repositories):
+    from central_universal.domain.entities import Activity
     from central_universal.domain.enums import HelpLevel, ProductionResult
+    from central_universal.evidence.service import EvidenceService
 
     learner = Learner(id=new_id(), display_name="Aluno", created_at=utc_now_iso())
     repos.learners.insert(learner)
@@ -74,19 +75,17 @@ def test_raw_interaction_is_immutable(conn: sqlite3.Connection, repos: Repositor
         created_at=utc_now_iso(),
     )
     repos.activities.insert(activity)
-    interaction = RawInteraction(
-        id=new_id(),
-        activity_id=activity.id,
-        session_id=session.id,
-        idempotency_key=new_id(),
-        learner_input="I go to school",
-        tutor_output="",
-        help_level=HelpLevel.A0,
+    service = EvidenceService(repos)
+    interaction, _ = service.record_interaction(
+        activity=activity, session_id=session.id, idempotency_key=new_id(),
+        learner_input="I go to school", tutor_output="", help_level=HelpLevel.A0,
         production_result=ProductionResult.SPONTANEOUS_CORRECT,
-        occurred_at=utc_now_iso(),
-        evidence_cluster_id=new_id(),
     )
-    repos.raw_interactions.insert(interaction)
+    return interaction
+
+
+def test_raw_interaction_is_immutable(conn: sqlite3.Connection, repos: Repositories) -> None:
+    interaction = _bootstrap_interaction(repos)
 
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute(
@@ -95,3 +94,19 @@ def test_raw_interaction_is_immutable(conn: sqlite3.Connection, repos: Repositor
         )
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute("DELETE FROM raw_interaction WHERE id = ?;", (interaction.id,))
+    # nem mesmo tentar "reabrir" uma avaliacao ja concluida e permitido
+    conn.execute("UPDATE raw_interaction SET evaluation_status = 'completed' WHERE id = ?;", (interaction.id,))
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("UPDATE raw_interaction SET evaluation_status = 'pending' WHERE id = ?;", (interaction.id,))
+
+
+def test_raw_interaction_allows_only_pending_to_completed_transition(conn: sqlite3.Connection, repos: Repositories) -> None:
+    interaction = _bootstrap_interaction(repos)
+    assert interaction.evaluation_status.value == "pending"
+
+    conn.execute("UPDATE raw_interaction SET evaluation_status = 'completed' WHERE id = ?;", (interaction.id,))
+    row = conn.execute("SELECT evaluation_status FROM raw_interaction WHERE id = ?;", (interaction.id,)).fetchone()
+    assert row["evaluation_status"] == "completed"
+
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("UPDATE raw_interaction SET evaluation_status = 'completed' WHERE id = ?;", (interaction.id,))

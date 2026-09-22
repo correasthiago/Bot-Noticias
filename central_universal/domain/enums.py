@@ -108,3 +108,22 @@ class MemoryCardState(str, Enum):
     LEARNING = "learning"
     REVIEW = "review"
     RELEARNING = "relearning"
+
+
+class EvaluationStatus(str, Enum):
+    """Estado de processamento da avaliacao de uma RawInteraction (Secao 24
+    v0.2: avaliacoes devem ser idempotentes e reprocessaveis)."""
+
+    PENDING = "pending"
+    COMPLETED = "completed"
+
+
+class ProjectionGenerationStatus(str, Enum):
+    """Ciclo de vida de uma geracao de projecao de CompetencyState
+    (Secao 14 v0.2: reconstrucao deixa de ser destrutiva)."""
+
+    BUILDING = "building"
+    VALIDATED = "validated"
+    ACTIVE = "active"
+    SUPERSEDED = "superseded"
+    FAILED = "failed"

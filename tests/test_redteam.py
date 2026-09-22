@@ -1,51 +1,60 @@
-"""Red Team final (Fase H, Secao 29): T1-T15, um teste por requisito.
+"""Red Team pos-correcao v0.2: testes de PRINCIPIOS, nao mais numerados
+T1-T15 (esses numeros descreviam cenarios do algoritmo v1, hardcoded e
+com corroboracao de regressao - superado). Cada teste aqui cobre,
+literalmente, um dos itens exigidos no pacote de correcao:
 
-Cada teste e nomeado e documentado com o numero exato da especificacao,
-para que a rastreabilidade do relatorio final seja trivial de auditar.
-Alguns destes cenarios ja sao cobertos indiretamente por testes de unidade
-em outros arquivos (aggregation, evidence, memory, providers) - aqui eles
-sao reexercitados de forma explicita e, sempre que possivel, atraves do
-caminho de producao real (EvidenceService / SessionOrchestrator), nao só
-da funcao pura isolada.
+P1  - avaliacao invalida nao altera nenhuma projecao nem FSRS.
+P2  - queda depois da interacao bruta permite reavaliacao idempotente.
+P3  - duas negativas no mesmo cluster nao corroboram regressao.
+P4  - IDs de cluster diferentes nao provam independencia por si.
+P5  - reconstrucao preserva historico e e atomica.
+P6  - duas RuleVersions produzem resultados diferentes quando suas regras diferem.
+P7  - falha ao inserir MemoryReviewLog nao altera MemoryState.
+P8  - ciclo de pre-requisito e rejeitado na escrita.
+P9  - restore real substitui e recupera o banco.
+P10 - reinicio completo do processo preserva estado.
+P11 - execucao offline falha no teste se qualquer acesso de rede for tentado.
+
+Os principios do algoritmo v1 que continuam validos (retencao longitudinal,
+independencia A0/A1, mere_presence, contradicao -> incerteza, erro isolado
+nao apaga dominio, double-submit idempotente) permanecem cobertos em
+`test_evidence_aggregation.py`, `test_evidence_service.py`,
+`test_memory_adapter.py` e `test_orchestration.py` - nao duplicados aqui.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+import socket
 
-import fsrs
 import pytest
 
-from central_universal.decision.engine import route_competency
-from central_universal.decision.service import DecisionService
 from central_universal.domain.clock import utc_now_iso
-from central_universal.domain.entities import Activity, Learner, LearningSession, RuleVersion
+from central_universal.domain.entities import (
+    Activity,
+    Learner,
+    LearningSession,
+    PrerequisiteRelation,
+)
 from central_universal.domain.enums import (
     CompetencyDimensionState,
     Dimension,
     HelpLevel,
     ProductionResult,
-    RoutingDecision,
     SessionStatus,
 )
 from central_universal.domain.ids import new_id
-from central_universal.evaluator.contract import EvaluatorInput, validate_evaluator_payload
-from central_universal.evaluator.service import EvaluatorService
+from central_universal.evaluator.contract import validate_evaluator_payload
+from central_universal.evidence.aggregation import AggregationConfig
 from central_universal.evidence.service import EvidenceService, recompute_all_from_log
-from central_universal.memory.fsrs_adapter import MemoryAdapter, MemoryReviewError
+from central_universal.memory.fsrs_adapter import MemoryReviewError
 from central_universal.orchestration.session_service import SessionOrchestrator
-from central_universal.persistence.repositories import Repositories
+from central_universal.persistence.backup import create_backup
+from central_universal.persistence.db import connect
+from central_universal.persistence.migrations import run_migrations
+from central_universal.persistence.repositories import PrerequisiteCycleError, Repositories
+from central_universal.persistence.restore import restore_from_backup
 from central_universal.providers.base import Provider, ProviderCallResult
 from central_universal.providers.mock import MockProvider
-
-
-def _rule_version(repos: Repositories, version: str = "v0.1.0") -> RuleVersion:
-    existing = repos.rule_versions.get_by_version(version)
-    if existing:
-        return existing
-    rv = RuleVersion(id=new_id(), version=version, description="teste", created_at=utc_now_iso())
-    repos.rule_versions.insert(rv)
-    return rv
 
 
 def _learner(repos: Repositories) -> Learner:
@@ -54,15 +63,19 @@ def _learner(repos: Repositories) -> Learner:
     return learner
 
 
-def _session_and_activity(repos: Repositories, learner_id: str, competency_id: str) -> tuple[LearningSession, Activity]:
+def _session(repos: Repositories, learner_id: str) -> LearningSession:
     session = LearningSession(id=new_id(), learner_id=learner_id, started_at=utc_now_iso(), status=SessionStatus.ACTIVE)
     repos.sessions.insert(session)
+    return session
+
+
+def _new_activity(repos: Repositories, session_id: str, prompt: str = "drill", activity_type: str = "drill") -> Activity:
     activity = Activity(
-        id=new_id(), session_id=session.id, competency_targets=[competency_id],
-        activity_type="drill", prompt="pratique", support_level=HelpLevel.A0, created_at=utc_now_iso(),
+        id=new_id(), session_id=session_id, competency_targets=[], activity_type=activity_type,
+        prompt=prompt, support_level=HelpLevel.A0, created_at=utc_now_iso(),
     )
     repos.activities.insert(activity)
-    return session, activity
+    return activity
 
 
 def _payload(competency_id: str, dimension: str, relation: str, classification: str) -> dict:
@@ -73,7 +86,7 @@ def _payload(competency_id: str, dimension: str, relation: str, classification: 
                 "dimension": dimension,
                 "classification": classification,
                 "result": "resultado de teste",
-                "confidence": 0.75,
+                "confidence": 0.9,
                 "justification": "Justificativa de teste do Red Team.",
                 "relation": relation,
             }
@@ -82,175 +95,7 @@ def _payload(competency_id: str, dimension: str, relation: str, classification: 
 
 
 # ---------------------------------------------------------------------
-# T1 - 10 acertos iguais na mesma sessao nao consolidam retencao.
-# ---------------------------------------------------------------------
-def test_T1_ten_same_day_correct_answers_do_not_consolidate_retention(repos: Repositories, make_competency):
-    competency_id = make_competency()
-    learner = _learner(repos)
-    rule_version = _rule_version(repos)
-    service = EvidenceService(repos)
-    session, activity = _session_and_activity(repos, learner.id, competency_id)
-
-    for i in range(10):
-        interaction, _ = service.record_interaction(
-            activity_id=activity.id, session_id=session.id, idempotency_key=new_id(),
-            learner_input=f"resposta {i}", tutor_output="", help_level=HelpLevel.A0,
-            production_result=ProductionResult.SPONTANEOUS_CORRECT,
-            evidence_cluster_id=new_id(),  # atividades/clusters distintos, MESMO dia
-        )
-        payload = _payload(competency_id, "retention", "target", "positive")
-        output = validate_evaluator_payload(payload, {competency_id})
-        service.record_evaluation(raw_interaction=interaction, evaluator_output=output, rule_version=rule_version)
-
-    state = repos.competency_states.current(competency_id, Dimension.RETENTION)
-    assert state is not None
-    assert state.state != CompetencyDimensionState.CONSOLIDATED
-    assert state.state != CompetencyDimensionState.DEMONSTRATED
-
-
-# ---------------------------------------------------------------------
-# T2 - resposta A3 nao demonstra retrieval independente.
-# ---------------------------------------------------------------------
-def test_T2_a3_response_never_demonstrates_independent_retrieval(repos: Repositories, make_competency):
-    competency_id = make_competency()
-    learner = _learner(repos)
-    rule_version = _rule_version(repos)
-    service = EvidenceService(repos)
-    session, activity = _session_and_activity(repos, learner.id, competency_id)
-
-    for i in range(3):
-        interaction, _ = service.record_interaction(
-            activity_id=activity.id, session_id=session.id, idempotency_key=new_id(),
-            learner_input="resposta dada quase pronta", tutor_output="", help_level=HelpLevel.A3,
-            production_result=ProductionResult.CORRECT_AFTER_EXTERNAL_CORRECTION,
-            evidence_cluster_id=new_id(),
-        )
-        payload = _payload(competency_id, "retrieval", "target", "positive")
-        output = validate_evaluator_payload(payload, {competency_id})
-        service.record_evaluation(raw_interaction=interaction, evaluator_output=output, rule_version=rule_version)
-
-    state = repos.competency_states.current(competency_id, Dimension.RETRIEVAL)
-    assert state is not None
-    assert state.state not in (CompetencyDimensionState.DEMONSTRATED, CompetencyDimensionState.CONSOLIDATED)
-
-
-# ---------------------------------------------------------------------
-# T3 - erro incidental isolado nao derruba competencia consolidada.
-# ---------------------------------------------------------------------
-def test_T3_isolated_incidental_error_does_not_topple_consolidated_competency(repos: Repositories, make_competency):
-    competency_id = make_competency()
-    learner = _learner(repos)
-    rule_version = _rule_version(repos)
-    service = EvidenceService(repos)
-    session, activity = _session_and_activity(repos, learner.id, competency_id)
-
-    for i in range(3):
-        interaction, _ = service.record_interaction(
-            activity_id=activity.id, session_id=session.id, idempotency_key=new_id(),
-            learner_input="correto", tutor_output="", help_level=HelpLevel.A0,
-            production_result=ProductionResult.SPONTANEOUS_CORRECT, evidence_cluster_id=new_id(),
-        )
-        payload = _payload(competency_id, "accuracy", "target", "positive")
-        output = validate_evaluator_payload(payload, {competency_id})
-        service.record_evaluation(raw_interaction=interaction, evaluator_output=output, rule_version=rule_version)
-
-    before = repos.competency_states.current(competency_id, Dimension.ACCURACY)
-    assert before.state == CompetencyDimensionState.CONSOLIDATED
-
-    interaction, _ = service.record_interaction(
-        activity_id=activity.id, session_id=session.id, idempotency_key=new_id(),
-        learner_input="um erro isolado", tutor_output="", help_level=HelpLevel.A0,
-        production_result=ProductionResult.INCORRECT, evidence_cluster_id=new_id(),
-    )
-    payload = _payload(competency_id, "accuracy", "target", "negative")
-    output = validate_evaluator_payload(payload, {competency_id})
-    service.record_evaluation(raw_interaction=interaction, evaluator_output=output, rule_version=rule_version)
-
-    after = repos.competency_states.current(competency_id, Dimension.ACCURACY)
-    assert after.state == CompetencyDimensionState.CONSOLIDATED  # dominio anterior nao foi apagado
-    assert after.possible_regression is True  # mas o sinal foi registrado
-
-
-# ---------------------------------------------------------------------
-# T4 - evidencia incidental qualificada pode criar hipotese/evidencia secundaria.
-# ---------------------------------------------------------------------
-def test_T4_qualified_incidental_evidence_creates_secondary_hypothesis(repos: Repositories, make_competency):
-    competency_id = make_competency()
-    learner = _learner(repos)
-    rule_version = _rule_version(repos)
-    service = EvidenceService(repos)
-    session, activity = _session_and_activity(repos, learner.id, competency_id)
-
-    interaction, _ = service.record_interaction(
-        activity_id=activity.id, session_id=session.id, idempotency_key=new_id(),
-        learner_input="usou a estrutura de passagem, sem ser o foco", tutor_output="",
-        help_level=HelpLevel.A0, production_result=ProductionResult.SPONTANEOUS_CORRECT,
-        evidence_cluster_id=new_id(),
-    )
-    payload = _payload(competency_id, "transfer", "qualified_incidental", "positive")
-    output = validate_evaluator_payload(payload, {competency_id})
-    states = service.record_evaluation(raw_interaction=interaction, evaluator_output=output, rule_version=rule_version)
-
-    assert len(states) == 1
-    assert states[0].state == CompetencyDimensionState.ACQUIRING  # hipotese, nao promocao forte
-
-
-# ---------------------------------------------------------------------
-# T5 - mere_presence nao altera estado.
-# ---------------------------------------------------------------------
-def test_T5_mere_presence_never_alters_state(repos: Repositories, make_competency):
-    competency_id = make_competency()
-    learner = _learner(repos)
-    rule_version = _rule_version(repos)
-    service = EvidenceService(repos)
-    session, activity = _session_and_activity(repos, learner.id, competency_id)
-
-    interaction, _ = service.record_interaction(
-        activity_id=activity.id, session_id=session.id, idempotency_key=new_id(),
-        learner_input="mencao de passagem", tutor_output="", help_level=HelpLevel.A0,
-        production_result=ProductionResult.INCONCLUSIVE, evidence_cluster_id=new_id(),
-    )
-    payload = _payload(competency_id, "comprehension", "mere_presence", "inconclusive")
-    output = validate_evaluator_payload(payload, {competency_id})
-    states = service.record_evaluation(raw_interaction=interaction, evaluator_output=output, rule_version=rule_version)
-
-    assert states == []
-    assert repos.competency_states.current(competency_id, Dimension.COMPREHENSION) is None
-
-
-# ---------------------------------------------------------------------
-# T6 - resposta contraditoria cria incerteza/validacao.
-# ---------------------------------------------------------------------
-def test_T6_contradictory_response_creates_uncertainty_routed_to_validate(repos: Repositories, make_competency):
-    competency_id = make_competency()
-    learner = _learner(repos)
-    rule_version = _rule_version(repos)
-    service = EvidenceService(repos)
-    session, activity = _session_and_activity(repos, learner.id, competency_id)
-
-    interaction, _ = service.record_interaction(
-        activity_id=activity.id, session_id=session.id, idempotency_key=new_id(),
-        learner_input="ora acerta ora erra a mesma regra", tutor_output="", help_level=HelpLevel.A0,
-        production_result=ProductionResult.INCONCLUSIVE, evidence_cluster_id=new_id(),
-    )
-    payload = _payload(competency_id, "comprehension", "target", "contradictory")
-    output = validate_evaluator_payload(payload, {competency_id})
-    service.record_evaluation(raw_interaction=interaction, evaluator_output=output, rule_version=rule_version)
-
-    state = repos.competency_states.current(competency_id, Dimension.COMPREHENSION)
-    assert state.state == CompetencyDimensionState.INSUFFICIENT_EVIDENCE
-    assert state.has_unresolved_contradiction is True
-
-    decision_service = DecisionService(repos)
-    routing, action = decision_service.decide(
-        competency_id=competency_id, learner_id=learner.id, rule_version=rule_version
-    )
-    assert routing.routing == RoutingDecision.VALIDATE
-    assert routing.rule_applied == "contradictory_evidence"
-
-
-# ---------------------------------------------------------------------
-# T7 - avaliacao invalida do LLM nao altera estado.
+# P1 - avaliacao invalida nao altera nenhuma projecao nem FSRS.
 # ---------------------------------------------------------------------
 class _MalformedProvider(Provider):
     provider_name = "malformed"
@@ -261,7 +106,6 @@ class _MalformedProvider(Provider):
         return ProviderCallResult(success=True, payload={"utterance": "oi", "activity_prompt": "oi"}, latency_ms=1)
 
     def generate_evaluation(self, evaluator_input):
-        # dimensao inexistente -> falha de validacao estrutural
         return ProviderCallResult(
             success=True,
             payload={"findings": [{"competency_id": evaluator_input.candidate_competency_ids[0], "dimension": "nao-existe"}]},
@@ -269,244 +113,373 @@ class _MalformedProvider(Provider):
         )
 
 
-def test_T7_invalid_evaluator_response_never_alters_state(repos: Repositories, make_competency):
-    competency_id = make_competency()
-    evaluator_service = EvaluatorService(repos, _MalformedProvider())
-    evaluator_input = EvaluatorInput(
-        raw_interaction_id="ri", learner_input="x", tutor_output="y",
-        candidate_competency_ids=(competency_id,), help_level=HelpLevel.A0,
-        production_result=ProductionResult.INCORRECT, context="", rule_version="v0.1.0",
-    )
-    output, event = evaluator_service.run(evaluator_input, {competency_id})
-
-    assert output is None
-    assert event.success is False
-    assert repos.competency_states.current(competency_id, Dimension.ACCURACY) is None
-    assert repos.evidence_events.list_all() == []
-
-
-# ---------------------------------------------------------------------
-# T8 - double-submit nao duplica evidencia.
-# ---------------------------------------------------------------------
-def test_T8_double_submit_never_duplicates_evidence(repos: Repositories, make_competency):
+def test_P1_invalid_evaluation_never_alters_projection_or_memory(repos, make_competency, make_rule_version, orchestrator_factory):
     competency_id = make_competency()
     learner = _learner(repos)
-    rule_version = _rule_version(repos)
-    orchestrator = SessionOrchestrator(repos, MockProvider(), rule_version)
-    session = orchestrator.start_session(learner.id)
-    activity, _ = orchestrator.start_activity(session_id=session.id, competency_id=competency_id, action=None)
-
-    key = new_id()
-    for _ in range(2):
-        orchestrator.submit_interaction(
-            activity_id=activity.id, session_id=session.id, idempotency_key=key,
-            learner_input="mesma resposta", help_level=HelpLevel.A0,
-            production_result=ProductionResult.SPONTANEOUS_CORRECT,
-        )
-
-    assert len(repos.raw_interactions.list_all()) == 1
-    assert len(repos.evidence_events.list_all()) == 1
-
-
-# ---------------------------------------------------------------------
-# T9 - falha no meio da transacao nao cria estado parcial.
-# ---------------------------------------------------------------------
-def test_T9_mid_transaction_failure_creates_no_partial_state(repos: Repositories, make_competency, monkeypatch):
-    competency_a = make_competency("a")
-    competency_b = make_competency("b")
-    learner = _learner(repos)
-    rule_version = _rule_version(repos)
-    service = EvidenceService(repos)
-    session, activity = _session_and_activity(repos, learner.id, competency_a)
-
-    interaction, _ = service.record_interaction(
-        activity_id=activity.id, session_id=session.id, idempotency_key=new_id(),
-        learner_input="x", tutor_output="", help_level=HelpLevel.A0,
-        production_result=ProductionResult.SPONTANEOUS_CORRECT, evidence_cluster_id=new_id(),
-    )
-    payload = {
-        "findings": [
-            {"competency_id": competency_a, "dimension": "accuracy", "classification": "positive",
-             "result": "ok", "confidence": 0.9, "justification": "ok", "relation": "target"},
-            {"competency_id": competency_b, "dimension": "accuracy", "classification": "positive",
-             "result": "ok", "confidence": 0.9, "justification": "ok", "relation": "target"},
-        ]
-    }
-    output = validate_evaluator_payload(payload, {competency_a, competency_b})
-
-    original_insert = repos.evidence_assessments.insert
-    call_count = {"n": 0}
-
-    def boom(assessment):
-        call_count["n"] += 1
-        if call_count["n"] == 2:
-            raise RuntimeError("falha simulada no meio do lote")
-        return original_insert(assessment)
-
-    monkeypatch.setattr(repos.evidence_assessments, "insert", boom)
-
-    from central_universal.persistence.db import transaction
-
-    with pytest.raises(RuntimeError):
-        with transaction(repos.conn):
-            service.record_evaluation(raw_interaction=interaction, evaluator_output=output, rule_version=rule_version)
-
-    # nada da SEGUNDA leva (nem a primeira) deve ter sobrevivido: tudo ou nada
-    assert repos.evidence_events.list_all() == []
-    assert repos.evidence_assessments.list_all() == []
-    assert repos.competency_states.current(competency_a, Dimension.ACCURACY) is None
-    assert repos.competency_states.current(competency_b, Dimension.ACCURACY) is None
-
-
-# ---------------------------------------------------------------------
-# T10 - reconstrucao dos estados a partir dos eventos reproduz estado atual.
-# ---------------------------------------------------------------------
-def test_T10_full_reconstruction_reproduces_current_state(repos: Repositories, make_competency):
-    competency_id = make_competency()
-    learner = _learner(repos)
-    rule_version = _rule_version(repos)
-    orchestrator = SessionOrchestrator(repos, MockProvider(), rule_version)
-    session = orchestrator.start_session(learner.id)
-
-    for result in (ProductionResult.SPONTANEOUS_CORRECT, ProductionResult.SPONTANEOUS_CORRECT, ProductionResult.INCORRECT):
-        activity, _ = orchestrator.start_activity(session_id=session.id, competency_id=competency_id, action=None)
-        orchestrator.submit_interaction(
-            activity_id=activity.id, session_id=session.id, idempotency_key=new_id(),
-            learner_input="x", help_level=HelpLevel.A0, production_result=result,
-        )
-
-    before = dict(repos.competency_states.current_all_dimensions(competency_id))
-    recompute_all_from_log(repos, rule_version)
-    after = dict(repos.competency_states.current_all_dimensions(competency_id))
-
-    assert before.keys() == after.keys()
-    for dimension in before:
-        assert before[dimension].state == after[dimension].state
-        assert before[dimension].possible_regression == after[dimension].possible_regression
-
-
-# ---------------------------------------------------------------------
-# T11 - mudanca de RuleVersion nao apaga avaliacao historica.
-# ---------------------------------------------------------------------
-def test_T11_rule_version_change_preserves_historical_assessments(repos: Repositories, make_competency):
-    competency_id = make_competency()
-    learner = _learner(repos)
-    rule_v1 = _rule_version(repos, "v0.1.0")
-    service = EvidenceService(repos)
-    session, activity = _session_and_activity(repos, learner.id, competency_id)
-
-    interaction, _ = service.record_interaction(
-        activity_id=activity.id, session_id=session.id, idempotency_key=new_id(),
-        learner_input="x", tutor_output="", help_level=HelpLevel.A0,
-        production_result=ProductionResult.SPONTANEOUS_CORRECT, evidence_cluster_id=new_id(),
-    )
-    payload = _payload(competency_id, "accuracy", "target", "positive")
-    output = validate_evaluator_payload(payload, {competency_id})
-    service.record_evaluation(raw_interaction=interaction, evaluator_output=output, rule_version=rule_v1)
-
-    assessments_before = repos.evidence_assessments.list_all()
-    assert len(assessments_before) == 1
-    assert assessments_before[0].rule_version_id == rule_v1.id
-
-    rule_v2 = _rule_version(repos, "v0.2.0-teste")
-    recompute_all_from_log(repos, rule_v2)
-
-    assessments_after = repos.evidence_assessments.list_all()
-    assert assessments_after == assessments_before  # nenhuma avaliacao historica foi tocada
-
-    current_state = repos.competency_states.current(competency_id, Dimension.ACCURACY)
-    assert current_state.rule_version_id == rule_v2.id  # a PROJECAO usa a nova versao
-    assert current_state.last_evidence_assessment_id == assessments_before[0].id  # mas aponta pra evidencia antiga
-
-
-# ---------------------------------------------------------------------
-# T12 - multiplas sessoes no mesmo dia nao simulam retencao de varios dias.
-# ---------------------------------------------------------------------
-def test_T12_multiple_sessions_same_day_do_not_simulate_multi_day_retention(repos: Repositories, make_competency):
-    competency_id = make_competency()
-    learner = _learner(repos)
-    rule_version = _rule_version(repos)
-    service = EvidenceService(repos)
-
-    for _ in range(4):
-        session, activity = _session_and_activity(repos, learner.id, competency_id)
-        interaction, _ = service.record_interaction(
-            activity_id=activity.id, session_id=session.id, idempotency_key=new_id(),
-            learner_input="x", tutor_output="", help_level=HelpLevel.A0,
-            production_result=ProductionResult.SPONTANEOUS_CORRECT, evidence_cluster_id=new_id(),
-        )
-        payload = _payload(competency_id, "retention", "target", "positive")
-        output = validate_evaluator_payload(payload, {competency_id})
-        service.record_evaluation(raw_interaction=interaction, evaluator_output=output, rule_version=rule_version)
-
-    state = repos.competency_states.current(competency_id, Dimension.RETENTION)
-    assert state.state not in (CompetencyDimensionState.DEMONSTRATED, CompetencyDimensionState.CONSOLIDATED)
-
-
-# ---------------------------------------------------------------------
-# T13 - prerequisite cycle e bloqueado/detectado.
-# ---------------------------------------------------------------------
-def test_T13_prerequisite_cycle_is_detected(repos: Repositories, make_competency):
-    from central_universal.domain.entities import PrerequisiteRelation
-    from central_universal.integrity.checks import run_all
-
-    a = make_competency("cycle-a")
-    b = make_competency("cycle-b")
-    now = utc_now_iso()
-    repos.prerequisites.insert(PrerequisiteRelation(id=new_id(), competency_id=a, prerequisite_id=b, created_at=now))
-    repos.prerequisites.insert(PrerequisiteRelation(id=new_id(), competency_id=b, prerequisite_id=a, created_at=now))
-
-    report = run_all(repos)
-    assert not report.ok
-    assert any(f.check == "prerequisite_cycles" for f in report.findings)
-
-
-# ---------------------------------------------------------------------
-# T14 - falha do FSRS nao destroi evidencia.
-# ---------------------------------------------------------------------
-def test_T14_fsrs_failure_does_not_destroy_evidence(repos: Repositories, make_competency, monkeypatch):
-    competency_id = make_competency()
-    learner = _learner(repos)
-    rule_version = _rule_version(repos)
-    orchestrator = SessionOrchestrator(repos, MockProvider(), rule_version)
-
-    def boom(*args, **kwargs):
-        raise RuntimeError("fsrs indisponivel (simulado)")
-
-    monkeypatch.setattr(orchestrator.memory_adapter.scheduler, "review_card", boom)
+    rule_version = make_rule_version()
+    orchestrator = orchestrator_factory(_MalformedProvider(), rule_version)
 
     session = orchestrator.start_session(learner.id)
-    activity, _ = orchestrator.start_activity(session_id=session.id, competency_id=competency_id, action=None)
+    activity, _ = orchestrator.start_activity(
+        session_id=session.id, competency_id=competency_id, action=None, is_planned_recall=True
+    )
     outcome = orchestrator.submit_interaction(
         activity_id=activity.id, session_id=session.id, idempotency_key=new_id(),
         learner_input="x", help_level=HelpLevel.A0, production_result=ProductionResult.SPONTANEOUS_CORRECT,
     )
 
-    assert isinstance(outcome.memory_result, MemoryReviewError)
-    assert len(repos.raw_interactions.list_all()) == 1
-    assert len(repos.evidence_events.list_all()) >= 1
-    assert len(outcome.competency_states) >= 1
+    assert outcome.evaluator_output is None
+    assert outcome.competency_states == []
+    assert outcome.memory_result is None
+    assert repos.competency_states.current(competency_id, Dimension.ACCURACY) is None
+    assert repos.memory_states.get(competency_id) is None
+    assert repos.evidence_events.list_all() == []
+    assert repos.evidence_assessments.list_all() == []
 
 
 # ---------------------------------------------------------------------
-# T15 - sistema completo funciona offline com MockProvider.
+# P2 - queda depois da interacao bruta permite reavaliacao idempotente.
 # ---------------------------------------------------------------------
-def test_T15_full_system_works_offline_with_mock_provider(repos: Repositories, make_competency):
-    """MockProvider nao importa nenhuma biblioteca de rede (ver
-    central_universal/providers/mock.py) - este teste roda o ciclo
-    completo sem qualquer acesso externo, provando o requisito de aceite
-    da Secao 22."""
+class _EvaluatorAlwaysFailsProvider(Provider):
+    provider_name = "eval-broken"
+    model = "x"
+    config_version = "1"
 
+    def generate_tutor_turn(self, tutor_input):
+        return ProviderCallResult(success=True, payload={"utterance": "oi", "activity_prompt": "oi"}, latency_ms=1)
+
+    def generate_evaluation(self, evaluator_input):
+        raise RuntimeError("avaliador indisponivel (simulado)")
+
+
+def test_P2_reprocessing_after_evaluator_failure_is_idempotent(repos, make_competency, make_rule_version, orchestrator_factory):
     competency_id = make_competency()
     learner = _learner(repos)
-    rule_version = _rule_version(repos)
-    orchestrator = SessionOrchestrator(repos, MockProvider(), rule_version)
+    rule_version = make_rule_version()
+
+    broken_orchestrator = orchestrator_factory(_EvaluatorAlwaysFailsProvider(), rule_version)
+    session = broken_orchestrator.start_session(learner.id)
+    activity, _ = broken_orchestrator.start_activity(session_id=session.id, competency_id=competency_id, action=None)
+
+    key = new_id()
+    first_attempt = broken_orchestrator.submit_interaction(
+        activity_id=activity.id, session_id=session.id, idempotency_key=key,
+        learner_input="She goes to school", help_level=HelpLevel.A0,
+        production_result=ProductionResult.SPONTANEOUS_CORRECT,
+    )
+    assert first_attempt.evaluator_output is None
+    interaction = repos.raw_interactions.get_by_idempotency_key(key)
+    assert interaction.evaluation_status.value == "pending"  # a QUEDA nao trava a interacao
+    assert repos.evidence_events.list_all() == []
+
+    # "conserta" o avaliador e reprocessa a MESMA interacao (mesma idempotency_key)
+    working_orchestrator = orchestrator_factory(MockProvider(), rule_version)
+    second_attempt = working_orchestrator.submit_interaction(
+        activity_id=activity.id, session_id=session.id, idempotency_key=key,
+        learner_input="She goes to school", help_level=HelpLevel.A0,
+        production_result=ProductionResult.SPONTANEOUS_CORRECT,
+    )
+    assert second_attempt.evaluator_output is not None
+    assert len(repos.raw_interactions.list_all()) == 1  # mesma interacao, nunca duplicada
+    assert len(repos.evidence_events.list_all()) == 1  # avaliada exatamente uma vez
+    completed = repos.raw_interactions.get(interaction.id)
+    assert completed.evaluation_status.value == "completed"
+
+    # reenviar de novo agora (ja completed) e um no-op idempotente
+    third_attempt = working_orchestrator.submit_interaction(
+        activity_id=activity.id, session_id=session.id, idempotency_key=key,
+        learner_input="She goes to school", help_level=HelpLevel.A0,
+        production_result=ProductionResult.SPONTANEOUS_CORRECT,
+    )
+    assert third_attempt.evaluator_output is None
+    assert len(repos.evidence_events.list_all()) == 1
+
+
+# ---------------------------------------------------------------------
+# P3 - duas negativas no mesmo cluster nao corroboram regressao.
+# ---------------------------------------------------------------------
+def test_P3_two_negatives_from_same_cluster_never_corroborate_regression(repos, make_competency, make_rule_version):
+    competency_id = make_competency()
+    learner = _learner(repos)
+    rule_version = make_rule_version()
+    service = EvidenceService(repos)
+    session = _session(repos, learner.id)
+    negative_activity = _new_activity(repos, session.id, prompt="negative-drill")
+
+    for i in range(3):
+        activity = _new_activity(repos, session.id, prompt=f"positive-drill-{i}")
+        interaction, _ = service.record_interaction(
+            activity=activity, session_id=session.id, idempotency_key=new_id(),
+            learner_input="ok", tutor_output="", help_level=HelpLevel.A0,
+            production_result=ProductionResult.SPONTANEOUS_CORRECT,
+        )
+        output = validate_evaluator_payload(_payload(competency_id, "accuracy", "target", "positive"), {competency_id})
+        service.record_evaluation(raw_interaction=interaction, evaluator_output=output, rule_version=rule_version)
+
+    before = repos.competency_states.current(competency_id, Dimension.ACCURACY)
+    assert before.state == CompetencyDimensionState.CONSOLIDATED
+
+    for _ in range(2):
+        interaction, _ = service.record_interaction(
+            activity=negative_activity, session_id=session.id, idempotency_key=new_id(),
+            learner_input="erro", tutor_output="", help_level=HelpLevel.A0,
+            production_result=ProductionResult.INCORRECT,
+        )
+        output = validate_evaluator_payload(_payload(competency_id, "accuracy", "target", "negative"), {competency_id})
+        service.record_evaluation(raw_interaction=interaction, evaluator_output=output, rule_version=rule_version)
+
+    after = repos.competency_states.current(competency_id, Dimension.ACCURACY)
+    assert after.state == CompetencyDimensionState.CONSOLIDATED  # nunca rebaixado
+    assert after.possible_regression is True  # mas o sinal esta visivel
+
+
+# ---------------------------------------------------------------------
+# P4 - IDs de cluster diferentes nao provam independencia por si.
+# ---------------------------------------------------------------------
+def test_P4_different_activity_ids_same_context_collapse_into_one_cluster(repos, make_competency, make_rule_version):
+    competency_id = make_competency()
+    learner = _learner(repos)
+    rule_version = make_rule_version()
+    service = EvidenceService(repos)
+    session = _session(repos, learner.id)
+
+    for i in range(3):
+        # cada iteracao cria uma ATIVIDADE NOVA (id diferente), mas o MESMO
+        # prompt/tipo na mesma sessao - o cluster no servidor deve ser o
+        # MESMO, mesmo que o activity_id (o "ID" ingenuo do v1) mude.
+        activity = _new_activity(repos, session.id, prompt="She ___ (go) to school.", activity_type="drill")
+        interaction, _ = service.record_interaction(
+            activity=activity, session_id=session.id, idempotency_key=new_id(),
+            learner_input=f"tentativa {i}", tutor_output="", help_level=HelpLevel.A0,
+            production_result=ProductionResult.SPONTANEOUS_CORRECT,
+        )
+        output = validate_evaluator_payload(_payload(competency_id, "accuracy", "target", "positive"), {competency_id})
+        service.record_evaluation(raw_interaction=interaction, evaluator_output=output, rule_version=rule_version)
+
+    events = repos.evidence_events.list_for_competency(competency_id, Dimension.ACCURACY)
+    cluster_ids = {e.evidence_cluster_id for e in events}
+    assert len(cluster_ids) == 1  # tres activity_id distintos, UM cluster
+
+    state = repos.competency_states.current(competency_id, Dimension.ACCURACY)
+    assert state.state == CompetencyDimensionState.ACQUIRING  # nunca passa de 1 cluster
+
+
+# ---------------------------------------------------------------------
+# P5 - reconstrucao preserva historico e e atomica.
+# ---------------------------------------------------------------------
+def test_P5_reconstruction_preserves_history_and_is_atomic_on_failure(repos, make_competency, make_rule_version, monkeypatch):
+    competency_id = make_competency()
+    learner = _learner(repos)
+    rule_version = make_rule_version()
+    service = EvidenceService(repos)
+    session = _session(repos, learner.id)
+    activity = _new_activity(repos, session.id)
+
+    interaction, _ = service.record_interaction(
+        activity=activity, session_id=session.id, idempotency_key=new_id(),
+        learner_input="ok", tutor_output="", help_level=HelpLevel.A0,
+        production_result=ProductionResult.SPONTANEOUS_CORRECT,
+    )
+    output = validate_evaluator_payload(_payload(competency_id, "accuracy", "target", "positive"), {competency_id})
+    service.record_evaluation(raw_interaction=interaction, evaluator_output=output, rule_version=rule_version)
+
+    before = repos.competency_states.current(competency_id, Dimension.ACCURACY)
+    before_generation_id = before.generation_id
+
+    # reconstrucao bem sucedida: nova geracao, geracao antiga preservada
+    recompute_all_from_log(repos, rule_version)
+    after = repos.competency_states.current(competency_id, Dimension.ACCURACY)
+    assert after.generation_id != before_generation_id
+    assert after.state == before.state
+    old_generation_rows = repos.competency_states.list_by_generation(before_generation_id)
+    assert len(old_generation_rows) >= 1  # nada foi apagado
+
+    # reconstrucao com falha simulada no meio: nao pode deixar a geracao
+    # ativa pela metade nem trocar o ponteiro.
+    active_before_failure = repos.active_projection_generation.get_id()
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("falha simulada no meio da reconstrucao")
+
+    monkeypatch.setattr(repos.competency_states, "insert", boom)
+
+    with pytest.raises(RuntimeError):
+        recompute_all_from_log(repos, rule_version)
+
+    assert repos.active_projection_generation.get_id() == active_before_failure
+
+
+# ---------------------------------------------------------------------
+# P6 - duas RuleVersions produzem resultados diferentes quando suas regras diferem.
+# ---------------------------------------------------------------------
+def test_P6_two_rule_versions_with_different_config_diverge(repos, make_competency, make_rule_version):
+    competency_id = make_competency()
+    learner = _learner(repos)
+    service = EvidenceService(repos)
+    session = _session(repos, learner.id)
+
+    lenient = make_rule_version(config=AggregationConfig(demonstrated_min_clusters=2, consolidated_min_clusters=99))
+    strict = make_rule_version(config=AggregationConfig(demonstrated_min_clusters=5, consolidated_min_clusters=99))
+
+    for i in range(2):
+        activity = _new_activity(repos, session.id, prompt=f"drill {i}")
+        interaction, _ = service.record_interaction(
+            activity=activity, session_id=session.id, idempotency_key=new_id(),
+            learner_input="ok", tutor_output="", help_level=HelpLevel.A0,
+            production_result=ProductionResult.SPONTANEOUS_CORRECT,
+        )
+        output = validate_evaluator_payload(_payload(competency_id, "accuracy", "target", "positive"), {competency_id})
+        # grava a EVIDENCIA uma vez so (o evento/avaliacao nao depende de RuleVersion);
+        # so a PROJECAO e recalculada sob cada regra a seguir.
+        service.record_evaluation(raw_interaction=interaction, evaluator_output=output, rule_version=lenient)
+
+    state_lenient = service.recompute_state(competency_id, Dimension.ACCURACY, lenient)
+    state_strict = service.recompute_state(competency_id, Dimension.ACCURACY, strict)
+
+    assert state_lenient.state == CompetencyDimensionState.DEMONSTRATED
+    assert state_strict.state == CompetencyDimensionState.ACQUIRING
+    assert state_lenient.state != state_strict.state
+
+
+# ---------------------------------------------------------------------
+# P7 - falha ao inserir MemoryReviewLog nao altera MemoryState.
+# ---------------------------------------------------------------------
+def test_P7_memory_review_log_failure_never_alters_memory_state(repos, make_competency, make_rule_version, orchestrator_factory, monkeypatch):
+    competency_id = make_competency()
+    learner = _learner(repos)
+    rule_version = make_rule_version()
+    orchestrator = orchestrator_factory(MockProvider(), rule_version)
+    session = orchestrator.start_session(learner.id)
+
+    activity1, _ = orchestrator.start_activity(
+        session_id=session.id, competency_id=competency_id, action=None, is_planned_recall=True
+    )
+    outcome1 = orchestrator.submit_interaction(
+        activity_id=activity1.id, session_id=session.id, idempotency_key=new_id(),
+        learner_input="ok", help_level=HelpLevel.A0, production_result=ProductionResult.SPONTANEOUS_CORRECT,
+    )
+    assert outcome1.memory_result is not None
+    before = repos.memory_states.get(competency_id)
+    assert before is not None
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("falha simulada ao gravar memory_review_log")
+
+    monkeypatch.setattr(repos.memory_review_logs, "insert", boom)
+
+    activity2, _ = orchestrator.start_activity(
+        session_id=session.id, competency_id=competency_id, action=None, is_planned_recall=True
+    )
+    outcome2 = orchestrator.submit_interaction(
+        activity_id=activity2.id, session_id=session.id, idempotency_key=new_id(),
+        learner_input="ok de novo", help_level=HelpLevel.A0, production_result=ProductionResult.SPONTANEOUS_CORRECT,
+    )
+
+    assert isinstance(outcome2.memory_result, MemoryReviewError)
+    after = repos.memory_states.get(competency_id)
+    assert after.fsrs_card_json == before.fsrs_card_json
+    assert after.updated_at == before.updated_at
+
+
+# ---------------------------------------------------------------------
+# P8 - ciclo de pre-requisito e rejeitado na escrita.
+# ---------------------------------------------------------------------
+def test_P8_prerequisite_cycle_is_rejected_at_write_time(repos, make_competency):
+    a = make_competency("cycle-a")
+    b = make_competency("cycle-b")
+    now = utc_now_iso()
+    repos.prerequisites.insert(PrerequisiteRelation(id=new_id(), competency_id=a, prerequisite_id=b, created_at=now))
+
+    with pytest.raises(PrerequisiteCycleError):
+        repos.prerequisites.insert(PrerequisiteRelation(id=new_id(), competency_id=b, prerequisite_id=a, created_at=now))
+
+
+# ---------------------------------------------------------------------
+# P9 - restore real substitui e recupera o banco.
+# ---------------------------------------------------------------------
+def test_P9_real_restore_substitutes_and_recovers_the_database(tmp_path):
+    db_path = tmp_path / "central.db"
+    conn = connect(db_path)
+    run_migrations(conn)
+    repos = Repositories(conn)
+    learner = Learner(id=new_id(), display_name="Preservado pelo backup", created_at=utc_now_iso())
+    repos.learners.insert(learner)
+
+    backup_event = create_backup(conn, repos, backup_dir=tmp_path / "backups")
+    assert backup_event.success is True
+
+    conn.close()
+    db_path.write_bytes(b"banco corrompido/perdido (simulado)")
+
+    result = restore_from_backup(db_path, backup_event.backup_path)
+    assert result.success is True
+
+    recovered_conn = connect(db_path)
+    recovered = Repositories(recovered_conn).learners.get(learner.id)
+    assert recovered is not None
+    assert recovered.display_name == "Preservado pelo backup"
+    recovered_conn.close()
+
+
+# ---------------------------------------------------------------------
+# P10 - reinicio completo do processo preserva estado.
+# ---------------------------------------------------------------------
+def test_P10_full_process_restart_preserves_state(tmp_path):
+    db_path = tmp_path / "central.db"
+
+    conn1 = connect(db_path)
+    run_migrations(conn1)
+    repos1 = Repositories(conn1)
+    rule_version = repos1.rule_versions
+    from central_universal.evidence.rule_versions import build_v0_2_0_rule_version
+
+    rv = build_v0_2_0_rule_version()
+    repos1.rule_versions.insert(rv)
+    repos1.active_rule_version.set(rv.id)
+    learner = Learner(id=new_id(), display_name="Sobrevive ao reinicio", created_at=utc_now_iso())
+    repos1.learners.insert(learner)
+    conn1.close()  # fim do "processo"
+
+    # "reinicio": processo novo, conexao nova, do zero
+    conn2 = connect(db_path)
+    run_migrations(conn2)  # idempotente - nao recria nada
+    repos2 = Repositories(conn2)
+
+    restored_learner = repos2.learners.get(learner.id)
+    assert restored_learner is not None
+    assert restored_learner.display_name == "Sobrevive ao reinicio"
+
+    active = repos2.active_rule_version.get()
+    assert active is not None
+    assert active.id == rv.id
+    conn2.close()
+
+
+# ---------------------------------------------------------------------
+# P11 - execucao offline falha no teste se qualquer acesso de rede for tentado.
+# ---------------------------------------------------------------------
+def test_P11_offline_execution_fails_if_network_is_attempted(repos, make_competency, make_rule_version, orchestrator_factory, monkeypatch):
+    def blocked(*args, **kwargs):
+        raise AssertionError(
+            "tentativa de acesso de rede detectada durante execucao offline - "
+            "MockProvider nunca deveria abrir um socket (Secao 22/T15)"
+        )
+
+    monkeypatch.setattr(socket.socket, "connect", blocked)
+    monkeypatch.setattr(socket, "create_connection", blocked)
+
+    competency_id = make_competency("simple_present")
+    learner = _learner(repos)
+    rule_version = make_rule_version()
+    orchestrator = orchestrator_factory(MockProvider(), rule_version)
 
     session = orchestrator.start_session(learner.id)
     focus = orchestrator.choose_focus_competency(learner.id)
     assert focus is not None
-    focus_id, _routing, action = focus
-    activity, tutor_output = orchestrator.start_activity(session_id=session.id, competency_id=focus_id, action=action)
+    focus_id, _routing, action, recall_due = focus
+    activity, tutor_output = orchestrator.start_activity(
+        session_id=session.id, competency_id=focus_id, action=action, is_planned_recall=recall_due
+    )
     assert tutor_output is not None
 
     outcome = orchestrator.submit_interaction(

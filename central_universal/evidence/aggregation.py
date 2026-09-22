@@ -6,15 +6,26 @@ ser testada exaustivamente e para que `CompetencyState` seja sempre
 recalculavel a partir de RawInteraction + EvidenceEvent + EvidenceAssessment
 + RuleVersion (Principio Constitucional 6, Secao 14).
 
-Deliberadamente NAO usamos pesos/scores numericos de "mastery": a
-especificacao pede explicitamente que thresholds fiquem para depois, quando
-houver dados reais para calibra-los (ver DECISIONS.md). O que ha aqui e uma
-maquina de estados baseada em contagem de evidencia INDEPENDENTE, nao um
-score artificial.
+v0.2 (pacote de correcao pos Red Team): dois principios reforcados aqui:
+
+- **Nenhum threshold hardcoded.** Todos os limiares vem de
+  `AggregationConfig`, que e lido do `config_json` IMUTAVEL da
+  `RuleVersion` em uso. Mudar um numero e criar uma nova RuleVersion,
+  nunca editar uma constante de modulo (Principio 18).
+- **Sem rebaixamento automatico.** Regressao NUNCA derruba o tier aqui:
+  so fica marcada em `possible_regression`, pendente de validacao
+  deliberada (Secao 17, regra 8 - TARGETED_REGRESSION_CHECK). Ate existir
+  calibracao real, e mais seguro deixar uma suspeita visivel do que
+  reescrever um estado que pode estar certo.
+- **Independencia e por cluster, nao por evento.** Cada bucket de
+  evidencia (positiva forte, positiva fraca, negativa/contraditoria alvo)
+  conta NO MAXIMO uma contribuicao por cluster - dez respostas do mesmo
+  cluster nunca pesam mais que uma.
 """
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -35,23 +46,59 @@ _STATE_ORDER = [
 ]
 
 
-def _downgrade_one_tier(state: CompetencyDimensionState) -> CompetencyDimensionState:
-    idx = _STATE_ORDER.index(state)
-    return _STATE_ORDER[max(idx - 1, 1)]  # nunca cai abaixo de INSUFFICIENT_EVIDENCE
+@dataclass(frozen=True)
+class AggregationConfig:
+    """Politica provisoria de agregacao, versionada via RuleVersion
+    (Secao 8/9 do pacote de correcao v0.2). Os valores default aqui sao
+    SOMENTE o fallback usado se um RuleVersion antigo nao trouxer
+    `config_json` (compatibilidade) - toda RuleVersion nova deve
+    declarar os seus explicitamente.
+    """
+
+    demonstrated_min_clusters: int = 2
+    consolidated_min_clusters: int = 3
+    retention_demonstrated_min_days: int = 2
+    retention_consolidated_min_days: int = 3
+    contradiction_outweigh_ratio: float = 2.0
+    min_confidence_for_aggregation: float = 0.5
+
+    @classmethod
+    def from_json(cls, config_json: str | None) -> "AggregationConfig":
+        if not config_json:
+            return cls()
+        data = json.loads(config_json)
+        known_fields = cls.__dataclass_fields__.keys()
+        filtered = {k: v for k, v in data.items() if k in known_fields}
+        return cls(**filtered)
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {
+                "demonstrated_min_clusters": self.demonstrated_min_clusters,
+                "consolidated_min_clusters": self.consolidated_min_clusters,
+                "retention_demonstrated_min_days": self.retention_demonstrated_min_days,
+                "retention_consolidated_min_days": self.retention_consolidated_min_days,
+                "contradiction_outweigh_ratio": self.contradiction_outweigh_ratio,
+                "min_confidence_for_aggregation": self.min_confidence_for_aggregation,
+            },
+            sort_keys=True,
+        )
 
 
 @dataclass(frozen=True)
 class UsableEvidence:
     """Uma evidencia ja assessada, pronta para entrar na agregacao.
 
-    `mere_presence` nunca chega aqui: e filtrada antes, na camada de
-    servico (Principio: mere_presence nao atualiza estado - Secao 8, T5).
+    `mere_presence`, achados `inconclusive` e achados com
+    `alternative_cause` pendente nunca chegam aqui: sao filtrados antes,
+    na camada de servico (Secao 8 e Secao 11 do pacote de correcao v0.2).
     """
 
     evidence_type: EvidenceType
     relation: EvidenceRelation
     help_level: HelpLevel
     evidence_cluster_id: str
+    confidence: float
     created_at: datetime
 
 
@@ -63,9 +110,26 @@ class AggregationResult:
     explanation: str
 
 
+def _dedupe_latest_per_cluster(events: list[UsableEvidence]) -> dict[str, UsableEvidence]:
+    """Garante 'no maximo uma contribuicao por cluster' (Secao 6 do pacote
+    de correcao v0.2): se o mesmo cluster aparece varias vezes num bucket,
+    so a ocorrencia mais recente conta."""
+
+    by_cluster: dict[str, UsableEvidence] = {}
+    for event in events:
+        current = by_cluster.get(event.evidence_cluster_id)
+        if current is None or event.created_at > current.created_at:
+            by_cluster[event.evidence_cluster_id] = event
+    return by_cluster
+
+
 def classify_dimension(
-    dimension: Dimension, events: list[UsableEvidence]
+    dimension: Dimension,
+    events: list[UsableEvidence],
+    config: AggregationConfig | None = None,
 ) -> AggregationResult:
+    config = config or AggregationConfig()
+
     if not events:
         return AggregationResult(
             CompetencyDimensionState.NOT_ASSESSED,
@@ -74,12 +138,20 @@ def classify_dimension(
             "Nenhuma evidencia registrada para esta dimensao.",
         )
 
-    events_sorted = sorted(events, key=lambda e: e.created_at)
+    usable = [e for e in events if e.confidence >= config.min_confidence_for_aggregation]
+    if not usable:
+        return AggregationResult(
+            CompetencyDimensionState.INSUFFICIENT_EVIDENCE,
+            False,
+            False,
+            f"{len(events)} evidencia(s) registrada(s), mas nenhuma atinge a "
+            f"confianca minima de agregacao ({config.min_confidence_for_aggregation}).",
+        )
+
+    events_sorted = sorted(usable, key=lambda e: e.created_at)
 
     # "Recuperacao independente nao pode ser considerada demonstrada
-    # somente por A2/A3" (Secao 9). Aplicamos essa barreira a toda
-    # evidencia POSITIVA de relacao 'target': so conta como evidencia
-    # forte (independente) quando o nivel de ajuda foi A0 ou A1.
+    # somente por A2/A3" (Secao 9).
     strong_positive = [
         e
         for e in events_sorted
@@ -92,93 +164,98 @@ def classify_dimension(
         for e in events_sorted
         if e.evidence_type == EvidenceType.POSITIVE and e not in strong_positive
     ]
-    negatives = [e for e in events_sorted if e.evidence_type == EvidenceType.NEGATIVE]
-    contradictory = [
-        e for e in events_sorted if e.evidence_type == EvidenceType.CONTRADICTORY
+    # Regressao so pode ser sinalizada por evidencia TARGET (Secao 7 do
+    # pacote de correcao v0.2: "evidencia incidental negativa deve gerar
+    # hipotese de validacao e nao rebaixamento automatico" - qualified
+    # incidental nunca entra aqui).
+    regression_signal = [
+        e
+        for e in events_sorted
+        if e.relation == EvidenceRelation.TARGET
+        and e.evidence_type in (EvidenceType.NEGATIVE, EvidenceType.CONTRADICTORY)
+    ]
+    contradictory = [e for e in events_sorted if e.evidence_type == EvidenceType.CONTRADICTORY]
+    incidental_negative = [
+        e
+        for e in events_sorted
+        if e.evidence_type == EvidenceType.NEGATIVE and e.relation == EvidenceRelation.QUALIFIED_INCIDENTAL
     ]
 
-    strong_clusters = {e.evidence_cluster_id for e in strong_positive}
-    strong_days = {e.created_at.date() for e in strong_positive}
+    strong_by_cluster = _dedupe_latest_per_cluster(strong_positive)
+    weak_by_cluster = _dedupe_latest_per_cluster(weak_positive)
+    regression_by_cluster = _dedupe_latest_per_cluster(regression_signal)
+    contradictory_by_cluster = _dedupe_latest_per_cluster(contradictory)
+
+    strong_clusters = set(strong_by_cluster.keys())
+    strong_days = {e.created_at.date() for e in strong_by_cluster.values()}
 
     if dimension == Dimension.RETENTION:
         # Principio 10 / Secao 12: retencao e longitudinal. Repeticoes no
-        # mesmo dia nao contam como dias distintos, nao importa quantas
-        # sessoes ou clusters existam (T1, T12).
-        if len(strong_days) >= 3:
+        # mesmo dia nao contam como dias distintos, nao importa quantos
+        # clusters/sessoes existam (T1, T12).
+        if len(strong_days) >= config.retention_consolidated_min_days:
             tier = CompetencyDimensionState.CONSOLIDATED
-        elif len(strong_days) >= 2:
+        elif len(strong_days) >= config.retention_demonstrated_min_days:
             tier = CompetencyDimensionState.DEMONSTRATED
-        elif strong_clusters or weak_positive:
+        elif strong_clusters or weak_by_cluster:
             tier = CompetencyDimensionState.ACQUIRING
         else:
             tier = CompetencyDimensionState.INSUFFICIENT_EVIDENCE
     else:
-        if len(strong_clusters) >= 3:
+        if len(strong_clusters) >= config.consolidated_min_clusters:
             tier = CompetencyDimensionState.CONSOLIDATED
-        elif len(strong_clusters) >= 2:
+        elif len(strong_clusters) >= config.demonstrated_min_clusters:
             tier = CompetencyDimensionState.DEMONSTRATED
-        elif strong_clusters or weak_positive:
+        elif strong_clusters or weak_by_cluster:
             tier = CompetencyDimensionState.ACQUIRING
         else:
             tier = CompetencyDimensionState.INSUFFICIENT_EVIDENCE
 
     explanation_parts = [
-        f"{len(strong_positive)} evidencia(s) positiva(s) independente(s) "
-        f"em {len(strong_clusters)} cluster(s) distinto(s)"
-        + (f" e {len(strong_days)} dia(s) distinto(s)" if dimension == Dimension.RETENTION else "")
+        f"{len(strong_by_cluster)} cluster(s) independente(s) com evidencia positiva forte"
+        + (f", {len(strong_days)} dia(s) distinto(s)" if dimension == Dimension.RETENTION else "")
         + "."
     ]
-    if weak_positive:
+    if weak_by_cluster:
         explanation_parts.append(
-            f"{len(weak_positive)} evidencia(s) positiva(s) assistida(s)/incidental(is) "
-            "(nao contam para demonstrar/consolidar, mas sustentam 'acquiring')."
+            f"{len(weak_by_cluster)} cluster(s) com evidencia positiva assistida/incidental "
+            "(sustenta 'acquiring', nunca promove sozinha a demonstrated/consolidated)."
+        )
+    if incidental_negative:
+        explanation_parts.append(
+            f"{len(incidental_negative)} evidencia(s) negativa(s) incidental(is) registrada(s) "
+            "como hipotese de validacao - nao contam para regressao nem rebaixam o estado."
         )
 
-    # Evidencia contradictoria pode coexistir (Principio 13). Se nao for
+    # Evidencia contraditoria pode coexistir (Principio 13). Se nao for
     # claramente superada pela evidencia positiva forte, o estado nao pode
-    # afirmar dominio: cai para insufficient_evidence e a decisao correta e
-    # validar, nao promover nem derrubar (T6).
+    # afirmar dominio: cai para insufficient_evidence (T6).
     has_unresolved_contradiction = False
-    if contradictory and len(strong_clusters) < 2 * len(contradictory):
+    if contradictory_by_cluster and len(strong_clusters) < config.contradiction_outweigh_ratio * len(contradictory_by_cluster):
         has_unresolved_contradiction = True
-        if _STATE_ORDER.index(tier) > _STATE_ORDER.index(
-            CompetencyDimensionState.INSUFFICIENT_EVIDENCE
-        ):
+        if _STATE_ORDER.index(tier) > _STATE_ORDER.index(CompetencyDimensionState.INSUFFICIENT_EVIDENCE):
             tier = CompetencyDimensionState.INSUFFICIENT_EVIDENCE
         explanation_parts.append(
-            f"{len(contradictory)} evidencia(s) contraditoria(s) nao superada(s) "
-            "pela evidencia positiva: estado mantido em incerteza."
+            f"{len(contradictory_by_cluster)} cluster(s) com evidencia contraditoria nao "
+            "superada pela evidencia positiva: estado mantido em incerteza."
         )
 
-    # Regressao possivel (Principio 12): um erro ISOLADO recente nao apaga
-    # dominio anterior - apenas sinaliza. So corroboramos (derrubamos um
-    # nivel) quando ha >=2 evidencias negativas/contraditorias entre as
-    # 3 mais recentes, ou seja, quando NAO e mais um erro isolado.
+    # Regressao (Secao 8 do pacote de correcao v0.2): NUNCA rebaixa o tier
+    # automaticamente aqui. So sinaliza, e so quando a evidencia TARGET
+    # mais recente (comparando positiva forte contra negativa/contraditoria,
+    # ja deduplicadas por cluster) e desfavoravel - "erro isolado" nao
+    # movimenta esse sinal se uma evidencia positiva mais recente já o
+    # superou.
     possible_regression = False
-    if tier in (
-        CompetencyDimensionState.DEMONSTRATED,
-        CompetencyDimensionState.CONSOLIDATED,
-    ):
-        recent = events_sorted[-3:]
-        recent_bad = [
-            e
-            for e in recent
-            if e.evidence_type in (EvidenceType.NEGATIVE, EvidenceType.CONTRADICTORY)
-        ]
-        if recent_bad:
+    if tier in (CompetencyDimensionState.DEMONSTRATED, CompetencyDimensionState.CONSOLIDATED) and regression_by_cluster:
+        combined = list(strong_by_cluster.values()) + list(regression_by_cluster.values())
+        most_recent = max(combined, key=lambda e: e.created_at)
+        if most_recent.evidence_type in (EvidenceType.NEGATIVE, EvidenceType.CONTRADICTORY):
             possible_regression = True
             explanation_parts.append(
-                f"{len(recent_bad)} evidencia(s) negativa(s)/contraditoria(s) recente(s) "
-                "detectada(s): possivel regressao sinalizada."
+                f"{len(regression_by_cluster)} cluster(s) com evidencia alvo negativa/contraditoria "
+                "mais recente que a ultima confirmacao positiva: possivel regressao sinalizada, "
+                "pendente de validacao deliberada (sem rebaixamento automatico)."
             )
-            if len(recent_bad) >= 2:
-                tier = _downgrade_one_tier(tier)
-                explanation_parts.append(
-                    "Regressao corroborada por mais de uma evidencia recente: "
-                    "estado rebaixado em um nivel (nao para insufficient_evidence "
-                    "direto, para nao apagar todo o historico de uma vez)."
-                )
 
-    return AggregationResult(
-        tier, possible_regression, has_unresolved_contradiction, " ".join(explanation_parts)
-    )
+    return AggregationResult(tier, possible_regression, has_unresolved_contradiction, " ".join(explanation_parts))

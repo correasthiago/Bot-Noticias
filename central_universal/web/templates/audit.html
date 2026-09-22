@@ -25,22 +25,39 @@
   <button type="submit">Fazer backup agora</button>
 </form>
 <table>
-  <tr><th>Quando</th><th>Sucesso</th><th>Tamanho</th><th>Caminho</th></tr>
+  <tr><th>Quando</th><th>Sucesso</th><th>Tamanho</th><th>Caminho</th><th></th></tr>
   {% for b in backups %}
   <tr>
     <td>{{ b.started_at }}</td>
     <td>{{ "sim" if b.success else "nao" }}</td>
     <td>{{ b.size_bytes }}</td>
     <td>{{ b.backup_path }}</td>
+    <td>
+      {% if b.success %}
+      <form method="post" action="/audit/restore" onsubmit="return confirm('Restaurar este backup vai substituir o banco atual. Continuar?');">
+        <input type="hidden" name="backup_path" value="{{ b.backup_path }}">
+        <button type="submit">Restaurar</button>
+      </form>
+      {% endif %}
+    </td>
   </tr>
   {% endfor %}
 </table>
 
 <h3>Versoes de regras</h3>
+<p><em>rule_version e imutavel no banco; qual versao esta ativa agora vive
+num ponteiro separado (active_rule_version), nunca numa coluna da propria
+linha.</em></p>
 <table>
-  <tr><th>Versao</th><th>Descricao</th><th>Ativa</th><th>Criada em</th></tr>
+  <tr><th>Versao</th><th>Descricao</th><th>Algoritmo</th><th>Ativa agora</th><th>Criada em</th></tr>
   {% for rv in rule_versions %}
-  <tr><td>{{ rv.version }}</td><td>{{ rv.description }}</td><td>{{ "sim" if rv.active else "nao" }}</td><td>{{ rv.created_at }}</td></tr>
+  <tr>
+    <td>{{ rv.version }}</td>
+    <td>{{ rv.description }}</td>
+    <td>{{ rv.algorithm_version }}</td>
+    <td>{{ "sim" if active_rule_version and rv.id == active_rule_version.id else "nao" }}</td>
+    <td>{{ rv.created_at }}</td>
+  </tr>
   {% endfor %}
 </table>
 

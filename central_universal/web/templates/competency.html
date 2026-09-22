@@ -28,18 +28,26 @@
 {% endif %}
 
 <h3>Evidencias</h3>
+<p><em>O evento registra os fatos observados (dimensao, relacao, ajuda); a
+classificacao (positive/negative/...) pertence exclusivamente as
+avaliacoes listadas na ultima coluna.</em></p>
 <table>
-  <tr><th>Quando</th><th>Dimensao</th><th>Tipo</th><th>Relacao</th><th>Ajuda</th><th>Avaliacoes</th></tr>
+  <tr><th>Quando</th><th>Dimensao</th><th>Relacao</th><th>Ajuda</th><th>Cluster</th><th>Avaliacoes</th></tr>
   {% for row in evidence_rows %}
   <tr>
     <td>{{ row.event.created_at }}</td>
     <td>{{ row.event.dimension.value }}</td>
-    <td>{{ row.event.evidence_type.value }}</td>
     <td>{{ row.event.relation.value }}</td>
     <td>{{ row.event.help_level.value }}</td>
+    <td>{{ row.event.evidence_cluster_id[:8] }}</td>
     <td>
       {% for a in row.assessments %}
-        <div>{{ a.classification.value }} (conf. {{ "%.2f"|format(a.confidence) }}) - {{ a.justification }}</div>
+        <div>
+          <strong>{{ a.classification.value }}</strong> (conf. {{ "%.2f"|format(a.confidence) }})
+          {% if a.inconclusive %}<span class="flag">inconclusive</span>{% endif %}
+          {% if a.alternative_cause %}<span class="flag">causa alternativa: {{ a.alternative_cause }}</span>{% endif %}
+          - {{ a.justification }}
+        </div>
       {% endfor %}
     </td>
   </tr>

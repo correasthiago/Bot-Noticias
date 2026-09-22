@@ -1,6 +1,7 @@
-# Modelo de dados — Central Universal V0.1
+# Modelo de dados — Central Universal V0.2
 
-Schema completo em `central_universal/persistence/migrations/0001_init.sql`.
+Schema completo em `central_universal/persistence/migrations/0001_init.sql`
+(base) + `0002_v0_2_corrections.sql` (pacote de correcao pos Red Team).
 Todas as tabelas sao `STRICT`. `foreign_keys=ON` e ativado por conexao em
 `persistence/db.py`, nao e uma configuracao global do arquivo `.db`.
 
@@ -11,32 +12,41 @@ Todas as tabelas sao `STRICT`. `foreign_keys=ON` e ativado por conexao em
 | `learner` | pessoa usando o sistema | mutavel |
 | `learning_domain` | dominio de conhecimento (ex.: ingles) | mutavel |
 | `competency` | um no do grafo de competencias | mutavel |
-| `prerequisite_relation` | aresta `competency -> prerequisite` | mutavel |
-| `rule_version` | uma versao das regras pedagogicas | **imutavel apos criada** |
+| `prerequisite_relation` | aresta `competency -> prerequisite` (ciclos bloqueados na escrita) | mutavel |
+| `rule_version` | uma versao das regras pedagogicas, com `config_json`/`algorithm_version` | **imutavel (trigger SQL)** |
+| `active_rule_version` | ponteiro singleton para a RuleVersion ativa agora | **mutavel (ponteiro)** |
 | `learning_session` | uma sessao de estudo | mutavel (status/ended_at) |
-| `activity` | uma atividade dentro de uma sessao | mutavel |
-| `raw_interaction` | uma resposta bruta do aprendiz | **imutavel (trigger SQL)** |
-| `evidence_event` | evidencia classificada a partir de uma interacao | **imutavel (trigger SQL)** |
-| `evidence_assessment` | interpretacao versionada de um evidence_event | **imutavel (trigger SQL)** |
-| `competency_state` | projecao derivada, append-only | **append-only** |
-| `memory_state` | card FSRS "atual" de uma competencia | mutavel (1 linha por competencia) |
-| `memory_review_log` | historico de reviews FSRS | append-only |
-| `decision_event` | uma decisao do Decisor, com justificativa | **imutavel** |
-| `provider_event` | uma chamada a um fornecedor de IA | **imutavel** |
-| `backup_event` | um backup executado | **imutavel** |
+| `activity` | uma atividade dentro de uma sessao, com `is_planned_recall` | mutavel |
+| `evidence_cluster` | contexto de tentativa computado no SERVIDOR | mutavel (so `last_seen_at`) |
+| `raw_interaction` | uma resposta bruta do aprendiz, com `evaluation_status` | **imutavel, exceto pending->completed (trigger SQL)** |
+| `evidence_event` | FATOS observados de uma interacao (sem classificacao) | **imutavel (trigger SQL)** |
+| `evidence_assessment` | classificacao/confianca/causa/RuleVersion de um evidence_event | **imutavel (trigger SQL)** |
+| `projection_generation` | uma geracao da projecao CompetencyState | mutavel (`status`, ciclo de vida) |
+| `active_projection_generation` | ponteiro singleton para a geracao ativa agora | **mutavel (ponteiro)** |
+| `competency_state` | projecao derivada, append-only, marcada com `generation_id` | **imutavel/append-only (trigger SQL)** |
+| `memory_state` | card FSRS "atual" de uma competencia | mutavel (1 linha por competencia, por design) |
+| `memory_review_log` | historico de reviews FSRS | **imutavel (trigger SQL)** |
+| `memory_observation` | evento explicito que autorizou uma revisao FSRS | **imutavel (trigger SQL)** |
+| `decision_event` | uma decisao do Decisor, com justificativa | **imutavel (trigger SQL)** |
+| `provider_event` | uma chamada a um fornecedor de IA | **imutavel (trigger SQL)** |
+| `backup_event` | um backup executado | **imutavel (trigger SQL)** |
 
 ## Relacoes principais
 
 ```
-learning_domain 1---N competency N---N competency   (via prerequisite_relation)
+learning_domain 1---N competency N---N competency   (via prerequisite_relation, sem ciclos)
 learner 1---N learning_session 1---N activity 1---N raw_interaction
+learning_session 1---N evidence_cluster (por sessao+contexto)
+raw_interaction N---1 evidence_cluster
 raw_interaction 1---N evidence_event 1---N evidence_assessment
 competency 1---N evidence_event
 competency 1---1 memory_state 1---N memory_review_log
-competency 1---N competency_state (append-only, uma "dimension" por vez)
+competency 1---N memory_observation
+projection_generation 1---N competency_state (append-only, uma "dimension" por vez, POR geracao)
 rule_version 1---N evidence_assessment
 rule_version 1---N competency_state
 rule_version 1---N decision_event
+rule_version 1---N projection_generation
 ```
 
 ## Por que `EvidenceAssessment.classification` NAO e um `CompetencyDimensionState`
@@ -49,32 +59,79 @@ SEMPRE calculado por `evidence.aggregation.classify_dimension` a partir de
 MUITAS avaliacoes — nunca escrito diretamente por um avaliador individual
 (Principio 2 e 8).
 
-## `competency_state`: por que append-only
+## Por que `EvidenceEvent` e `EvidenceAssessment` sao estritamente separados (v0.2)
 
-Cada recomputo de `(competency_id, dimension)` insere uma NOVA linha; o
-"estado atual" e sempre a de `computed_at` mais recente. Isso da, de
-graca:
+Ate a V0.1, `EvidenceEvent` tinha uma coluna `evidence_type` que
+duplicava, mecanicamente, o que `EvidenceAssessment.classification` ja
+carregava - uma inconsistencia que o Red Team pos-entrega apontou. Desde
+v0.2:
+
+- `EvidenceEvent` registra so FATOS OBSERVADOS e condicoes da tentativa:
+  `dimension`, `relation` (target/qualified_incidental/mere_presence),
+  `help_level`, `production_result`, `evidence_cluster_id`. Nunca uma
+  classificacao/julgamento.
+- `EvidenceAssessment` registra a INTERPRETACAO: `classification`,
+  `confidence`, `justification`, `alternative_cause`, `inconclusive`,
+  `rule_version_id`. Um CHECK constraint garante
+  `(classification='inconclusive') <=> (inconclusive=1)`.
+
+## `competency_state`: por que append-only E organizado em geracoes (v0.2)
+
+Cada recomputo INCREMENTAL de `(competency_id, dimension)` insere uma
+NOVA linha na geracao ATIVA; o "estado atual" e sempre a linha de
+`computed_at` mais recente DENTRO da geracao ativa (nunca misturando
+geracoes). Isso da, de graca:
 
 - historico completo de como o estado evoluiu (Principio 3);
-- recalculabilidade total: `evidence.service.recompute_all_from_log`
-  apaga a tabela inteira e a reconstroi a partir de
-  `raw_interaction + evidence_event + evidence_assessment + rule_version`
-  (Principio 6, testado em T10).
+- recalculabilidade total SEM PERDA: `evidence.service.recompute_all_from_log`
+  cria uma `ProjectionGeneration` NOVA, recalcula TUDO dentro dela numa
+  transacao, valida, e SO ENTAO move o ponteiro `active_projection_generation`
+  - a geracao anterior fica no banco para sempre, marcada `superseded`
+  (Principio 6 e 10 do pacote de correcao v0.2).
+
+A tabela em si e IMUTAVEL (trigger `BEFORE UPDATE`/`BEFORE DELETE`) desde
+v0.2 - nenhuma linha de nenhuma geracao, ativa ou nao, pode ser alterada
+ou apagada depois de inserida.
+
+## Por que o cluster de evidencia e uma tabela propria, computada no servidor (v0.2)
+
+Ate a V0.1, `evidence_cluster_id` era um `TEXT` livre que o CHAMADOR
+decidia (na pratica, o orquestrador usava `activity_id`, mas nada no
+schema impedia outra coisa). O Red Team apontou que isso permite
+"provar independencia" so inventando um id novo. Desde v0.2,
+`evidence_cluster` e uma tabela real: `id` e um hash determinístico de
+`(session_id, activity_type, prompt normalizado)`, com
+`UNIQUE(session_id, context_signature)`. `raw_interaction.evidence_cluster_id`
+e `evidence_event.evidence_cluster_id` sao FOREIGN KEY para ela - nenhum
+codigo de aplicacao aceita mais um cluster id vindo de fora (ver
+`evidence/clustering.py`).
 
 ## Campos que merecem explicacao
 
-- `evidence_event.evidence_cluster_id` — Secao 11: respostas da MESMA
-  atividade compartilham cluster (na pratica, `evidence_cluster_id =
-  activity_id`), para que 10 respostas quase identicas nao contem como 10
-  provas independentes.
+- `raw_interaction.evaluation_status` (`pending`/`completed`) — permite
+  reprocessar (reavaliar) uma interacao cuja avaliacao anterior falhou,
+  sem duplicar evidencia se a avaliacao ja tiver completado. A transicao
+  `pending -> completed` e feita por um `UPDATE ... WHERE
+  evaluation_status = 'pending'` atomico
+  (`RawInteractionRepository.try_claim_evaluation`) - e a UNICA excecao
+  permitida pela trigger de imutabilidade de `raw_interaction`.
+- `activity.is_planned_recall` — marca se esta atividade foi criada
+  especificamente como uma tentativa de recuperacao espacada (e nao um
+  estudo comum). E um dos quatro requisitos para que a interacao gere um
+  `MemoryObservation` (ver Secao 1-2 do pacote de correcao v0.2).
+- `memory_observation` — o UNICO evento que autoriza
+  `MemoryAdapter.observe_and_review` a chamar o FSRS. Guarda
+  `planned_recall`, `interval_days` (desde a ultima revisao) e `rating`
+  como um registro auditavel de POR QUE aquela revisao aconteceu.
 - `competency_state.possible_regression` — marcador booleano
   INDEPENDENTE do enum de estado (Secao 7): nunca vira um valor do enum
-  `CompetencyDimensionState`.
+  `CompetencyDimensionState`. Desde v0.2, NUNCA rebaixa o `state`
+  automaticamente - e so um sinal, pendente de validacao deliberada.
 - `competency_state.has_unresolved_contradiction` — permite ao Decisor
   (Secao 17, regra 7) diferenciar "sem evidencia ainda" de "evidencia
   ambigua", sem precisar re-consultar o event log inteiro a cada decisao.
 - `raw_interaction.idempotency_key` — `UNIQUE`; e a chave que torna
-  `EvidenceService.record_interaction` idempotente (Secao 24, T8).
+  `EvidenceService.record_interaction` idempotente.
 - `activity.competency_targets` — `TEXT` com um array JSON de ids. E a
   UNICA referencia a `competency` que o SQLite nao valida via
   `FOREIGN KEY` (JSON embutido); por isso
@@ -84,6 +141,20 @@ graca:
   — serializacao COMPLETA (`Card.to_json()` / `ReviewLog.to_json()`) do
   Py-FSRS, nao so os campos usados hoje. Permite reconstruir/recalcular o
   scheduler inteiro no futuro (Secao 13).
+- `rule_version.config_json` — a UNICA fonte de thresholds de agregacao
+  (`AggregationConfig`); nada mais no codigo hardcoda esses numeros.
+  `rule_version.algorithm_version` documenta qual forma de codigo sabe
+  interpretar aquele JSON.
+
+## Por que "versao ativa" e "geracao ativa" vivem em tabelas-ponteiro separadas
+
+`rule_version` e `competency_state`/`projection_generation` sao
+imutaveis/append-only. Se "qual versao/geracao esta ativa" fosse uma
+coluna dessas proprias linhas, "ativar" uma nova exigiria dar UPDATE
+numa linha antiga - proibido pela trigger. Por isso `active_rule_version`
+e `active_projection_generation` sao tabelas SEPARADAS, de uma linha so
+(`id=1`), deliberadamente mutaveis: sao bookkeeping/ponteiro, nao fato
+historico.
 
 ## Datas
 

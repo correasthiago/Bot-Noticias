@@ -12,10 +12,12 @@ from dataclasses import dataclass, field
 from central_universal.domain.enums import (
     CompetencyDimensionState,
     Dimension,
+    EvaluationStatus,
     EvidenceRelation,
     EvidenceType,
     HelpLevel,
     ProductionResult,
+    ProjectionGenerationStatus,
     ProviderFunction,
     SessionStatus,
 )
@@ -54,11 +56,23 @@ class PrerequisiteRelation:
 
 @dataclass
 class RuleVersion:
+    """Uma versao IMUTAVEL das regras pedagogicas (Principio 18).
+
+    `config_json` e a UNICA fonte de thresholds/politicas provisorias
+    (Secao 8 do pacote de correcao v0.2): nenhum threshold de agregacao
+    vive mais hardcoded em `evidence/aggregation.py`. `algorithm_version`
+    identifica qual forma de codigo sabe interpretar `config_json` - uma
+    nova RuleVersion nunca pode "reetiquetar" projecoes de uma versao de
+    algoritmo diferente sem recomputa-las de verdade.
+    """
+
     id: str
     version: str
     description: str
     created_at: str
-    active: bool = True
+    config_json: str
+    algorithm_version: str
+    active: bool = True  # anotacao historica; a versao ATIVA de verdade e active_rule_version
 
 
 @dataclass
@@ -80,6 +94,26 @@ class Activity:
     support_level: HelpLevel
     created_at: str
     tutor_provider_event_id: str | None = None
+    is_planned_recall: bool = False
+
+
+@dataclass
+class EvidenceCluster:
+    """Contexto de tentativa computado no SERVIDOR (Secao 6 do pacote de
+    correcao v0.2): nunca aceitamos um id arbitrario do chamador como
+    prova de independencia. Duas interacoes na MESMA sessao com o mesmo
+    tipo de atividade e o mesmo prompt normalizado caem no mesmo cluster,
+    nao importa quantos `activity_id`/`raw_interaction_id` distintos
+    existam por baixo.
+    """
+
+    id: str
+    session_id: str
+    activity_type: str
+    context_signature: str
+    origin: str
+    first_seen_at: str
+    last_seen_at: str
 
 
 @dataclass
@@ -94,15 +128,19 @@ class RawInteraction:
     production_result: ProductionResult
     occurred_at: str
     evidence_cluster_id: str
+    evaluation_status: EvaluationStatus = EvaluationStatus.PENDING
 
 
 @dataclass
 class EvidenceEvent:
+    """Fatos OBSERVADOS e condicoes da tentativa (Secao 4 do pacote de
+    correcao v0.2). Nunca carrega classificacao/julgamento - isso e
+    exclusivo de EvidenceAssessment."""
+
     id: str
     raw_interaction_id: str
     competency_id: str
     dimension: Dimension
-    evidence_type: EvidenceType
     relation: EvidenceRelation
     help_level: HelpLevel
     production_result: ProductionResult
@@ -114,11 +152,11 @@ class EvidenceEvent:
 class EvidenceAssessment:
     """Interpretacao VERSIONADA de um EvidenceEvent (Secao 16).
 
-    `classification` e o julgamento final do avaliador sobre o TIPO da
-    evidencia (positive/negative/contradictory/inconclusive) apos escrutinio
-    - pode diferir do `evidence_type` mecanico do EvidenceEvent. O estado da
-    competencia (CompetencyDimensionState) NUNCA e decidido aqui: e sempre
-    derivado por agregacao deterministica em `evidence.aggregation`.
+    Classificacao, confianca, causa alternativa, conclusividade e
+    RuleVersion pertencem EXCLUSIVAMENTE aqui (Secao 4 do pacote de
+    correcao v0.2). O estado da competencia (CompetencyDimensionState)
+    nunca e decidido aqui: e sempre derivado por agregacao deterministica
+    em `evidence.aggregation`.
     """
 
     id: str
@@ -135,14 +173,32 @@ class EvidenceAssessment:
 
 
 @dataclass
+class ProjectionGeneration:
+    """Uma geracao da projecao CompetencyState (Secao 10 do pacote de
+    correcao v0.2). Reconstrucao total deixa de apagar `competency_state`:
+    ela constroi uma geracao nova, valida, e so entao a ativa - gerações
+    antigas permanecem no banco, nunca sao apagadas."""
+
+    id: str
+    rule_version_id: str
+    created_at: str
+    status: ProjectionGenerationStatus
+    activated_at: str | None = None
+    note: str = ""
+
+
+@dataclass
 class CompetencyState:
     """Projecao derivada e recalculavel (Principio 6, Secao 14).
 
-    Cada recomputo insere uma NOVA linha (append-only). O estado "atual"
-    e sempre a linha mais recente por (competency_id, dimension).
+    Cada linha pertence a uma `ProjectionGeneration`. Dentro da geracao
+    ATIVA, o estado "atual" e a linha mais recente por
+    (competency_id, dimension). Linhas de geracoes antigas nunca sao
+    apagadas nem alteradas.
     """
 
     id: str
+    generation_id: str
     competency_id: str
     dimension: Dimension
     state: CompetencyDimensionState
@@ -175,6 +231,24 @@ class MemoryReviewLog:
     review_datetime: str
     rating: int
     fsrs_review_log_json: str
+    created_at: str
+
+
+@dataclass
+class MemoryObservation:
+    """Evento EXPLICITO de observacao de memoria (Secao 1 do pacote de
+    correcao v0.2). E o UNICO gatilho legitimo para chamar
+    `MemoryAdapter.review`: so existe quando uma tentativa de recuperacao
+    foi planejada, ocorreu apos um intervalo relevante, e recebeu uma
+    avaliacao valida e conclusiva."""
+
+    id: str
+    competency_id: str
+    raw_interaction_id: str
+    evidence_assessment_id: str
+    planned_recall: bool
+    interval_days: float | None
+    rating: int
     created_at: str
 
 

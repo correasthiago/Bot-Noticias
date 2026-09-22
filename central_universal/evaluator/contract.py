@@ -3,9 +3,16 @@
 O Avaliador (LLM ou regra) recebe uma interacao bruta e candidatos de
 competencia e retorna uma lista de `EvaluatorFinding`. Cada finding e
 validado estruturalmente antes de poder gerar EvidenceEvent/EvidenceAssessment.
-Uma resposta invalida (campo fora do enum, confianca fora de [0,1], etc.)
-e descartada inteiramente - Principio: "Resposta invalida do LLM NAO
-altera estado" (Secao 16, Teste T7).
+Uma resposta invalida (campo fora do enum, confianca fora de [0,1],
+inconclusive=True sem classification='inconclusive', etc.) e descartada
+inteiramente - Principio: "Resposta invalida do LLM NAO altera estado"
+(Secao 16, Teste T7).
+
+Findings estruturalmente validos ainda podem ser EXCLUIDOS da agregacao
+mais adiante (Secao 11 do pacote de correcao v0.2): `inconclusive=True`,
+confianca abaixo do minimo configurado na RuleVersion, ou
+`alternative_cause` pendente nunca promovem/rebaixam CompetencyState nem
+disparam revisao de memoria - ver `evidence.service.recompute_state`.
 """
 
 from __future__ import annotations
@@ -90,6 +97,14 @@ def validate_finding(candidate: dict, valid_competency_ids: set[str]) -> Evaluat
     if classification == EvidenceType.INCONCLUSIVE and not inconclusive:
         # coerencia interna: uma classificacao inconclusive deve marcar o flag
         inconclusive = True
+    if inconclusive and classification != EvidenceType.INCONCLUSIVE:
+        # Secao 11 do pacote de correcao v0.2: inconclusive=True SO pode
+        # coexistir com classification='inconclusive'. Qualquer outra
+        # combinacao e rejeitada aqui, na fronteira - o mesmo invariante e
+        # reforcado por CHECK constraint no banco (defesa em profundidade).
+        raise InvalidEvaluatorOutput(
+            f"inconclusive=True exige classification='inconclusive', recebeu '{classification.value}'"
+        )
 
     return EvaluatorFinding(
         competency_id=competency_id,

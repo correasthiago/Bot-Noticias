@@ -1,4 +1,4 @@
-# Limitacoes conhecidas — Central Universal V0.1
+# Limitacoes conhecidas — Central Universal V0.2
 
 Honestas e explicitas, conforme pedido no relatorio final (Secao 34). Nada
 aqui viola a constituicao pedagogica — sao lacunas de escopo/maturidade
@@ -7,12 +7,28 @@ da V0, nao de principio.
 ## Pedagogicas
 
 - **Thresholds de agregacao sao um ponto de partida, nao uma
-  calibracao.** `classify_dimension` usa 2/3 clusters independentes
-  (ou dias distintos, para retencao) como limiares de
-  `demonstrated`/`consolidated`. Sao numeros simples e auditaveis, nao
-  uma calibracao com dados reais de aprendizado — a especificacao pede
-  exatamente isso (nao inventar pesos sem dados). A V0 deve gerar os
-  dados que permitirao revisar esses numeros.
+  calibracao.** `AggregationConfig` (lida de `RuleVersion.config_json`)
+  usa 2/3 clusters independentes (ou dias distintos, para retencao) como
+  limiares de `demonstrated`/`consolidated`. Sao numeros simples e
+  auditaveis, nao uma calibracao com dados reais de aprendizado — a
+  especificacao pede exatamente isso (nao inventar pesos sem dados). A
+  V0 deve gerar os dados que permitirao revisar esses numeros. Desde
+  v0.2, pelo menos esses numeros sao configuraveis por RuleVersion, nao
+  mais hardcoded - revisa-los agora e criar uma nova RuleVersion, nao
+  editar codigo.
+- **Regressao nunca e confirmada automaticamente (v0.2).** O pacote de
+  correcao removeu de proposito o rebaixamento automatico de estado por
+  "corroboracao" de evidencia negativa - era, na pratica, so um
+  rebaixamento automatico com um limiar mais alto, e o Red Team apontou
+  isso corretamente. `possible_regression=True` agora e um sinal
+  PERMANENTE ate que uma "validacao deliberada" resolva a duvida - mas a
+  V0 nao implementa NENHUM mecanismo automatico dessa validacao (isso e
+  Fase futura: o Decisor ja roteia para `TARGETED_REGRESSION_CHECK`, mas
+  nada hoje fecha esse ciclo automaticamente reavaliando e confirmando ou
+  descartando a suspeita). Na pratica, uma competencia com
+  `possible_regression=True` fica assim indefinidamente ate uma
+  intervencao futura - correto pelo Principio 12, mas uma limitacao real
+  de completude do ciclo.
 - **Uma unica dimensao "escolhida" por interacao no MockProvider.**
   O `MockProvider` avalia sempre a dimensao `accuracy` para toda
   competencia candidata, porque ele nao faz NLU real. Um avaliador real
@@ -29,6 +45,19 @@ da V0, nao de principio.
 
 ## Tecnicas
 
+- **Cluster de evidencia e escopado a UMA sessao, sem janela de tempo
+  explicita (v0.2).** `evidence_cluster` agrupa por
+  `(session_id, activity_type, prompt normalizado)`. Isso impede a
+  maioria dos casos de "fingir independencia" (ver DECISIONS.md #6-7),
+  mas uma sessao anormalmente longa (varias horas) com o mesmo prompt
+  repetido no inicio e no fim continuaria contando como um cluster so -
+  o que e conservador (subestima independencia), nao permissivo.
+- **Idempotencia de avaliacao nao foi testada sob concorrencia real.**
+  `try_claim_evaluation` usa um `UPDATE ... WHERE evaluation_status =
+  'pending'` atomico, que deveria ser seguro sob o lock `BEGIN IMMEDIATE`
+  do SQLite mesmo com multiplas conexoes tentando completar a mesma
+  avaliacao ao mesmo tempo - mas isso nunca foi exercitado com threads ou
+  processos reais, so logicamente.
 - **Concorrencia real nao foi testada.** SQLite em WAL suporta um
   escritor por vez; para um unico usuario local isso nunca e um
   problema, mas o codigo nao foi testado sob multiplos processos
@@ -43,6 +72,11 @@ da V0, nao de principio.
 - **Sem paginacao nas telas de auditoria/mapa.** Para uma unica pessoa
   com um grafo de ~17 competencias de ingles isso e irrelevante; escala
   mal se o grafo crescer para milhares de nos sem paginacao.
+- **Backup automatico e baseado em intervalo simples, nao em
+  criticidade.** `maybe_run_automatic_backup` dispara no fim de cada
+  sessao, no maximo uma vez por hora. Nao ha politica de "backup antes de
+  uma operacao arriscada" (ex.: antes de uma reconstrucao completa de
+  geracao) - so o gatilho de fim de sessao.
 - **Pin de dependencias `fastapi`/`starlette`** por um bug encontrado na
   combinacao mais recente no momento da implementacao (ver DECISIONS.md
   #7). Precisa ser revisitado quando houver uma versao corrigida.
@@ -62,7 +96,8 @@ parcialmente.
    formato de payload que `MockProvider` ja retorna hoje
    (`{"utterance": ..., "activity_prompt": ...}` para o tutor;
    `{"findings": [...]}` no formato de `evaluator.contract` para o
-   avaliador).
+   avaliador, respeitando a regra `inconclusive=True <=>
+   classification='inconclusive'`).
 2. Apontar `central_universal.web.deps.ACTIVE_PROVIDER` para a nova
    classe (uma linha, configuracao explicita — Principio 17).
 3. Desenhar os prompts do tutor e do avaliador — hoje isso nao existe
@@ -73,6 +108,9 @@ parcialmente.
 5. Revisar `validate_evaluator_payload` para garantir que ela cobre
    variacoes reais de saida do LLM escolhido (hoje ela ja e fail-closed:
    qualquer campo fora do formato esperado rejeita o payload inteiro).
+6. Calibrar `AggregationConfig` (thresholds, confianca minima) com dados
+   reais, publicando uma nova `RuleVersion` - nunca editando os defaults
+   em codigo.
 
 ## O que falta para voz
 
@@ -96,15 +134,25 @@ parcialmente.
   `dict`. Resolvido com pin explicito (DECISIONS.md #7), mas e um
   lembrete de que "instalar a mais recente" nao e seguro sem teste de
   fumaca.
-- **Ambiguidade real entre "EvidenceEvent" e "EvidenceAssessment".** A
-  especificacao original nao deixa 100% claro qual das duas entidades
-  carrega o julgamento fino do avaliador; a decisao tomada (DECISIONS.md
-  #1) e razoavel mas nao e a unica interpretacao possivel — se a
-  intencao original era outra, revisar antes de calibrar qualquer coisa
-  em cima disso.
 - **Custo de manter triggers de imutabilidade em SQLite.** Funcionam bem
   na V0, mas se o sistema precisar migrar dados historicos no futuro
   (ex.: uma correcao retroativa de bug de gravacao), os triggers vao
   bloquear ate UPDATE administrativo direto — sera necessario um
   procedimento explicito de manutencao (desabilitar trigger, corrigir,
-  reabilitar), nao uma operacao trivial.
+  reabilitar), nao uma operacao trivial. Desde v0.2 isso se aplica a
+  MAIS tabelas (`rule_version`, `competency_state`, `decision_event`,
+  `provider_event`, `memory_review_log`, `backup_event`) - o custo de
+  manutencao cresceu junto com a garantia de integridade.
+- **Migration 0002 faz varios `DROP TABLE`/`CREATE TABLE` para adicionar
+  FKs e CHECKs que o SQLite nao permite adicionar via `ALTER TABLE`.**
+  Isso e seguro para o volume de dados de uma V0 pre-lancamento (a
+  migration inclusive faz backfill honesto de `evidence_cluster` a
+  partir de dados legados, se existirem), mas um banco de producao muito
+  grande levaria mais tempo para migrar do que uma `ALTER TABLE` simples
+  levaria. Nao e um problema na escala desta V0.
+- **Ambiguidade original entre "EvidenceEvent" e "EvidenceAssessment" -
+  RESOLVIDA no pacote de correcao v0.2.** A V0.1 tinha uma coluna
+  `evidence_type` duplicada em `EvidenceEvent`; o pacote de correcao a
+  removeu e formalizou a separacao (fatos vs. julgamento) descrita em
+  DECISIONS.md #4. Mantido aqui como registro historico do risco que foi
+  endereçado.

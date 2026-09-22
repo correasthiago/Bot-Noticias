@@ -17,7 +17,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-from central_universal.domain.clock import utc_now, utc_now_iso
+from central_universal.domain.clock import parse_iso, utc_now, utc_now_iso
 from central_universal.domain.entities import BackupEvent
 from central_universal.domain.ids import new_id
 from central_universal.persistence.repositories import Repositories
@@ -29,6 +29,12 @@ DEFAULT_BACKUP_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "b
 # reais ainda - e um numero pequeno e razoavel para uso local de uma
 # pessoa so.
 RETENTION_KEEP = 14
+
+# Politica de backup automatico simples (Secao 14 do pacote de correcao
+# v0.2): no maximo um backup automatico por este intervalo, disparado em
+# pontos de transicao naturais da aplicacao (hoje: fim de sessao). Nao e
+# um agendador/cron - e deliberadamente simples para a V0.
+AUTOMATIC_BACKUP_MIN_INTERVAL_HOURS = 1.0
 
 
 def create_backup(
@@ -88,3 +94,24 @@ def _apply_retention(backup_dir: Path, keep: int) -> None:
 
 def list_backups(repos: Repositories, limit: int = 20) -> list[BackupEvent]:
     return repos.backup_events.list_recent(limit)
+
+
+def maybe_run_automatic_backup(
+    conn: sqlite3.Connection,
+    repos: Repositories,
+    backup_dir: Path = DEFAULT_BACKUP_DIR,
+    retention_keep: int = RETENTION_KEEP,
+    min_interval_hours: float = AUTOMATIC_BACKUP_MIN_INTERVAL_HOURS,
+) -> BackupEvent | None:
+    """Dispara um backup automatico se o ultimo (de qualquer resultado) foi
+    ha mais de `min_interval_hours`, ou se nunca houve nenhum. Devolve
+    None quando nao havia necessidade de rodar agora - isso NAO e uma
+    falha, e a politica funcionando como esperado."""
+
+    recent = repos.backup_events.list_recent(1)
+    if recent:
+        elapsed_hours = (utc_now() - parse_iso(recent[0].started_at)).total_seconds() / 3600.0
+        if elapsed_hours < min_interval_hours:
+            return None
+
+    return create_backup(conn, repos, backup_dir=backup_dir, retention_keep=retention_keep)
