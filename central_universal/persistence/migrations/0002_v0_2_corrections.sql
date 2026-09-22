@@ -29,8 +29,16 @@
 -- Onde ha dado legado a preservar (bancos de teste/dev ja existentes),
 -- fazemos um backfill honesto; nao existe usuario real cujo historico
 -- pudesse ser perdido nesta transicao.
+--
+-- v0.2.1 (pacote de correcao, ponto 4): esta migration inteira roda como
+-- UMA transacao atomica (BEGIN.../COMMIT explicitos abaixo) - uma falha
+-- em qualquer instrucao desfaz tudo, nunca deixa o banco parcialmente
+-- migrado (ver `persistence/migrations.py:_apply_migration_atomically`
+-- para por que o BEGIN/COMMIT precisa estar aqui dentro do arquivo, e nao
+-- so em Python). `PRAGMA foreign_keys` e ligado/desligado por fora, em
+-- Python - a pragma so tem efeito fora de uma transacao aberta.
 
-PRAGMA foreign_keys = OFF;
+BEGIN IMMEDIATE;
 
 -- =====================================================================
 -- 1) RuleVersion: config_json, algorithm_version, active_rule_version,
@@ -239,12 +247,25 @@ CREATE TABLE evidence_assessment_new (
     )
 ) STRICT;
 
+-- v0.2.1 (correcao do ponto 4): a versao anterior desta migration usava
+-- um WHERE para so copiar linhas ja consistentes com o novo CHECK,
+-- descartando SILENCIOSAMENTE qualquer avaliacao v0.1 cujo par
+-- classification/inconclusive nao batesse (o esquema antigo nao tinha
+-- essa restricao, entao dados legados legitimos podiam violar o CHECK
+-- novo). Agora TODA avaliacao e preservada, sem excecao: `inconclusive`
+-- e recalculado a partir de `classification` (a fonte de verdade) em vez
+-- de confiar no valor legado potencialmente divergente. O diagnostico de
+-- quantas linhas precisaram ser normalizadas fica registrado em
+-- `schema_migrations.notes` (ver `migrations.py:_diagnose_migration`).
 INSERT INTO evidence_assessment_new
-SELECT id, evidence_event_id, rule_version_id, classification, result, confidence,
-       justification, alternative_cause, inconclusive, evaluator_provider_event_id, created_at
-FROM evidence_assessment
-WHERE (classification = 'inconclusive' AND inconclusive = 1)
-   OR (classification <> 'inconclusive' AND inconclusive = 0);
+    (id, evidence_event_id, rule_version_id, classification, result, confidence,
+     justification, alternative_cause, inconclusive, evaluator_provider_event_id, created_at)
+SELECT
+    id, evidence_event_id, rule_version_id, classification, result, confidence,
+    justification, alternative_cause,
+    CASE WHEN classification = 'inconclusive' THEN 1 ELSE 0 END,
+    evaluator_provider_event_id, created_at
+FROM evidence_assessment;
 
 DROP TABLE evidence_assessment;
 ALTER TABLE evidence_assessment_new RENAME TO evidence_assessment;
@@ -428,4 +449,4 @@ END;
 -- mutaveis de proposito (sao ponteiros, nao fatos histricos) - ver
 -- DECISIONS.md.
 
-PRAGMA foreign_keys = ON;
+COMMIT;

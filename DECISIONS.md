@@ -381,3 +381,223 @@ mere_presence, contradicao, erro isolado nao apaga dominio, double-submit)
 permanecem cobertos - so nao duplicados neste arquivo, ja que vivem em
 `test_evidence_aggregation.py`, `test_evidence_service.py`,
 `test_memory_adapter.py` e `test_orchestration.py`.
+
+---
+
+## Pacote de correcao v0.2.1 (segunda auditoria pos-entrega)
+
+Uma segunda auditoria, sobre o commit que fechou o pacote de correcao
+v0.2, encontrou seis pontos onde a v0.2 ainda nao atendia ao criterio de
+aceite - mesmo com os 100 testes daquele pacote passando. Esta secao
+documenta a decisao para cada um. Como no pacote v0.2, todas sao mudancas
+"puramente implementacionais e reversiveis" - nenhuma altera pedagogia,
+arquitetura aprovada, governanca ou custos. A nova politica de
+rating/intervalo de recuperacao (itens #2 abaixo) esta registrada em
+`RuleVersion` via `evidence.rule_versions.build_v0_2_1_rule_version` -
+ver PEDAGOGICAL_CONSTITUTION.md (Principio 24) e DATA_MODEL.md.
+
+### #1. O primeiro card FSRS nasce pelo fluxo normal da aplicacao
+
+**Problema:** `is_planned_recall` so podia ficar `True` via
+`memory_recall_due`, que exigia um `MemoryState` JA existente - que so
+podia ser criado por `observe_and_review`, que exigia
+`is_planned_recall=True`. Um bootstrapping circular: nenhum card FSRS
+podia nascer pelo fluxo real da aplicacao, so por um teste que setava
+`is_planned_recall=True` diretamente.
+
+**Decisao dupla:**
+
+1. `SessionOrchestrator.start_activity` deixou de aceitar
+   `is_planned_recall` como parametro. Agora ele e SEMPRE derivado:
+   `is_planned_recall = action is not None and action.decision_type ==
+   DecisionType.SCHEDULE_RECALL` - nunca informado por um chamador.
+2. `MockProvider.generate_evaluation` deixou de avaliar sempre a dimensao
+   `accuracy`: agora usa `EvaluatorInput.target_dimension` (nova
+   propriedade, derivada de `activity.activity_type` via o mapa
+   `_DIMENSION_BY_ACTION` em `session_service.py`), que aponta para a
+   dimensao que cada acao da ladder pedagogica foi desenhada para
+   exercitar (MINIMAL_EXPLANATION -> comprehension, ..., SCHEDULE_RECALL
+   -> retention). Sem isso, nenhuma dimensao alem da primeira jamais
+   recebia evidencia, e o Decisor nunca conseguia progredir a ladder ate
+   SCHEDULE_RECALL mesmo com a correcao #1 sozinha.
+
+Testado em `test_orchestration.py::test_first_fsrs_card_is_born_through_normal_application_flow`,
+que parte de um banco novo (`repos.memory_states.get(...) is None`) e usa
+SOMENTE `start_session -> choose_focus_competency -> start_activity ->
+submit_interaction` (a fixture `drive_to_schedule_recall` em
+`conftest.py`) ate o Decisor escolher SCHEDULE_RECALL por conta propria -
+nenhum teste neste arquivo define `is_planned_recall=True` diretamente.
+
+### #2. Nota FSRS derivada da propria avaliacao de recuperacao, nunca do ProductionResult
+
+**Problema:** embora a v0.2 ja exigisse uma `EvidenceAssessment` valida
+para autorizar uma revisao, a NOTA (1-4) continuava vindo do mapeamento
+generico `ProductionResult -> Rating` (Decisao #5 original) - a mesma
+tabela usada para QUALQUER interacao, nao a avaliacao especifica daquela
+tentativa de recuperacao.
+
+**Decisao:** `rating_from_production_result` foi removido.
+`memory/fsrs_adapter.derive_recall_rating(assessment, config)` deriva a
+nota EXCLUSIVAMENTE de `EvidenceAssessment.classification`/`.confidence`
+da avaliacao de RETENTION da propria tentativa: `NEGATIVE` sempre vira
+`Again`; `POSITIVE` vira `Easy`/`Good`/`Hard` conforme dois novos
+limiares de confianca (`recall_rating_easy_min_confidence` = 0.85,
+`recall_rating_good_min_confidence` = 0.65). `evaluate_recall_eligibility`
+ganhou dois parametros (`evidence_dimension`, `config`) e perdeu
+`production_result`; agora exige, nesta ordem: atividade planejada ->
+avaliacao presente -> dimensao == `retention` -> relacao == `target` ->
+nao inconclusiva -> sem causa alternativa pendente -> confianca >=
+`recall_min_confidence` (0.5) -> intervalo desde a ultima revisao >=
+`recall_min_interval_seconds` (3600s = 1h). Os quatro limiares vivem em
+`AggregationConfig`, serializados em `RuleVersion.config_json` - nunca
+hardcoded no adapter.
+
+Testado em `test_memory_adapter.py` com casos explicitos para avaliacao
+negativa (`test_negative_evaluation_is_eligible_with_again_rating`),
+baixa confianca (`test_low_confidence_assessment_is_never_eligible`),
+evidencia incidental (`test_incidental_evidence_is_never_eligible`) e
+tentativas separadas por segundos
+(`test_attempts_seconds_apart_are_not_independent_observations`, com o
+caso simetrico `test_attempts_far_apart_are_independent_observations`).
+
+### #3. Reprocessamento usa exclusivamente a RawInteraction persistida; idempotency_key reutilizada com conteudo diferente e rejeitada
+
+**Decisao dupla:**
+
+1. `EvidenceService.record_interaction` ganhou `IdempotencyConflictError`:
+   se uma `idempotency_key` ja usada chega de novo com `activity_id`,
+   `session_id`, `learner_input`, `help_level` ou `production_result`
+   DIFERENTE do que foi persistido da primeira vez, a chamada e rejeitada
+   (nunca "resolvida" silenciosamente escolhendo uma das duas versoes).
+   `tutor_output` deliberadamente NAO entra nessa checagem de conflito
+   (nao faz parte da identidade da submissao), mas tambem nunca
+   sobrescreve o que ja foi gravado - a linha existente e sempre devolvida
+   sem alteracao.
+2. `SessionOrchestrator.submit_interaction` monta o `EvaluatorInput`
+   exclusivamente a partir dos campos da `RawInteraction` PERSISTIDA
+   (`raw_interaction.learner_input`, `.tutor_output`, `.help_level`,
+   `.production_result`), nunca dos parametros frescos desta chamada. Numa
+   interacao nova isso e o mesmo conteudo (ja validado igual por
+   `record_interaction`); numa REPROCESSADA (apos queda do avaliador,
+   inclusive apos reinicio do processo), garante que o avaliador sempre ve
+   exatamente o que ficou gravado da primeira vez.
+
+Testado em `test_evidence_service.py`:
+`test_idempotency_key_reused_with_different_content_is_rejected`,
+`test_reprocessing_uses_persisted_raw_interaction_not_fresh_call_params`
+e, cobrindo explicitamente "apos reiniciar o processo",
+`test_idempotency_conflict_rejected_after_process_restart` (fecha a
+conexao, abre uma NOVA no mesmo arquivo, e confirma que a rejeicao
+sobrevive porque vem do banco, nunca de estado em memoria de um processo
+anterior).
+
+### #4. Migration 0002 atomica, sem perda silenciosa de avaliacoes v0.1
+
+**Problema duplo:** (a) `run_migrations` rodava cada migration via
+`conn.executescript()`, que no modulo `sqlite3` do Python emite um COMMIT
+implicito ANTES de rodar o script - uma falha no meio de uma migration de
+varios passos (como a 0002, que reconstroi varias tabelas) podia deixar o
+banco parcialmente migrado, sem rollback. (b) a reconstrucao de
+`evidence_assessment` usava um `WHERE` que so copiava linhas ja
+consistentes com o novo `CHECK` (`inconclusive` <=> `classification`) -
+uma avaliacao v0.1 legitima que violasse essa consistencia (o esquema
+antigo nao tinha esse `CHECK`) era DESCARTADA silenciosamente.
+
+**Decisao:**
+
+1. `migrations/0002_v0_2_corrections.sql` agora contem seu proprio
+   `BEGIN IMMEDIATE;`/`COMMIT;` explicito - a fronteira transacional real
+   precisa vir de DENTRO do texto do script (pelo motivo em (a) acima).
+   `persistence/migrations._apply_migration_atomically` liga/desliga
+   `PRAGMA foreign_keys` por FORA da transacao (so tem efeito la, nunca
+   dentro de uma aberta) e faz `ROLLBACK` explicito se o script falhar no
+   meio, antes de propagar `MigrationError` - nenhuma alteracao parcial
+   sobrevive.
+2. A reconstrucao de `evidence_assessment` deixou de filtrar por `WHERE`:
+   toda linha e copiada, com `inconclusive` RECALCULADO a partir de
+   `classification` (a fonte de verdade) via `CASE`, nunca confiando no
+   valor legado potencialmente divergente. Nenhuma avaliacao e descartada.
+3. `run_migrations` agora tira um backup automatico (Online Backup API,
+   reaproveitando `persistence.backup.create_backup`) ANTES de aplicar
+   qualquer migration pendente num banco que JA tinha migrations
+   aplicadas (upgrade de um banco existente - nunca um banco novo vazio).
+4. Um diagnostico auditavel (quantas linhas de `evidence_assessment`
+   precisaram ser normalizadas) e calculado ANTES da migration alterar
+   qualquer coisa e persistido em `schema_migrations.notes` (coluna nova,
+   adicionada sob demanda por `_ensure_migrations_table`).
+
+Testado em `tests/test_migrations.py`: atualizacao de um banco v0.1
+POPULADO, com avaliacoes cujo par classification/inconclusive so era
+permitido pelo esquema antigo
+(`test_migration_0002_preserves_all_v01_evaluations_including_incompatible_ones`),
+backup automatico previo
+(`test_migration_0002_takes_automatic_backup_before_upgrading_existing_database`),
+e rollback completo diante de uma falha sintetica no meio do script
+(`test_migration_atomic_rollback_on_mid_script_failure`).
+
+### #5. Restore em estado controlado: impede escritas, trata WAL, mostra falha ao usuario
+
+**Decisao:**
+
+1. Antes de copiar/trocar qualquer arquivo, `restore_from_backup` chama
+   `close_connections()` (callback do chamador) e tenta ficar EXCLUSIVO no
+   banco ativo via `_checkpoint_and_clear_wal`: `PRAGMA
+   wal_checkpoint(TRUNCATE)` + `PRAGMA journal_mode = DELETE` (o que
+   remove os arquivos `-wal`/`-shm`). O proprio SQLite recusa essa troca
+   de modo com `OperationalError: database is locked` se OUTRA conexao
+   ainda tiver o banco aberto - usamos exatamente esse comportamento
+   nativo como sinal de "ha uma conexao concorrente", em vez de
+   reimplementar um lock proprio: a restauracao e ABORTADA nesse caso,
+   sem tocar em nenhum arquivo. Um banco ativo corrompido/ilegivel
+   (`DatabaseError`, o proprio desastre que a restauracao existe para
+   corrigir) e tratado como "nada a proteger" e a restauracao prossegue.
+2. `_remove_wal_sidecars` roda de novo logo apos o `os.replace` (o arquivo
+   recem-trocado nunca deve herdar sidecars orfaos) e tambem apos
+   qualquer reversao (a copia de seguranca restaurada nunca fica ao lado
+   de sidecars de uma tentativa que falhou).
+3. `web/app.py`'s `/audit/restore` route agora captura o `RestoreResult` e
+   redireciona para `/audit?restore_status=...&restore_message=...`; a
+   pagina de auditoria mostra a mensagem (classe `ok`/`error`) - o
+   resultado nunca e descartado silenciosamente.
+
+Testado em `tests/test_restore.py`: WAL genuinamente ativo (
+`test_restore_flattens_active_wal_before_swapping`, com
+`PRAGMA wal_autocheckpoint = 0` para garantir que o WAL nao se achate
+sozinho antes do teste), conexao concorrente bloqueando a restauracao
+(`test_restore_aborts_cleanly_with_concurrent_connection_open`) e reversao
+com WAL ativo (`test_restore_reverts_cleanly_when_swap_target_had_active_wal`).
+`tests/test_web.py::test_restore_failure_is_shown_to_the_user` cobre a
+superficie HTTP.
+
+### #6. Cluster de evidencia nunca usa o texto do prompt
+
+**Problema:** mesmo com clustering server-side (item #6-7 da v0.2), a
+assinatura do cluster incluia o prompt normalizado. Um Red Team encontrou
+que prompts com texto DIFERENTE mas pedagogicamente PREVISIVEL (mesmo
+exercicio de lacuna, so trocando sujeito/verbo - "She ___ (go) to
+school." vs. "He ___ (work) at a bank.") gerava clusters diferentes,
+permitindo "provar independencia" so variando palavras superficiais de um
+template repetido.
+
+**Decisao:** `compute_context_signature` deixou de incluir o texto do
+prompt; a assinatura agora e `(activity_type, competency_targets
+ordenados)`, com o cluster continuando escopado a uma `session_id`
+(inalterado). Detectar predictibilidade textual de forma robusta exigiria
+NLP, fora do escopo da V0; a alternativa auditavel e conservadora e usar o
+que realmente define "a mesma tarefa" neste sistema - mesma sessao +
+mesma acao pedagogica + mesma(s) competencia(s) alvo - deliberadamente
+MENOS permissivo com "independencia" do que comparar texto. Isso e MAIS
+rigoroso que antes: repetir a mesma acao pedagogica na mesma sessao para a
+mesma competencia agora sempre colapsa num cluster so, MESMO que os
+prompts sejam visivelmente distintos.
+
+*Efeito colateral documentado:* varios testes que geravam "evidencia
+independente" via prompts diferentes na MESMA sessao precisaram passar a
+usar sessoes DIFERENTES para continuar genuinamente independentes (ver
+`_new_session`/sessoes por iteracao em `test_evidence_service.py` e
+`test_redteam.py`).
+
+Testado em `test_clustering.py::test_predictable_template_variation_does_not_prove_independence`
+(tres prompts textualmente distintos, mesma competencia/sessao/tipo,
+`len(cluster_ids) == 1`) e em
+`test_redteam.py::test_P4_different_activity_ids_same_context_collapse_into_one_cluster`.

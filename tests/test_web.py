@@ -83,3 +83,25 @@ def test_map_and_audit_pages_render(tmp_path, monkeypatch):
 
         backup_resp = client.post("/audit/backup", follow_redirects=False)
         assert backup_resp.status_code == 303
+
+
+def test_restore_failure_is_shown_to_the_user(tmp_path, monkeypatch):
+    """Ponto 5 do pacote de correcao v0.2.1: 'mostre falha ao usuario
+    quando o restore falhar' - a pagina de auditoria precisa exibir o
+    motivo, nunca so redirecionar silenciosamente."""
+
+    with _fresh_client(tmp_path, monkeypatch) as client:
+        client.get("/audit")  # garante que o app ja fez bootstrap do banco
+
+        restore_resp = client.post(
+            "/audit/restore",
+            data={"backup_path": str(tmp_path / "nao-existe.db")},
+            follow_redirects=False,
+        )
+        assert restore_resp.status_code == 303
+        assert "restore_status=error" in restore_resp.headers["location"]
+
+        audit_page = client.get(restore_resp.headers["location"])
+        assert audit_page.status_code == 200
+        assert "Restauracao" in audit_page.text
+        assert 'class="error"' in audit_page.text

@@ -16,7 +16,9 @@ from central_universal.evaluator.contract import (
     InvalidEvaluatorOutput,
     validate_evaluator_payload,
 )
-from central_universal.evidence.service import EvidenceService, recompute_all_from_log
+from central_universal.evidence.service import EvidenceService, IdempotencyConflictError, recompute_all_from_log
+from central_universal.persistence.db import connect
+from central_universal.persistence.migrations import run_migrations
 from central_universal.persistence.repositories import Repositories
 
 
@@ -68,13 +70,22 @@ def _valid_payload(competency_id: str, dimension: str = "accuracy", relation: st
     }
 
 
-def _new_activity(repos: Repositories, session_id: str, prompt: str = "drill") -> Activity:
+def _new_activity(repos: Repositories, session_id: str, competency_targets: list[str], prompt: str = "drill") -> Activity:
     activity = Activity(
-        id=new_id(), session_id=session_id, competency_targets=[], activity_type="drill",
+        id=new_id(), session_id=session_id, competency_targets=competency_targets, activity_type="drill",
         prompt=prompt, support_level=HelpLevel.A0, created_at=utc_now_iso(),
     )
     repos.activities.insert(activity)
     return activity
+
+
+def _new_session(repos: Repositories, learner_id: str) -> LearningSession:
+    from central_universal.domain.entities import LearningSession as _LS
+    from central_universal.domain.enums import SessionStatus as _SS
+
+    session = _LS(id=new_id(), learner_id=learner_id, started_at=utc_now_iso(), status=_SS.ACTIVE)
+    repos.sessions.insert(session)
+    return session
 
 
 def test_double_submit_does_not_duplicate_evidence(repos: Repositories):
@@ -96,6 +107,109 @@ def test_double_submit_does_not_duplicate_evidence(repos: Repositories):
     assert created2 is False
     assert interaction1.id == interaction2.id
     assert len(repos.raw_interactions.list_all()) == 1
+
+
+def test_idempotency_key_reused_with_different_content_is_rejected(repos: Repositories):
+    """Ponto 3 da correcao v0.2.1: uma `idempotency_key` reaproveitada com
+    atividade/sessao/conteudo diferente e SEMPRE rejeitada - nunca aceita
+    silenciosamente escolhendo uma das duas versoes."""
+
+    session, activity, competency, rule_version = _bootstrap(repos)
+    service = EvidenceService(repos)
+    key = new_id()
+
+    service.record_interaction(
+        activity=activity, session_id=session.id, idempotency_key=key,
+        learner_input="She goes to school", tutor_output="", help_level=HelpLevel.A0,
+        production_result=ProductionResult.SPONTANEOUS_CORRECT,
+    )
+
+    with pytest.raises(IdempotencyConflictError):
+        service.record_interaction(
+            activity=activity, session_id=session.id, idempotency_key=key,
+            learner_input="She go to school (conteudo diferente)", tutor_output="", help_level=HelpLevel.A0,
+            production_result=ProductionResult.SPONTANEOUS_CORRECT,
+        )
+
+    assert len(repos.raw_interactions.list_all()) == 1  # nada novo foi gravado
+
+
+def test_idempotency_conflict_rejected_after_process_restart(tmp_path):
+    """Ponto 3 da correcao v0.2.1, ultima frase explicita: 'Teste o caso
+    apos reiniciar o processo.' Fecha a conexao, abre uma conexao NOVA no
+    MESMO arquivo (simulando um processo novo do zero, sem nenhum estado
+    em memoria do processo anterior) e reprocessa a MESMA idempotency_key
+    com conteudo diferente - a rejeicao precisa sobreviver ao reinicio
+    porque vem do que esta persistido no banco, nunca de cache em
+    memoria."""
+
+    db_path = tmp_path / "central.db"
+    conn1 = connect(db_path)
+    run_migrations(conn1)
+    repos1 = Repositories(conn1)
+    session, activity, competency, rule_version = _bootstrap(repos1)
+    service1 = EvidenceService(repos1)
+    key = new_id()
+
+    service1.record_interaction(
+        activity=activity, session_id=session.id, idempotency_key=key,
+        learner_input="She goes to school", tutor_output="", help_level=HelpLevel.A0,
+        production_result=ProductionResult.SPONTANEOUS_CORRECT,
+    )
+    conn1.close()  # fim do "processo"
+
+    # "reinicio": processo novo, conexao nova, sem nenhum estado em memoria
+    conn2 = connect(db_path)
+    run_migrations(conn2)  # idempotente - nao recria nada
+    repos2 = Repositories(conn2)
+    service2 = EvidenceService(repos2)
+
+    with pytest.raises(IdempotencyConflictError):
+        service2.record_interaction(
+            activity=activity, session_id=session.id, idempotency_key=key,
+            learner_input="She go to school (conteudo diferente)", tutor_output="", help_level=HelpLevel.A0,
+            production_result=ProductionResult.SPONTANEOUS_CORRECT,
+        )
+
+    # a mesma key, com o MESMO conteudo original, continua idempotente
+    # apos o reinicio - devolve a interacao existente, nunca duplica.
+    same_content, created = service2.record_interaction(
+        activity=activity, session_id=session.id, idempotency_key=key,
+        learner_input="She goes to school", tutor_output="", help_level=HelpLevel.A0,
+        production_result=ProductionResult.SPONTANEOUS_CORRECT,
+    )
+    assert created is False
+    assert len(repos2.raw_interactions.list_all()) == 1
+    conn2.close()
+
+
+def test_reprocessing_uses_persisted_raw_interaction_not_fresh_call_params(repos: Repositories):
+    """Ponto 3 da correcao v0.2.1: ao reprocessar, o conteudo relevante
+    (activity/session/learner_input/help_level/production_result) vem
+    EXCLUSIVAMENTE da RawInteraction persistida - um `tutor_output`
+    diferente enviado numa tentativa posterior (mesma idempotency_key)
+    nao e tratado como conflito, mas tambem nunca sobrescreve o que ja
+    foi gravado da primeira vez."""
+
+    session, activity, competency, rule_version = _bootstrap(repos)
+    service = EvidenceService(repos)
+    key = new_id()
+
+    first, created_first = service.record_interaction(
+        activity=activity, session_id=session.id, idempotency_key=key,
+        learner_input="She goes to school", tutor_output="[MockTutor] versao original",
+        help_level=HelpLevel.A0, production_result=ProductionResult.SPONTANEOUS_CORRECT,
+    )
+    assert created_first is True
+
+    second, created_second = service.record_interaction(
+        activity=activity, session_id=session.id, idempotency_key=key,
+        learner_input="She goes to school", tutor_output="[MockTutor] versao DIFERENTE nesta tentativa",
+        help_level=HelpLevel.A0, production_result=ProductionResult.SPONTANEOUS_CORRECT,
+    )
+    assert created_second is False
+    assert second.id == first.id
+    assert second.tutor_output == "[MockTutor] versao original"  # persistido, nunca sobrescrito
 
 
 def test_mere_presence_does_not_alter_state(repos: Repositories):
@@ -130,9 +244,13 @@ def test_full_reconstruction_matches_incremental_state(repos: Repositories):
     service = EvidenceService(repos)
 
     for i in range(3):
-        drill_activity = _new_activity(repos, session.id, prompt=f"drill #{i}")
+        # Independencia legitima: sessoes DIFERENTES (nao so prompts
+        # diferentes na mesma sessao - isso deixou de contar como
+        # independente, ver evidence/clustering.py).
+        drill_session = _new_session(repos, session.learner_id)
+        drill_activity = _new_activity(repos, drill_session.id, [competency.id], prompt=f"drill #{i}")
         interaction, _ = service.record_interaction(
-            activity=drill_activity, session_id=session.id, idempotency_key=new_id(),
+            activity=drill_activity, session_id=drill_session.id, idempotency_key=new_id(),
             learner_input=f"She goes #{i}", tutor_output="", help_level=HelpLevel.A0,
             production_result=ProductionResult.SPONTANEOUS_CORRECT,
         )

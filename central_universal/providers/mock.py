@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import time
 
-from central_universal.domain.enums import EvidenceType, ProductionResult
+from central_universal.domain.enums import Dimension, EvidenceType, ProductionResult
 from central_universal.evaluator.contract import EvaluatorInput
 from central_universal.providers.base import Provider, ProviderCallResult
 from central_universal.tutor.contract import TutorInput
@@ -64,11 +64,18 @@ class MockProvider(Provider):
         classification = _CLASSIFICATION_BY_RESULT[evaluator_input.production_result]
         confidence = _CONFIDENCE_BY_RESULT[evaluator_input.production_result]
         relation = "target"
+        # Avalia a dimensao que a atividade foi desenhada para exercitar
+        # (Secao 1 do pacote de correcao v0.2.1) - nao mais sempre
+        # "accuracy": sem isso, uma atividade de GUIDED_RETRIEVAL nunca
+        # produziria evidencia de retrieval, e o Decisor nunca conseguiria
+        # progredir a ladder ate SCHEDULE_RECALL (o primeiro card FSRS
+        # nunca nasceria pelo fluxo normal).
+        dimension = evaluator_input.target_dimension or Dimension.ACCURACY
 
         findings = [
             {
                 "competency_id": competency_id,
-                "dimension": "accuracy",
+                "dimension": dimension.value,
                 "classification": classification.value,
                 "result": evaluator_input.production_result.value,
                 "confidence": confidence,

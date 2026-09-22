@@ -16,19 +16,20 @@ def _session(repos: Repositories) -> LearningSession:
     return session
 
 
-def _activity(repos: Repositories, session_id: str, activity_type: str, prompt: str) -> Activity:
+def _activity(repos: Repositories, session_id: str, activity_type: str, prompt: str, competency_targets: list[str]) -> Activity:
     activity = Activity(
-        id=new_id(), session_id=session_id, competency_targets=[], activity_type=activity_type,
+        id=new_id(), session_id=session_id, competency_targets=competency_targets, activity_type=activity_type,
         prompt=prompt, support_level=HelpLevel.A0, created_at=utc_now_iso(),
     )
     repos.activities.insert(activity)
     return activity
 
 
-def test_same_session_same_prompt_share_one_cluster(repos: Repositories):
+def test_same_session_same_prompt_share_one_cluster(repos: Repositories, make_competency):
+    competency_id = make_competency()
     session = _session(repos)
-    a1 = _activity(repos, session.id, "drill", "  She  ___ (go) to school.  ")
-    a2 = _activity(repos, session.id, "drill", "She ___ (go) to school.")  # mesmo prompt, espacamento diferente
+    a1 = _activity(repos, session.id, "drill", "  She  ___ (go) to school.  ", [competency_id])
+    a2 = _activity(repos, session.id, "drill", "She ___ (go) to school.", [competency_id])
 
     c1 = resolve_cluster(repos, session_id=session.id, activity=a1)
     c2 = resolve_cluster(repos, session_id=session.id, activity=a2)
@@ -36,22 +37,62 @@ def test_same_session_same_prompt_share_one_cluster(repos: Repositories):
     assert c1.id == c2.id  # atividades distintas, mesmo contexto -> mesmo cluster
 
 
-def test_different_prompt_same_session_different_cluster(repos: Repositories):
+def test_predictable_template_variation_does_not_prove_independence(repos: Repositories, make_competency):
+    """Secao 6 (auditoria pos-correcao v0.2): prompts com texto DIFERENTE
+    mas pedagogicamente previsivel (mesmo tipo de exercicio, mesma
+    competencia, so trocando sujeito/verbo) NAO podem contar como
+    tentativas independentes so por terem textos distintos."""
+
+    competency_id = make_competency()
     session = _session(repos)
-    a1 = _activity(repos, session.id, "drill", "She ___ (go) to school.")
-    a2 = _activity(repos, session.id, "drill", "They ___ (have) a car.")
+    prompts = [
+        "Complete: She ___ (go) to school.",
+        "Complete: He ___ (work) at a bank.",
+        "Complete: They ___ (study) every day.",
+    ]
+    clusters = [
+        resolve_cluster(
+            repos, session_id=session.id,
+            activity=_activity(repos, session.id, "contrastive_practice", prompt, [competency_id]),
+        )
+        for prompt in prompts
+    ]
+
+    cluster_ids = {c.id for c in clusters}
+    assert len(cluster_ids) == 1  # mesma acao pedagogica + mesma competencia = mesmo cluster
+
+
+def test_different_competency_same_session_and_activity_type_different_cluster(repos: Repositories, make_competency):
+    competency_a = make_competency("a")
+    competency_b = make_competency("b")
+    session = _session(repos)
+    a1 = _activity(repos, session.id, "drill", "She ___ (go) to school.", [competency_a])
+    a2 = _activity(repos, session.id, "drill", "They ___ (have) a car.", [competency_b])
 
     c1 = resolve_cluster(repos, session_id=session.id, activity=a1)
     c2 = resolve_cluster(repos, session_id=session.id, activity=a2)
 
-    assert c1.id != c2.id
+    assert c1.id != c2.id  # competencias diferentes: exercicios genuinamente distintos
 
 
-def test_same_prompt_different_session_different_cluster(repos: Repositories):
+def test_different_activity_type_same_competency_different_cluster(repos: Repositories, make_competency):
+    competency_id = make_competency()
+    session = _session(repos)
+    a1 = _activity(repos, session.id, "guided_retrieval", "She ___ (go) to school.", [competency_id])
+    a2 = _activity(repos, session.id, "contrastive_practice", "She ___ (go) to school.", [competency_id])
+
+    c1 = resolve_cluster(repos, session_id=session.id, activity=a1)
+    c2 = resolve_cluster(repos, session_id=session.id, activity=a2)
+
+    assert c1.id != c2.id  # acoes pedagogicas diferentes (dimensoes diferentes) nao colidem
+
+
+def test_same_prompt_different_session_different_cluster(repos: Repositories, make_competency):
+    competency_id = make_competency()
     session1 = _session(repos)
     session2 = _session(repos)
-    a1 = _activity(repos, session1.id, "drill", "She ___ (go) to school.")
-    a2 = _activity(repos, session2.id, "drill", "She ___ (go) to school.")
+    a1 = _activity(repos, session1.id, "drill", "She ___ (go) to school.", [competency_id])
+    a2 = _activity(repos, session2.id, "drill", "She ___ (go) to school.", [competency_id])
 
     c1 = resolve_cluster(repos, session_id=session1.id, activity=a1)
     c2 = resolve_cluster(repos, session_id=session2.id, activity=a2)

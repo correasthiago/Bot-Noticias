@@ -5,16 +5,27 @@ arquivo conhece `fsrs.Card`, `fsrs.Scheduler`, `fsrs.Rating`, `fsrs.State`
 e `fsrs.ReviewLog`.
 
 v0.2 (pacote de correcao pos Red Team): o `ProductionResult` de uma
-interacao NUNCA mais dispara uma revisao FSRS sozinho. O UNICO gatilho
+interacao NUNCA dispara uma revisao FSRS sozinho. O UNICO gatilho
 legitimo e um `MemoryObservation` explicito (Secao 1 do pacote de
 correcao), emitido somente quando `evaluate_recall_eligibility` confirma
 que:
 
-- a atividade foi PLANEJADA como recuperacao (`Activity.is_planned_recall`);
-- ocorreu apos um intervalo relevante desde a ultima revisao (nao e um
-  repique no mesmo instante);
-- recebeu uma avaliacao VALIDA e CONCLUSIVA (nem inconclusive, nem com
-  causa alternativa pendente, nem `mere_presence`).
+- a atividade foi PLANEJADA como recuperacao (`Activity.is_planned_recall`,
+  derivado pelo orquestrador quando o Decisor escolhe SCHEDULE_RECALL -
+  nunca setado diretamente por um chamador);
+- existe uma EvidenceAssessment para a dimensao RETENTION, com relacao
+  `target` (nunca incidental nem mere_presence);
+- essa avaliacao e valida e conclusiva (nao inconclusive, sem
+  alternative_cause pendente) e tem confianca >= `recall_min_confidence`;
+- o intervalo desde a ultima revisao e >= `recall_min_interval_seconds`
+  (ambos configuraveis via `RuleVersion.config_json` - Secao 2 do pacote
+  de correcao v0.2.1).
+
+v0.2.1 (auditoria pos-correcao): a NOTA FSRS (1-4) deixou de vir de
+`ProductionResult` (removido - `rating_from_production_result` nao
+existe mais). Ela e derivada EXCLUSIVAMENTE de
+`EvidenceAssessment.classification`/`confidence` da propria avaliacao de
+recuperacao, via `derive_recall_rating`.
 
 `memory_state` (o "card atual") e `memory_review_log` (o historico) sao
 escritos numa UNICA transacao junto com o proprio `MemoryObservation`:
@@ -37,8 +48,9 @@ from central_universal.domain.entities import (
     MemoryReviewLog,
     MemoryState,
 )
-from central_universal.domain.enums import EvidenceRelation, MemoryCardState, ProductionResult
+from central_universal.domain.enums import Dimension, EvidenceRelation, MemoryCardState
 from central_universal.domain.ids import new_id
+from central_universal.evidence.aggregation import AggregationConfig
 from central_universal.persistence.db import transaction
 from central_universal.persistence.repositories import Repositories
 
@@ -48,23 +60,30 @@ _STATE_MAP = {
     fsrs.State.Relearning: MemoryCardState.RELEARNING,
 }
 
-# Mapeamento provisorio e documentado (DECISIONS.md) de resultado de
-# producao para a nota de 1-4 que o FSRS espera - usado SO depois que a
-# elegibilidade ja foi confirmada, nunca como gatilho por si so.
-_RATING_MAP = {
-    ProductionResult.SPONTANEOUS_CORRECT: fsrs.Rating.Easy,
-    ProductionResult.SPONTANEOUS_SELF_CORRECTION: fsrs.Rating.Good,
-    ProductionResult.CORRECT_AFTER_HINT: fsrs.Rating.Hard,
-    ProductionResult.CORRECT_AFTER_EXTERNAL_CORRECTION: fsrs.Rating.Again,
-    ProductionResult.INCORRECT: fsrs.Rating.Again,
-    # INCONCLUSIVE nao aparece aqui de proposito: incerteza e um estado
-    # legitimo (Principio 14) e nao deve forcar uma nota de memoria.
-}
 
+def derive_recall_rating(assessment: EvidenceAssessment, config: AggregationConfig) -> int | None:
+    """Deriva a nota FSRS (1-4) EXCLUSIVAMENTE da avaliacao especifica de
+    recuperacao (classificacao + confianca) - nunca do `ProductionResult`
+    bruto da interacao (Secao 2 do pacote de correcao v0.2.1).
 
-def rating_from_production_result(result: ProductionResult) -> int | None:
-    rating = _RATING_MAP.get(result)
-    return int(rating) if rating is not None else None
+    Uma avaliacao NEGATIVE sempre vira "Again" (o FSRS precisa desse sinal
+    para modelar esquecimento). Uma avaliacao POSITIVE vira Easy/Good/Hard
+    conforme a confianca do avaliador, usando os limiares configurados na
+    RuleVersion. Contraditoria/inconclusiva nunca chegam aqui - ja sao
+    filtradas por `evaluate_recall_eligibility`.
+    """
+
+    from central_universal.domain.enums import EvidenceType
+
+    if assessment.classification == EvidenceType.NEGATIVE:
+        return int(fsrs.Rating.Again)
+    if assessment.classification == EvidenceType.POSITIVE:
+        if assessment.confidence >= config.recall_rating_easy_min_confidence:
+            return int(fsrs.Rating.Easy)
+        if assessment.confidence >= config.recall_rating_good_min_confidence:
+            return int(fsrs.Rating.Good)
+        return int(fsrs.Rating.Hard)
+    return None
 
 
 @dataclass(frozen=True)
@@ -88,28 +107,42 @@ def evaluate_recall_eligibility(
     *,
     activity: Activity,
     evidence_relation: EvidenceRelation | None,
+    evidence_dimension: Dimension | None,
     assessment: EvidenceAssessment | None,
-    production_result: ProductionResult,
     memory_state: MemoryState | None,
+    config: AggregationConfig | None = None,
     now: datetime | None = None,
 ) -> MemoryObservationEligibility:
     """Decide se esta interacao pode gerar um MemoryObservation.
 
-    Cobre explicitamente a Secao 2 do pacote de correcao v0.2: nao revisa
-    quando o avaliador falhou (assessment is None), o payload foi
-    invalido (idem), a classificacao e inconclusiva, a evidencia e
-    mere_presence, a atividade nao e uma recuperacao planejada, ou ha
-    causa alternativa nao resolvida.
+    Cobre explicitamente a Secao 2 do pacote de correcao v0.2/v0.2.1: nao
+    revisa quando o avaliador falhou (assessment is None), a evidencia nao
+    e da dimensao RETENTION, a relacao nao e `target` (evidencia
+    incidental/mere_presence NUNCA conta), a classificacao e inconclusiva,
+    a confianca e baixa demais, ha causa alternativa pendente, a atividade
+    nao e uma recuperacao planejada, ou o intervalo desde a ultima revisao
+    e menor que o minimo definido na regra.
     """
+
+    config = config or AggregationConfig()
 
     if not activity.is_planned_recall:
         return MemoryObservationEligibility(False, "atividade nao foi planejada como recuperacao agendada")
 
-    if evidence_relation == EvidenceRelation.MERE_PRESENCE:
-        return MemoryObservationEligibility(False, "evidencia e mere_presence, nao uma tentativa de recuperacao valida")
-
     if assessment is None:
         return MemoryObservationEligibility(False, "sem avaliacao valida associada (avaliador falhou ou payload invalido)")
+
+    if evidence_dimension != Dimension.RETENTION:
+        got = evidence_dimension.value if evidence_dimension else "nenhuma"
+        return MemoryObservationEligibility(
+            False, f"avaliacao e da dimensao '{got}', recuperacao exige uma avaliacao de 'retention'"
+        )
+
+    if evidence_relation != EvidenceRelation.TARGET:
+        got = evidence_relation.value if evidence_relation else "nenhuma"
+        return MemoryObservationEligibility(
+            False, f"relacao da evidencia e '{got}', recuperacao exige relacao 'target' (nunca incidental)"
+        )
 
     if assessment.inconclusive:
         return MemoryObservationEligibility(False, "avaliacao inconclusiva")
@@ -117,19 +150,29 @@ def evaluate_recall_eligibility(
     if assessment.alternative_cause:
         return MemoryObservationEligibility(False, "causa alternativa pendente nao resolvida")
 
-    rating = rating_from_production_result(production_result)
-    if rating is None:
-        return MemoryObservationEligibility(False, "producao inconclusiva nao produz nota de memoria")
+    if assessment.confidence < config.recall_min_confidence:
+        return MemoryObservationEligibility(
+            False,
+            f"confianca {assessment.confidence:.2f} abaixo do minimo exigido pela regra "
+            f"({config.recall_min_confidence:.2f})",
+        )
 
-    interval_days: float | None = None
+    rating = derive_recall_rating(assessment, config)
+    if rating is None:
+        return MemoryObservationEligibility(False, "classificacao da avaliacao nao produz uma nota de recuperacao valida")
+
+    interval_seconds: float | None = None
     if memory_state is not None and memory_state.last_review_at:
         reference = now or utc_now()
-        interval_days = (reference - parse_iso(memory_state.last_review_at)).total_seconds() / 86400.0
-        if interval_days <= 0:
+        interval_seconds = (reference - parse_iso(memory_state.last_review_at)).total_seconds()
+        if interval_seconds < config.recall_min_interval_seconds:
             return MemoryObservationEligibility(
-                False, "intervalo desde a ultima revisao nao e relevante (mesmo instante ou negativo)"
+                False,
+                f"intervalo de {interval_seconds:.1f}s desde a ultima revisao e menor que o minimo "
+                f"definido pela regra ({config.recall_min_interval_seconds:.1f}s)",
             )
 
+    interval_days = interval_seconds / 86400.0 if interval_seconds is not None else None
     return MemoryObservationEligibility(True, "elegivel", interval_days=interval_days, rating=rating)
 
 

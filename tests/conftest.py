@@ -65,6 +65,50 @@ def orchestrator_factory(repos: Repositories, tmp_path: Path):
 
 
 @pytest.fixture()
+def drive_to_schedule_recall():
+    """Avanca uma competencia ate a acao SCHEDULE_RECALL usando SOMENTE o
+    fluxo real do orquestrador (escolher foco -> comecar atividade ->
+    responder), a mesma sequencia de chamadas que a interface web usa -
+    nunca definindo `is_planned_recall` diretamente (Secao 1 do pacote de
+    correcao v0.2.1: o primeiro card FSRS precisa nascer pelo fluxo
+    normal). Cada interacao usa uma sessao NOVA porque, desde a correcao
+    de clustering (Secao 6), repetir a mesma acao pedagogica na MESMA
+    sessao para a MESMA competencia conta como um cluster so - precisa de
+    sessoes distintas para produzir evidencia genuinamente independente.
+
+    Devolve (session, activity, tutor_output) da atividade de
+    SCHEDULE_RECALL, ainda SEM resposta submetida - o teste decide o que
+    submeter."""
+
+    from central_universal.domain.enums import HelpLevel, ProductionResult
+    from central_universal.domain.ids import new_id as _new_id
+
+    def _drive(orchestrator, learner_id: str, competency_id: str):
+        for _ in range(30):
+            session = orchestrator.start_session(learner_id)
+            focus = orchestrator.choose_focus_competency(learner_id)
+            assert focus is not None, "competencia foi pulada (SKIP) antes de alcancar SCHEDULE_RECALL"
+            focus_competency_id, _routing, action, _recall_due = focus
+            assert focus_competency_id == competency_id
+
+            activity, tutor_output = orchestrator.start_activity(
+                session_id=session.id, competency_id=competency_id, action=action
+            )
+            if activity.is_planned_recall:
+                return session, activity, tutor_output
+
+            orchestrator.submit_interaction(
+                activity_id=activity.id, session_id=session.id, idempotency_key=_new_id(),
+                learner_input="resposta espontanea correta", help_level=HelpLevel.A0,
+                production_result=ProductionResult.SPONTANEOUS_CORRECT,
+                tutor_output_text=tutor_output.utterance if tutor_output else "",
+            )
+        raise AssertionError("nao alcancou SCHEDULE_RECALL em tempo habil (possivel regressao na ladder do Decisor)")
+
+    return _drive
+
+
+@pytest.fixture()
 def make_rule_version(repos: Repositories):
     """Fabrica e insere uma RuleVersion valida (config_json default) e
     devolve o objeto. Cada chamada cria uma versao nova (version unica)."""

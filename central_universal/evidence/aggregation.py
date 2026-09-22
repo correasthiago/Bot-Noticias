@@ -62,6 +62,28 @@ class AggregationConfig:
     contradiction_outweigh_ratio: float = 2.0
     min_confidence_for_aggregation: float = 0.5
 
+    # Politica de revisao de memoria (Secao 2 do pacote de correcao
+    # v0.2.1) - documentada aqui, na RuleVersion, e NAO mais hardcoded em
+    # memory/fsrs_adapter.py:
+    #  - `recall_min_confidence`: confianca minima da avaliacao de
+    #    RETENTION/target para sequer considerar a tentativa como
+    #    observacao de memoria valida.
+    #  - `recall_min_interval_seconds`: intervalo minimo desde a ultima
+    #    revisao para a nova tentativa contar como uma observacao
+    #    DISTINTA (evita que dois cliques em sequencia, segundos depois
+    #    um do outro, sejam tratados como duas revisoes espacadas).
+    #  - `recall_rating_easy_min_confidence` / `..._good_min_confidence`:
+    #    limiares de confianca que convertem uma avaliacao POSITIVE em
+    #    nota FSRS Easy/Good/Hard (ver `memory.fsrs_adapter.derive_recall_rating`).
+    #    Uma avaliacao NEGATIVE sempre vira "Again", independente de
+    #    confianca. O rating NUNCA e derivado do ProductionResult bruto -
+    #    so da classificacao e confianca que o avaliador atribuiu aquela
+    #    tentativa especifica de recuperacao.
+    recall_min_confidence: float = 0.5
+    recall_min_interval_seconds: float = 3600.0
+    recall_rating_easy_min_confidence: float = 0.85
+    recall_rating_good_min_confidence: float = 0.65
+
     @classmethod
     def from_json(cls, config_json: str | None) -> "AggregationConfig":
         if not config_json:
@@ -80,6 +102,10 @@ class AggregationConfig:
                 "retention_consolidated_min_days": self.retention_consolidated_min_days,
                 "contradiction_outweigh_ratio": self.contradiction_outweigh_ratio,
                 "min_confidence_for_aggregation": self.min_confidence_for_aggregation,
+                "recall_min_confidence": self.recall_min_confidence,
+                "recall_min_interval_seconds": self.recall_min_interval_seconds,
+                "recall_rating_easy_min_confidence": self.recall_rating_easy_min_confidence,
+                "recall_rating_good_min_confidence": self.recall_rating_good_min_confidence,
             },
             sort_keys=True,
         )

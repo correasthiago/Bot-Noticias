@@ -37,6 +37,7 @@ from central_universal.domain.entities import (
 )
 from central_universal.domain.enums import (
     CompetencyDimensionState,
+    DecisionType,
     Dimension,
     HelpLevel,
     ProductionResult,
@@ -69,10 +70,33 @@ def _session(repos: Repositories, learner_id: str) -> LearningSession:
     return session
 
 
-def _new_activity(repos: Repositories, session_id: str, prompt: str = "drill", activity_type: str = "drill") -> Activity:
+def _new_activity(
+    repos: Repositories,
+    session_id: str,
+    competency_targets: list[str] | None = None,
+    prompt: str = "drill",
+    activity_type: str = "drill",
+) -> Activity:
     activity = Activity(
-        id=new_id(), session_id=session_id, competency_targets=[], activity_type=activity_type,
+        id=new_id(), session_id=session_id, competency_targets=competency_targets or [], activity_type=activity_type,
         prompt=prompt, support_level=HelpLevel.A0, created_at=utc_now_iso(),
+    )
+    repos.activities.insert(activity)
+    return activity
+
+
+def _planned_recall_activity(repos: Repositories, session_id: str, competency_id: str) -> Activity:
+    """Constroi uma Activity ja marcada como recuperacao planejada, sem
+    passar por `start_activity`/o Decisor - usado apenas para exercitar
+    isoladamente o adapter de memoria (P7), ja que `is_planned_recall`
+    deixou de ser um parametro aceito pelo orquestrador (Secao 1 do
+    pacote de correcao v0.2.1: so o proprio Decisor, ao escolher
+    SCHEDULE_RECALL, pode produzir uma atividade assim)."""
+
+    activity = Activity(
+        id=new_id(), session_id=session_id, competency_targets=[competency_id],
+        activity_type=DecisionType.SCHEDULE_RECALL.value, prompt="Recall this",
+        support_level=HelpLevel.A0, created_at=utc_now_iso(), is_planned_recall=True,
     )
     repos.activities.insert(activity)
     return activity
@@ -121,7 +145,7 @@ def test_P1_invalid_evaluation_never_alters_projection_or_memory(repos, make_com
 
     session = orchestrator.start_session(learner.id)
     activity, _ = orchestrator.start_activity(
-        session_id=session.id, competency_id=competency_id, action=None, is_planned_recall=True
+        session_id=session.id, competency_id=competency_id, action=None
     )
     outcome = orchestrator.submit_interaction(
         activity_id=activity.id, session_id=session.id, idempotency_key=new_id(),
@@ -203,11 +227,13 @@ def test_P3_two_negatives_from_same_cluster_never_corroborate_regression(repos, 
     learner = _learner(repos)
     rule_version = make_rule_version()
     service = EvidenceService(repos)
-    session = _session(repos, learner.id)
-    negative_activity = _new_activity(repos, session.id, prompt="negative-drill")
 
+    # Tres clusters genuinamente independentes (Secao 6 da correcao
+    # v0.2.1: dentro da MESMA sessao, mesmo tipo+competencia colapsam num
+    # cluster so - independencia real exige sessoes distintas).
     for i in range(3):
-        activity = _new_activity(repos, session.id, prompt=f"positive-drill-{i}")
+        session = _session(repos, learner.id)
+        activity = _new_activity(repos, session.id, competency_targets=[competency_id], prompt=f"positive-drill-{i}")
         interaction, _ = service.record_interaction(
             activity=activity, session_id=session.id, idempotency_key=new_id(),
             learner_input="ok", tutor_output="", help_level=HelpLevel.A0,
@@ -219,9 +245,14 @@ def test_P3_two_negatives_from_same_cluster_never_corroborate_regression(repos, 
     before = repos.competency_states.current(competency_id, Dimension.ACCURACY)
     assert before.state == CompetencyDimensionState.CONSOLIDATED
 
+    # As duas negativas reusam a MESMA atividade (mesma sessao, mesmo
+    # tipo+competencia) - deliberadamente o MESMO cluster, para provar
+    # que repeti-las nele nao corrobora regressao.
+    negative_session = _session(repos, learner.id)
+    negative_activity = _new_activity(repos, negative_session.id, competency_targets=[competency_id], prompt="negative-drill")
     for _ in range(2):
         interaction, _ = service.record_interaction(
-            activity=negative_activity, session_id=session.id, idempotency_key=new_id(),
+            activity=negative_activity, session_id=negative_session.id, idempotency_key=new_id(),
             learner_input="erro", tutor_output="", help_level=HelpLevel.A0,
             production_result=ProductionResult.INCORRECT,
         )
@@ -247,7 +278,9 @@ def test_P4_different_activity_ids_same_context_collapse_into_one_cluster(repos,
         # cada iteracao cria uma ATIVIDADE NOVA (id diferente), mas o MESMO
         # prompt/tipo na mesma sessao - o cluster no servidor deve ser o
         # MESMO, mesmo que o activity_id (o "ID" ingenuo do v1) mude.
-        activity = _new_activity(repos, session.id, prompt="She ___ (go) to school.", activity_type="drill")
+        activity = _new_activity(
+            repos, session.id, competency_targets=[competency_id], prompt="She ___ (go) to school.", activity_type="drill"
+        )
         interaction, _ = service.record_interaction(
             activity=activity, session_id=session.id, idempotency_key=new_id(),
             learner_input=f"tentativa {i}", tutor_output="", help_level=HelpLevel.A0,
@@ -316,13 +349,15 @@ def test_P6_two_rule_versions_with_different_config_diverge(repos, make_competen
     competency_id = make_competency()
     learner = _learner(repos)
     service = EvidenceService(repos)
-    session = _session(repos, learner.id)
 
     lenient = make_rule_version(config=AggregationConfig(demonstrated_min_clusters=2, consolidated_min_clusters=99))
     strict = make_rule_version(config=AggregationConfig(demonstrated_min_clusters=5, consolidated_min_clusters=99))
 
     for i in range(2):
-        activity = _new_activity(repos, session.id, prompt=f"drill {i}")
+        # sessoes distintas: independencia real (Secao 6 da correcao
+        # v0.2.1), nao dois eventos colapsados no mesmo cluster.
+        session = _session(repos, learner.id)
+        activity = _new_activity(repos, session.id, competency_targets=[competency_id], prompt=f"drill {i}")
         interaction, _ = service.record_interaction(
             activity=activity, session_id=session.id, idempotency_key=new_id(),
             learner_input="ok", tutor_output="", help_level=HelpLevel.A0,
@@ -347,17 +382,25 @@ def test_P6_two_rule_versions_with_different_config_diverge(repos, make_competen
 def test_P7_memory_review_log_failure_never_alters_memory_state(repos, make_competency, make_rule_version, orchestrator_factory, monkeypatch):
     competency_id = make_competency()
     learner = _learner(repos)
-    rule_version = make_rule_version()
+    # `recall_min_interval_seconds=0` isola este teste do relogio real:
+    # a segunda tentativa de recuperacao (segundos depois da primeira, em
+    # tempo de execucao do teste) precisa continuar elegivel para exercitar
+    # a falha de escrita - o intervalo minimo entre revisoes e o que a
+    # Secao 2 da correcao v0.2.1 testa em test_memory_adapter.py.
+    rule_version = make_rule_version(config=AggregationConfig(recall_min_interval_seconds=0.0))
     orchestrator = orchestrator_factory(MockProvider(), rule_version)
     session = orchestrator.start_session(learner.id)
 
-    activity1, _ = orchestrator.start_activity(
-        session_id=session.id, competency_id=competency_id, action=None, is_planned_recall=True
-    )
+    # `is_planned_recall` nao e mais um parametro do orquestrador (Secao 1
+    # da correcao v0.2.1: so o proprio Decisor pode produzi-lo, escolhendo
+    # SCHEDULE_RECALL) - a atividade e construida diretamente para isolar
+    # este teste no comportamento do adapter de memoria.
+    activity1 = _planned_recall_activity(repos, session.id, competency_id)
     outcome1 = orchestrator.submit_interaction(
         activity_id=activity1.id, session_id=session.id, idempotency_key=new_id(),
         learner_input="ok", help_level=HelpLevel.A0, production_result=ProductionResult.SPONTANEOUS_CORRECT,
     )
+    assert outcome1.memory_eligibility is not None and outcome1.memory_eligibility.eligible is True
     assert outcome1.memory_result is not None
     before = repos.memory_states.get(competency_id)
     assert before is not None
@@ -367,14 +410,13 @@ def test_P7_memory_review_log_failure_never_alters_memory_state(repos, make_comp
 
     monkeypatch.setattr(repos.memory_review_logs, "insert", boom)
 
-    activity2, _ = orchestrator.start_activity(
-        session_id=session.id, competency_id=competency_id, action=None, is_planned_recall=True
-    )
+    activity2 = _planned_recall_activity(repos, session.id, competency_id)
     outcome2 = orchestrator.submit_interaction(
         activity_id=activity2.id, session_id=session.id, idempotency_key=new_id(),
         learner_input="ok de novo", help_level=HelpLevel.A0, production_result=ProductionResult.SPONTANEOUS_CORRECT,
     )
 
+    assert outcome2.memory_eligibility is not None and outcome2.memory_eligibility.eligible is True
     assert isinstance(outcome2.memory_result, MemoryReviewError)
     after = repos.memory_states.get(competency_id)
     assert after.fsrs_card_json == before.fsrs_card_json
@@ -478,7 +520,7 @@ def test_P11_offline_execution_fails_if_network_is_attempted(repos, make_compete
     assert focus is not None
     focus_id, _routing, action, recall_due = focus
     activity, tutor_output = orchestrator.start_activity(
-        session_id=session.id, competency_id=focus_id, action=action, is_planned_recall=recall_due
+        session_id=session.id, competency_id=focus_id, action=action
     )
     assert tutor_output is not None
 

@@ -3,6 +3,10 @@
 {% block content %}
 <h1>Auditoria</h1>
 
+{% if restore_status %}
+<p class="{{ 'ok' if restore_status == 'ok' else 'error' }}"><strong>Restauracao:</strong> {{ restore_message }}</p>
+{% endif %}
+
 <h3>Integridade</h3>
 {% if report.ok %}
   <p class="ok">Nenhum problema de integridade encontrado ({{ report.findings|length }} achado(s) de aviso, se houver).</p>

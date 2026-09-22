@@ -38,6 +38,14 @@ class EvaluatorInput:
     production_result: ProductionResult
     context: str
     rule_version: str
+    # Qual dimensao esta atividade foi desenhada para exercitar (Secao 17:
+    # a acao pedagogica escolhida pelo Decisor ja implica uma dimensao-
+    # alvo - MINIMAL_EXPLANATION mira comprehension, GUIDED_RETRIEVAL mira
+    # retrieval, etc.). None quando a atividade nao tem uma unica dimensao
+    # obvia (ex.: DISCRETE_VALIDATION, revisao longitudinal sem decisao).
+    # Isto e um GUIA para o avaliador, nunca uma imposicao - um avaliador
+    # real ainda decide por si mesmo qual dimensao a evidencia sustenta.
+    target_dimension: Dimension | None = None
 
 
 @dataclass(frozen=True)

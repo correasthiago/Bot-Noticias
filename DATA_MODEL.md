@@ -93,18 +93,27 @@ A tabela em si e IMUTAVEL (trigger `BEFORE UPDATE`/`BEFORE DELETE`) desde
 v0.2 - nenhuma linha de nenhuma geracao, ativa ou nao, pode ser alterada
 ou apagada depois de inserida.
 
-## Por que o cluster de evidencia e uma tabela propria, computada no servidor (v0.2)
+## Por que o cluster de evidencia e uma tabela propria, computada no servidor (v0.2, refinada em v0.2.1)
 
 Ate a V0.1, `evidence_cluster_id` era um `TEXT` livre que o CHAMADOR
 decidia (na pratica, o orquestrador usava `activity_id`, mas nada no
 schema impedia outra coisa). O Red Team apontou que isso permite
 "provar independencia" so inventando um id novo. Desde v0.2,
-`evidence_cluster` e uma tabela real: `id` e um hash determinístico de
-`(session_id, activity_type, prompt normalizado)`, com
-`UNIQUE(session_id, context_signature)`. `raw_interaction.evidence_cluster_id`
-e `evidence_event.evidence_cluster_id` sao FOREIGN KEY para ela - nenhum
+`evidence_cluster` e uma tabela real, com `UNIQUE(session_id,
+context_signature)`; `raw_interaction.evidence_cluster_id` e
+`evidence_event.evidence_cluster_id` sao FOREIGN KEY para ela - nenhum
 codigo de aplicacao aceita mais um cluster id vindo de fora (ver
 `evidence/clustering.py`).
+
+`context_signature` era originalmente um hash de `(session_id,
+activity_type, prompt normalizado)`. Uma segunda auditoria (pacote de
+correcao v0.2.1) encontrou que isso ainda permitia "provar independencia"
+trocando so palavras superficiais de um exercicio previsivel (mesmo
+template, sujeito/verbo diferentes). O prompt saiu da assinatura:
+`context_signature` agora e um hash de `(activity_type,
+competency_targets ordenados)` - a MESMA acao pedagogica repetida para a
+MESMA competencia, na mesma sessao, sempre colapsa num cluster so, seja
+qual for o texto exato do prompt.
 
 ## Campos que merecem explicacao
 
@@ -117,8 +126,11 @@ codigo de aplicacao aceita mais um cluster id vindo de fora (ver
   permitida pela trigger de imutabilidade de `raw_interaction`.
 - `activity.is_planned_recall` — marca se esta atividade foi criada
   especificamente como uma tentativa de recuperacao espacada (e nao um
-  estudo comum). E um dos quatro requisitos para que a interacao gere um
-  `MemoryObservation` (ver Secao 1-2 do pacote de correcao v0.2).
+  estudo comum). E um dos requisitos para que a interacao gere um
+  `MemoryObservation` (ver Secao 1-2 do pacote de correcao v0.2). Desde
+  v0.2.1, e SEMPRE derivado por `SessionOrchestrator.start_activity` a
+  partir de `action.decision_type == DecisionType.SCHEDULE_RECALL` -
+  nunca um valor que um chamador (nem um teste) possa setar diretamente.
 - `memory_observation` — o UNICO evento que autoriza
   `MemoryAdapter.observe_and_review` a chamar o FSRS. Guarda
   `planned_recall`, `interval_days` (desde a ultima revisao) e `rating`
@@ -144,7 +156,29 @@ codigo de aplicacao aceita mais um cluster id vindo de fora (ver
 - `rule_version.config_json` — a UNICA fonte de thresholds de agregacao
   (`AggregationConfig`); nada mais no codigo hardcoda esses numeros.
   `rule_version.algorithm_version` documenta qual forma de codigo sabe
-  interpretar aquele JSON.
+  interpretar aquele JSON. Desde v0.2.1, tambem carrega a politica de
+  revisao de memoria: `recall_min_confidence`,
+  `recall_min_interval_seconds`, `recall_rating_easy_min_confidence` e
+  `recall_rating_good_min_confidence` - os limiares que
+  `memory.fsrs_adapter.derive_recall_rating`/`evaluate_recall_eligibility`
+  usam para transformar a `EvidenceAssessment` de RETENTION de uma
+  tentativa em elegibilidade + nota FSRS. Antes da v0.2.1 esses numeros so
+  existiam como defaults implicitos da dataclass `AggregationConfig`;
+  agora sao explicitos em `evidence.rule_versions.build_v0_2_1_rule_version`.
+- `raw_interaction`/`activity`/`learner_input`/`help_level`/`production_result`
+  identificam uma submissao junto com `idempotency_key`: desde v0.2.1,
+  `EvidenceService.record_interaction` rejeita
+  (`IdempotencyConflictError`) uma `idempotency_key` reutilizada com
+  qualquer um desses campos diferente do que foi persistido da primeira
+  vez. `tutor_output` deliberadamente NAO faz parte dessa checagem (nao e
+  parte da identidade da submissao), mas tambem nunca e sobrescrito - a
+  linha existente e sempre devolvida como esta.
+- `schema_migrations.notes` (coluna nova em v0.2.1, adicionada sob
+  demanda a bancos mais antigos) — diagnostico auditavel de uma migration
+  especifica, calculado ANTES dela alterar qualquer coisa. Por exemplo,
+  quantas linhas de `evidence_assessment` de um banco v0.1 precisaram ser
+  normalizadas (nunca descartadas) para respeitar o novo `CHECK` de
+  consistencia `inconclusive`/`classification` da migration 0002.
 
 ## Por que "versao ativa" e "geracao ativa" vivem em tabelas-ponteiro separadas
 

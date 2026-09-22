@@ -178,3 +178,59 @@ pos-entrega tornou explicitos porque a V0.1 os cumpria so parcialmente.
     `evaluate_recall_eligibility` confirma recuperacao PLANEJADA,
     intervalo relevante desde a ultima revisao, e avaliacao valida e
     conclusiva (`central_universal/memory/fsrs_adapter.py`).
+
+## Principios adicionados pelo pacote de correcao v0.2.1
+
+Uma segunda auditoria pos-entrega, sobre o commit que fechou a v0.2,
+encontrou que os principios acima ainda eram satisfeitos so parcialmente
+em seis pontos. Estes principios nao substituem os 23 anteriores - sao
+reforcos que essa auditoria tornou explicitos.
+
+24. **"Recuperacao planejada" e uma consequencia da decisao pedagogica,
+    nunca um dado informado por um chamador.**
+    `Activity.is_planned_recall` e SEMPRE derivado de
+    `action.decision_type == DecisionType.SCHEDULE_RECALL` dentro de
+    `SessionOrchestrator.start_activity` - nunca um parametro que outro
+    codigo (nem mesmo um teste) possa simplesmente setar. Isso garante que
+    o PRIMEIRO card FSRS do sistema so pode nascer pela mesma sequencia de
+    chamadas que a interface real usa
+    (`test_first_fsrs_card_is_born_through_normal_application_flow`).
+
+25. **A nota de uma recuperacao vem da avaliacao DAQUELA tentativa
+    especifica, nunca de um mapeamento generico de resultado.**
+    `ProductionResult` classifica a interacao bruta; a nota FSRS (1-4)
+    exige uma `EvidenceAssessment` de RETENTION, com relacao `target`,
+    confianca suficiente e intervalo desde a ultima revisao respeitando o
+    minimo definido pela `RuleVersion` em uso
+    (`recall_min_confidence`/`recall_min_interval_seconds`/
+    `recall_rating_easy_min_confidence`/`recall_rating_good_min_confidence`
+    em `AggregationConfig`, documentados na propria `RuleVersion` -
+    `evidence.rule_versions.build_v0_2_1_rule_version`). Mudar esses
+    numeros e criar uma nova `RuleVersion`, nunca editar uma constante de
+    modulo (reforco direto do Principio 18).
+
+26. **Reprocessar uma interacao pendente nunca confia em dados frescos do
+    chamador, e uma chave de idempotencia identifica UMA submissao, nunca
+    conteudo novo.**
+    `EvaluatorInput` e sempre montado a partir da `RawInteraction`
+    PERSISTIDA, mesmo quando a chamada que reprocessa passa parametros
+    (por exemplo, `tutor_output_text`) diferentes dos da primeira
+    tentativa. Uma `idempotency_key` reutilizada com atividade, sessao ou
+    conteudo semanticamente relevante diferente e sempre rejeitada
+    (`IdempotencyConflictError`) - nunca aceita silenciosamente escolhendo
+    uma das duas versoes. Essa garantia sobrevive a um reinicio completo
+    do processo, porque vem do banco, nunca de estado em memoria
+    (`test_idempotency_conflict_rejected_after_process_restart`).
+
+27. **Migracao de esquema e restauracao de backup sao operacoes de
+    fronteira: atomicas, sem perda silenciosa, e visiveis ao operador
+    quando falham.**
+    Uma migration inteira aplica-se por completo ou nao aplica nada
+    (`_apply_migration_atomically`); dados legados permitidos por um
+    esquema anterior sao NORMALIZADOS para o novo, nunca descartados
+    silenciosamente por um filtro `WHERE`. Uma restauracao de backup so
+    prossegue depois de garantir exclusividade real no banco ativo
+    (recusando-se explicitamente diante de uma conexao concorrente) e de
+    tratar o WAL e seus arquivos auxiliares - e seu resultado (sucesso ou
+    falha, com o motivo) e sempre mostrado ao usuario, nunca descartado
+    apos o redirect.

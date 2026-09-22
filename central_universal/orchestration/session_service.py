@@ -11,7 +11,7 @@ na ordem certa, os modulos que ja a implementam.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from central_universal.decision.engine import ActionOutcome, RoutingOutcome
@@ -28,6 +28,7 @@ from central_universal.domain.entities import (
 )
 from central_universal.domain.enums import (
     DecisionType,
+    Dimension,
     EvaluationStatus,
     HelpLevel,
     ProductionResult,
@@ -37,6 +38,7 @@ from central_universal.domain.enums import (
 from central_universal.domain.ids import new_id
 from central_universal.evaluator.contract import EvaluatorInput, EvaluatorOutput
 from central_universal.evaluator.service import EvaluatorService
+from central_universal.evidence.aggregation import AggregationConfig
 from central_universal.evidence.service import EvidenceService
 from central_universal.memory.fsrs_adapter import (
     MemoryAdapter,
@@ -61,6 +63,21 @@ _SUPPORT_LEVEL_BY_ACTION = {
     DecisionType.DISCRETE_VALIDATION: HelpLevel.A0,
     DecisionType.TARGETED_REGRESSION_CHECK: HelpLevel.A1,
     DecisionType.EXIT_ACTIVE_FOCUS: HelpLevel.A0,
+}
+
+# Secao 1 do pacote de correcao v0.2.1: a dimensao que cada acao
+# pedagogica (Secao 17) foi desenhada para exercitar. Usada para (a)
+# guiar o avaliador (`EvaluatorInput.target_dimension`) e (b) permitir
+# que o Decisor progrida naturalmente ate escolher SCHEDULE_RECALL - sem
+# isso, nenhuma dimensao alem da primeira jamais recebe evidencia, e o
+# primeiro card FSRS nunca nasce pelo fluxo normal da aplicacao.
+_DIMENSION_BY_ACTION: dict[str, Dimension] = {
+    DecisionType.MINIMAL_EXPLANATION.value: Dimension.COMPREHENSION,
+    DecisionType.GUIDED_RETRIEVAL.value: Dimension.RETRIEVAL,
+    DecisionType.CONTRASTIVE_PRACTICE.value: Dimension.ACCURACY,
+    DecisionType.CONTEXTUAL_PRODUCTION.value: Dimension.AUTOMATICITY,
+    DecisionType.NOVEL_CONTEXT_TRANSFER.value: Dimension.TRANSFER,
+    DecisionType.SCHEDULE_RECALL.value: Dimension.RETENTION,
 }
 
 
@@ -122,9 +139,9 @@ class SessionOrchestrator:
         pode ser pulada. Retorna None se tudo puder ser pulado agora. O
         ultimo item do tuplo (`memory_recall_due`) diz se esta competencia
         foi escolhida (ao menos em parte) porque o FSRS tem uma
-        recuperacao agendada agora - usado para marcar a atividade
-        resultante como `is_planned_recall` (Secao 1 do pacote de
-        correcao v0.2)."""
+        recuperacao agendada agora - informativo para quem chama; a
+        atividade em si so vira `is_planned_recall` quando a ACAO
+        escolhida for `SCHEDULE_RECALL` (ver `start_activity`)."""
 
         for competency in self.repos.competencies.list_all():
             recall_due = self.memory_adapter.is_recall_due(competency.id)
@@ -144,12 +161,7 @@ class SessionOrchestrator:
     # ---- atividade ----------------------------------------------------
 
     def start_activity(
-        self,
-        *,
-        session_id: str,
-        competency_id: str,
-        action: ActionOutcome | None,
-        is_planned_recall: bool = False,
+        self, *, session_id: str, competency_id: str, action: ActionOutcome | None
     ) -> tuple[Activity, TutorOutput | None]:
         competency = self.repos.competencies.get(competency_id)
         if competency is None:
@@ -167,6 +179,13 @@ class SessionOrchestrator:
             prompt_seed=f"Pratique: {competency.name}",
         )
         tutor_output, _provider_event = self.tutor_service.run(tutor_input)
+
+        # Secao 1 do pacote de correcao v0.2.1: `is_planned_recall` NUNCA
+        # e informado pelo chamador - e SEMPRE derivado da acao que o
+        # Decisor escolheu. So SCHEDULE_RECALL ("transferencia demonstrada
+        # mas retencao pendente" ou "recuperacao agendada pelo FSRS")
+        # constitui uma tentativa de recuperacao legitima.
+        is_planned_recall = action is not None and action.decision_type == DecisionType.SCHEDULE_RECALL
 
         activity = Activity(
             id=new_id(),
@@ -202,6 +221,10 @@ class SessionOrchestrator:
         if activity is None:
             raise ValueError(f"atividade desconhecida: {activity_id}")
 
+        # Secao 3 do pacote de correcao v0.2.1: uma idempotency_key
+        # reutilizada com atividade/sessao/conteudo DIFERENTE e rejeitada
+        # (IdempotencyConflictError) dentro de record_interaction - nunca
+        # aceita silenciosamente.
         raw_interaction, created_now = self.evidence_service.record_interaction(
             activity=activity,
             session_id=session_id,
@@ -223,25 +246,30 @@ class SessionOrchestrator:
                 memory_result=None,
             )
 
-        # Uma interacao PENDING (nova, ou uma reenviada cuja avaliacao
-        # nunca completou antes) sempre pode ser (re)processada - Secao 5
-        # do pacote de correcao v0.2.
+        # Secao 3 do pacote de correcao v0.2.1: o EvaluatorInput e montado
+        # EXCLUSIVAMENTE a partir da RawInteraction PERSISTIDA - nunca dos
+        # parametros frescos desta chamada. Numa interacao nova isso e o
+        # mesmo conteudo (ja validado igual por record_interaction); numa
+        # REPROCESSADA, garante que o avaliador sempre ve exatamente o que
+        # ficou gravado da primeira vez, imune a qualquer deriva entre
+        # tentativas.
+        target_dimension = _DIMENSION_BY_ACTION.get(activity.activity_type)
         evaluator_input = EvaluatorInput(
             raw_interaction_id=raw_interaction.id,
-            learner_input=learner_input,
-            tutor_output=tutor_output_text,
+            learner_input=raw_interaction.learner_input,
+            tutor_output=raw_interaction.tutor_output,
             candidate_competency_ids=tuple(activity.competency_targets),
-            help_level=help_level,
-            production_result=production_result,
+            help_level=raw_interaction.help_level,
+            production_result=raw_interaction.production_result,
             context=activity.prompt,
             rule_version=self.rule_version.version,
+            target_dimension=target_dimension,
         )
         evaluator_output, eval_provider_event = self.evaluator_service.run(
             evaluator_input, set(activity.competency_targets)
         )
 
         competency_states: list[CompetencyState] = []
-        assessments: list[EvidenceAssessment] = []
         if evaluator_output is not None:
             # Secao 25 / T9: todo o lote de evidencia desta submissao e
             # atomico - ou entra inteiro, ou nao entra nada. A propria
@@ -255,7 +283,6 @@ class SessionOrchestrator:
                     evaluator_provider_event_id=eval_provider_event.id,
                 )
             competency_states = eval_result.competency_states
-            assessments = eval_result.assessments
         # Se evaluator_output for None (avaliador falhou ou devolveu algo
         # invalido), a RawInteraction ja gravada permanece como esta e a
         # avaliacao fica pendente (Secao 25) - nada mais e feito aqui.
@@ -264,13 +291,17 @@ class SessionOrchestrator:
         memory_eligibility: MemoryObservationEligibility | None = None
         target_id = activity.competency_targets[0] if activity.competency_targets else None
         if target_id is not None:
+            # Secao 2 do pacote de correcao v0.2.1: a observacao de
+            # memoria exige especificamente a avaliacao da dimensao
+            # RETENTION - nunca "qualquer evento desta competencia".
+            events_for_interaction = [
+                e
+                for e in self.repos.evidence_events.list_by_raw_interaction(raw_interaction.id)
+                if e.competency_id == target_id
+            ]
             matching_event = next(
-                (
-                    e
-                    for e in self.repos.evidence_events.list_by_raw_interaction(raw_interaction.id)
-                    if e.competency_id == target_id
-                ),
-                None,
+                (e for e in events_for_interaction if e.dimension == Dimension.RETENTION),
+                events_for_interaction[0] if events_for_interaction else None,
             )
             matching_assessment = None
             if matching_event is not None:
@@ -278,17 +309,20 @@ class SessionOrchestrator:
                 matching_assessment = max(candidates, key=lambda a: a.created_at) if candidates else None
 
             memory_state_before = self.repos.memory_states.get(target_id)
+            config = AggregationConfig.from_json(self.rule_version.config_json)
             memory_eligibility = evaluate_recall_eligibility(
                 activity=activity,
                 evidence_relation=matching_event.relation if matching_event else None,
+                evidence_dimension=matching_event.dimension if matching_event else None,
                 assessment=matching_assessment,
-                production_result=production_result,
                 memory_state=memory_state_before,
+                config=config,
             )
             # Secao 2 do pacote de correcao v0.2: se nao for elegivel, o
             # FSRS NUNCA e chamado - nem para avaliador que falhou, nem
-            # payload invalido, nem inconclusive, nem mere_presence, nem
-            # atividade que nao e uma recuperacao planejada.
+            # payload invalido, nem inconclusive, nem mere_presence/
+            # incidental, nem atividade que nao e uma recuperacao
+            # planejada, nem intervalo/confianca abaixo do minimo.
             if memory_eligibility.eligible and matching_assessment is not None:
                 memory_result = self.memory_adapter.observe_and_review(
                     competency_id=target_id,

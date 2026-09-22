@@ -29,12 +29,17 @@ da V0, nao de principio.
   `possible_regression=True` fica assim indefinidamente ate uma
   intervencao futura - correto pelo Principio 12, mas uma limitacao real
   de completude do ciclo.
-- **Uma unica dimensao "escolhida" por interacao no MockProvider.**
-  O `MockProvider` avalia sempre a dimensao `accuracy` para toda
-  competencia candidata, porque ele nao faz NLU real. Um avaliador real
-  (LLM) escolheria a dimensao certa por interacao; isso e esperado e
-  documentado — o Mock existe para provar o motor, nao para ensinar
-  ingles de verdade.
+- **Uma unica dimensao "escolhida" por interacao no MockProvider -
+  PARCIALMENTE RESOLVIDA em v0.2.1.** Ate a v0.2, o `MockProvider`
+  avaliava sempre a dimensao `accuracy`, o que impedia o Decisor de
+  progredir a ladder ate SCHEDULE_RECALL pelo fluxo normal (Decisao #1 do
+  pacote v0.2.1). Desde v0.2.1, ele consulta
+  `EvaluatorInput.target_dimension` (derivado da acao pedagogica que a
+  atividade foi criada para exercitar) - mas isso continua sendo uma
+  heuristica MECANICA (um mapa fixo acao->dimensao), nao NLU real. Um
+  avaliador real (LLM) ainda escolheria a dimensao certa por conteudo da
+  resposta, nao so pelo tipo de atividade; o Mock existe para provar o
+  motor, nao para ensinar ingles de verdade.
 - **Automaticidade e provisoria na V0 textual (Secao 20).** Os dados
   estao estruturados para receber `response latency`, pausas,
   reformulacoes e modalidade de fala no futuro, mas nenhum desses sinais
@@ -46,22 +51,31 @@ da V0, nao de principio.
 ## Tecnicas
 
 - **Cluster de evidencia e escopado a UMA sessao, sem janela de tempo
-  explicita (v0.2).** `evidence_cluster` agrupa por
-  `(session_id, activity_type, prompt normalizado)`. Isso impede a
-  maioria dos casos de "fingir independencia" (ver DECISIONS.md #6-7),
-  mas uma sessao anormalmente longa (varias horas) com o mesmo prompt
-  repetido no inicio e no fim continuaria contando como um cluster so -
-  o que e conservador (subestima independencia), nao permissivo.
+  explicita (v0.2; assinatura refinada em v0.2.1).** `evidence_cluster`
+  agrupa por `(session_id, activity_type, competency_targets)` - o texto
+  do prompt saiu da assinatura em v0.2.1 (ver DECISIONS.md #6), porque
+  prompts textualmente diferentes mas pedagogicamente previsiveis
+  conseguiam forjar independencia. Isso impede a maioria dos casos de
+  "fingir independencia", mas uma sessao anormalmente longa (varias
+  horas) com a mesma acao/competencia repetida no inicio e no fim
+  continuaria contando como um cluster so - o que e conservador
+  (subestima independencia), nao permissivo.
 - **Idempotencia de avaliacao nao foi testada sob concorrencia real.**
   `try_claim_evaluation` usa um `UPDATE ... WHERE evaluation_status =
   'pending'` atomico, que deveria ser seguro sob o lock `BEGIN IMMEDIATE`
   do SQLite mesmo com multiplas conexoes tentando completar a mesma
   avaliacao ao mesmo tempo - mas isso nunca foi exercitado com threads ou
   processos reais, so logicamente.
-- **Concorrencia real nao foi testada.** SQLite em WAL suporta um
-  escritor por vez; para um unico usuario local isso nunca e um
-  problema, mas o codigo nao foi testado sob multiplos processos
-  escrevendo simultaneamente.
+- **Concorrencia real nao foi testada com processos separados do SO.**
+  SQLite em WAL suporta um escritor por vez; para um unico usuario local
+  isso nunca e um problema. Desde v0.2.1, `restore_from_backup` pelo
+  menos DETECTA uma conexao concorrente (recusando prosseguir se nao
+  conseguir sair do modo WAL com exclusividade - ver DECISIONS.md #5) e
+  isso e testado com uma segunda `sqlite3.Connection`, mas ainda no MESMO
+  processo/thread do teste - nao ha teste com processos do SO realmente
+  separados disputando o mesmo arquivo. O timeout de espera pela
+  exclusividade (`_LOCK_TIMEOUT_SECONDS = 5.0` em `persistence/restore.py`)
+  e um numero arbitrario, nao calibrado contra nenhuma carga real.
 - **Sem autenticacao/autorizacao.** A V0 assume fisicamente um unico
   computador de um unico usuario (Secao 1). Nao ha login, nao ha
   isolamento entre "learners" alem de uma FK — se o escopo mudar para
@@ -149,7 +163,21 @@ parcialmente.
   migration inclusive faz backfill honesto de `evidence_cluster` a
   partir de dados legados, se existirem), mas um banco de producao muito
   grande levaria mais tempo para migrar do que uma `ALTER TABLE` simples
-  levaria. Nao e um problema na escala desta V0.
+  levaria. Nao e um problema na escala desta V0. Desde v0.2.1 ela roda
+  como uma transacao atomica de verdade (ver DECISIONS.md #4) - uma falha
+  no meio desfaz tudo, e todas as avaliacoes v0.1 sao preservadas
+  (normalizadas, nunca descartadas).
+- **A atomicidade explicita (`BEGIN IMMEDIATE`/`COMMIT` dentro do proprio
+  arquivo .sql) e o diagnostico auditavel em `schema_migrations.notes`
+  foram aplicados especificamente a migration 0002 (v0.2.1), nao a TODA
+  migration presente ou futura.** `migrations/0001_init.sql` continua
+  rodando em modo autocommit por instrucao (e so cria tabelas com
+  `CREATE TABLE IF NOT EXISTS` - baixo risco de falha parcial
+  problematica). `persistence/migrations._diagnose_migration` hoje so
+  reconhece o nome `0002_v0_2_corrections.sql`; uma migration futura que
+  precise do mesmo tipo de diagnostico vai precisar do proprio ramo
+  explicito ali (documentado no docstring da funcao) - nao ha (ainda) um
+  mecanismo generico de "toda migration declara seu proprio diagnostico".
 - **Ambiguidade original entre "EvidenceEvent" e "EvidenceAssessment" -
   RESOLVIDA no pacote de correcao v0.2.** A V0.1 tinha uma coluna
   `evidence_type` duplicada em `EvidenceEvent`; o pacote de correcao a

@@ -101,6 +101,116 @@ def test_restore_reverts_when_integrity_check_fails_after_swap(tmp_path: Path, m
     reverted.close()
 
 
+def test_restore_flattens_active_wal_before_swapping(tmp_path: Path):
+    """Ponto 5 do pacote de correcao v0.2.1: restaurar por cima de um
+    banco com WAL genuinamente ativo (dados commitados so no `-wal`,
+    ainda nao levados ao arquivo principal) precisa funcionar - e nao
+    pode deixar nenhum sidecar `-wal`/`-shm` orfao grudado no banco
+    recem-restaurado."""
+
+    db_path = tmp_path / "central.db"
+    conn = connect(db_path)
+    run_migrations(conn)
+    repos = Repositories(conn)
+    # Impede o auto-checkpoint para garantir que o WAL fique realmente
+    # ativo (nao seja achatado sozinho pelo SQLite antes do teste rodar).
+    conn.execute("PRAGMA wal_autocheckpoint = 0;")
+    learner = Learner(id=new_id(), display_name="Commitado so no WAL", created_at=utc_now_iso())
+    repos.learners.insert(learner)
+
+    backup_event = create_backup(conn, repos, backup_dir=tmp_path / "backups")
+    assert backup_event.success is True
+
+    wal_path = db_path.with_name(db_path.name + "-wal")
+    assert wal_path.exists() and wal_path.stat().st_size > 0  # WAL genuinamente ativo
+
+    conn.close()
+
+    result = restore_from_backup(db_path, backup_event.backup_path)
+    assert result.success is True
+
+    assert not wal_path.exists()  # nenhum sidecar orfao sobrou grudado no banco restaurado
+
+    restored = connect(db_path)
+    assert Repositories(restored).learners.get(learner.id) is not None
+    restored.close()
+
+
+def test_restore_aborts_cleanly_with_concurrent_connection_open(tmp_path: Path):
+    """Ponto 5 do pacote de correcao v0.2.1: 'impeca novas escritas' -
+    uma conexao concorrente ainda aberta no banco ativo tem que bloquear
+    a restauracao (sem tocar em nenhum arquivo), nao arriscar uma
+    corrida com a troca atomica do arquivo."""
+
+    db_path = tmp_path / "central.db"
+    conn = connect(db_path)
+    run_migrations(conn)
+    repos = Repositories(conn)
+    learner = Learner(id=new_id(), display_name="Original", created_at=utc_now_iso())
+    repos.learners.insert(learner)
+    backup_event = create_backup(conn, repos, backup_dir=tmp_path / "backups")
+    assert backup_event.success is True
+
+    # `conn` continua deliberadamente aberta - simula uma sessao/processo
+    # concorrente que ainda nao fechou sua conexao com o banco ativo.
+    result = restore_from_backup(db_path, backup_event.backup_path)
+    assert result.success is False
+    assert "conexao" in result.message
+
+    # nada foi tocado: a mesma conexao concorrente ainda enxerga o original
+    assert repos.learners.get(learner.id) is not None
+    conn.close()
+
+    # com a conexao concorrente fechada, a restauracao agora funciona
+    result2 = restore_from_backup(db_path, backup_event.backup_path)
+    assert result2.success is True
+
+
+def test_restore_reverts_cleanly_when_swap_target_had_active_wal(tmp_path: Path, monkeypatch):
+    """Combina reversao (integrity_check falha apos a troca) com um WAL
+    ativo no banco original - a reversao precisa devolver exatamente o
+    estado anterior, sem sidecars orfaos da tentativa que falhou."""
+
+    db_path = tmp_path / "central.db"
+    conn = connect(db_path)
+    run_migrations(conn)
+    repos = Repositories(conn)
+    conn.execute("PRAGMA wal_autocheckpoint = 0;")
+    original_learner = Learner(id=new_id(), display_name="Fica mesmo com WAL ativo", created_at=utc_now_iso())
+    repos.learners.insert(original_learner)
+
+    wal_path = db_path.with_name(db_path.name + "-wal")
+    assert wal_path.exists() and wal_path.stat().st_size > 0
+
+    other_db = tmp_path / "other.db"
+    other_conn = connect(other_db)
+    run_migrations(other_conn)
+    other_conn.close()
+
+    conn.close()
+
+    import central_universal.persistence.restore as restore_module
+
+    def fake_run_all(_repos):
+        class _FakeReport:
+            ok = False
+            findings = [type("F", (), {"severity": "error", "message": "forcado no teste"})()]
+
+        return _FakeReport()
+
+    monkeypatch.setattr(restore_module, "run_all", fake_run_all)
+
+    result = restore_from_backup(db_path, other_db)
+    assert result.success is False
+    assert "revertida" in result.message
+
+    assert not wal_path.exists()  # nenhum sidecar orfao da tentativa que falhou
+
+    reverted = connect(db_path)
+    assert Repositories(reverted).learners.get(original_learner.id) is not None
+    reverted.close()
+
+
 def test_maybe_run_automatic_backup_respects_min_interval(tmp_path: Path):
     db_path = tmp_path / "central.db"
     conn = connect(db_path)

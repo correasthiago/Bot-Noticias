@@ -5,13 +5,14 @@ from datetime import datetime, timedelta, timezone
 import fsrs
 import pytest
 
-from central_universal.domain.clock import utc_now_iso
+from central_universal.domain.clock import to_utc_iso, utc_now_iso
 from central_universal.domain.entities import (
     Activity,
     EvidenceAssessment,
     EvidenceEvent,
     Learner,
     LearningSession,
+    MemoryState,
     RawInteraction,
 )
 from central_universal.domain.enums import (
@@ -24,11 +25,12 @@ from central_universal.domain.enums import (
     SessionStatus,
 )
 from central_universal.domain.ids import new_id
+from central_universal.evidence.aggregation import AggregationConfig
 from central_universal.memory.fsrs_adapter import (
     MemoryAdapter,
     MemoryReviewError,
+    derive_recall_rating,
     evaluate_recall_eligibility,
-    rating_from_production_result,
 )
 from central_universal.persistence.repositories import Repositories
 
@@ -52,10 +54,14 @@ def _valid_assessment(**overrides) -> EvidenceAssessment:
     return EvidenceAssessment(**base)
 
 
-def _real_observation_refs(repos: Repositories, competency_id: str):
+def _real_observation_refs(repos: Repositories, competency_id: str, **assessment_overrides):
     """Cria Learner/Session/Activity/RawInteraction/EvidenceEvent/
     EvidenceAssessment de verdade, para satisfazer as foreign keys reais
-    de memory_observation (raw_interaction_id, evidence_assessment_id)."""
+    de memory_observation (raw_interaction_id, evidence_assessment_id).
+
+    O evento criado e da dimensao RETENTION com relacao `target` - o
+    unico par que `evaluate_recall_eligibility` aceita para revisao de
+    memoria (Secao 2 do pacote de correcao v0.2.1)."""
 
     learner = Learner(id=new_id(), display_name="Aluno", created_at=utc_now_iso())
     repos.learners.insert(learner)
@@ -73,7 +79,7 @@ def _real_observation_refs(repos: Repositories, competency_id: str):
     repos.raw_interactions.insert(interaction)
     event = EvidenceEvent(
         id=new_id(), raw_interaction_id=interaction.id, competency_id=competency_id,
-        dimension=Dimension.ACCURACY,
+        dimension=Dimension.RETENTION,
         relation=EvidenceRelation.TARGET, help_level=HelpLevel.A0,
         production_result=ProductionResult.SPONTANEOUS_CORRECT, evidence_cluster_id=interaction.evidence_cluster_id,
         created_at=utc_now_iso(),
@@ -87,7 +93,7 @@ def _real_observation_refs(repos: Repositories, competency_id: str):
         created_at=utc_now_iso(), config_json="{}", algorithm_version="v2",
     )
     repos.rule_versions.insert(rule_version)
-    assessment = _valid_assessment(evidence_event_id=event.id, rule_version_id=rule_version.id)
+    assessment = _valid_assessment(evidence_event_id=event.id, rule_version_id=rule_version.id, **assessment_overrides)
     repos.evidence_assessments.insert(assessment)
     return activity, interaction, assessment
 
@@ -107,14 +113,14 @@ def test_get_or_create_state_is_idempotent(repos: Repositories, make_competency)
     assert first.fsrs_card_json == second.fsrs_card_json
 
 
-# --- elegibilidade (Secao 2 do pacote de correcao v0.2) --------------
+# --- elegibilidade (Secao 2 do pacote de correcao v0.2/v0.2.1) --------
 
 def test_not_planned_activity_is_never_eligible():
     result = evaluate_recall_eligibility(
         activity=_planned_activity("s1", planned=False),
         evidence_relation=EvidenceRelation.TARGET,
+        evidence_dimension=Dimension.RETENTION,
         assessment=_valid_assessment(),
-        production_result=ProductionResult.SPONTANEOUS_CORRECT,
         memory_state=None,
     )
     assert result.eligible is False
@@ -125,19 +131,47 @@ def test_mere_presence_is_never_eligible():
     result = evaluate_recall_eligibility(
         activity=_planned_activity("s1"),
         evidence_relation=EvidenceRelation.MERE_PRESENCE,
+        evidence_dimension=Dimension.RETENTION,
         assessment=_valid_assessment(),
-        production_result=ProductionResult.SPONTANEOUS_CORRECT,
         memory_state=None,
     )
     assert result.eligible is False
+
+
+def test_incidental_evidence_is_never_eligible():
+    """Ponto 2 da correcao v0.2.1: evidencia incidental (relacao
+    `qualified_incidental`, nunca `target`) jamais pode gerar uma
+    observacao de memoria, mesmo com avaliacao positiva e confiante."""
+
+    result = evaluate_recall_eligibility(
+        activity=_planned_activity("s1"),
+        evidence_relation=EvidenceRelation.QUALIFIED_INCIDENTAL,
+        evidence_dimension=Dimension.RETENTION,
+        assessment=_valid_assessment(confidence=0.95),
+        memory_state=None,
+    )
+    assert result.eligible is False
+    assert "incidental" in result.reason or "target" in result.reason
+
+
+def test_wrong_dimension_is_never_eligible():
+    result = evaluate_recall_eligibility(
+        activity=_planned_activity("s1"),
+        evidence_relation=EvidenceRelation.TARGET,
+        evidence_dimension=Dimension.ACCURACY,
+        assessment=_valid_assessment(),
+        memory_state=None,
+    )
+    assert result.eligible is False
+    assert "retention" in result.reason
 
 
 def test_missing_assessment_is_never_eligible():
     result = evaluate_recall_eligibility(
         activity=_planned_activity("s1"),
         evidence_relation=EvidenceRelation.TARGET,
+        evidence_dimension=Dimension.RETENTION,
         assessment=None,
-        production_result=ProductionResult.SPONTANEOUS_CORRECT,
         memory_state=None,
     )
     assert result.eligible is False
@@ -147,8 +181,8 @@ def test_inconclusive_assessment_is_never_eligible():
     result = evaluate_recall_eligibility(
         activity=_planned_activity("s1"),
         evidence_relation=EvidenceRelation.TARGET,
+        evidence_dimension=Dimension.RETENTION,
         assessment=_valid_assessment(classification=EvidenceType.INCONCLUSIVE, inconclusive=True),
-        production_result=ProductionResult.INCONCLUSIVE,
         memory_state=None,
     )
     assert result.eligible is False
@@ -158,23 +192,119 @@ def test_pending_alternative_cause_is_never_eligible():
     result = evaluate_recall_eligibility(
         activity=_planned_activity("s1"),
         evidence_relation=EvidenceRelation.TARGET,
+        evidence_dimension=Dimension.RETENTION,
         assessment=_valid_assessment(alternative_cause="possivel cola"),
-        production_result=ProductionResult.SPONTANEOUS_CORRECT,
         memory_state=None,
     )
     assert result.eligible is False
+
+
+def test_low_confidence_assessment_is_never_eligible():
+    """Ponto 2 da correcao v0.2.1: confianca abaixo de
+    `recall_min_confidence` bloqueia a observacao mesmo com classificacao
+    POSITIVE e relacao target."""
+
+    result = evaluate_recall_eligibility(
+        activity=_planned_activity("s1"),
+        evidence_relation=EvidenceRelation.TARGET,
+        evidence_dimension=Dimension.RETENTION,
+        assessment=_valid_assessment(confidence=0.3),
+        memory_state=None,
+    )
+    assert result.eligible is False
+    assert "confianca" in result.reason
 
 
 def test_first_observation_with_no_prior_state_is_eligible():
     result = evaluate_recall_eligibility(
         activity=_planned_activity("s1"),
         evidence_relation=EvidenceRelation.TARGET,
-        assessment=_valid_assessment(),
-        production_result=ProductionResult.SPONTANEOUS_CORRECT,
+        evidence_dimension=Dimension.RETENTION,
+        assessment=_valid_assessment(confidence=0.9),
         memory_state=None,
     )
     assert result.eligible is True
     assert result.rating == int(fsrs.Rating.Easy)
+
+
+def test_negative_evaluation_is_eligible_with_again_rating():
+    """Ponto 2 da correcao v0.2.1: uma avaliacao NEGATIVE, conclusiva e
+    confiante, ainda produz uma observacao valida - so que com nota
+    "Again", nunca derivada do ProductionResult bruto."""
+
+    result = evaluate_recall_eligibility(
+        activity=_planned_activity("s1"),
+        evidence_relation=EvidenceRelation.TARGET,
+        evidence_dimension=Dimension.RETENTION,
+        assessment=_valid_assessment(classification=EvidenceType.NEGATIVE, result="incorrect", confidence=0.9),
+        memory_state=None,
+    )
+    assert result.eligible is True
+    assert result.rating == int(fsrs.Rating.Again)
+
+
+def test_derive_recall_rating_uses_confidence_thresholds_not_production_result():
+    config = AggregationConfig()
+    assert derive_recall_rating(_valid_assessment(confidence=0.95), config) == int(fsrs.Rating.Easy)
+    assert derive_recall_rating(_valid_assessment(confidence=0.7), config) == int(fsrs.Rating.Good)
+    assert derive_recall_rating(_valid_assessment(confidence=0.55), config) == int(fsrs.Rating.Hard)
+    assert derive_recall_rating(
+        _valid_assessment(classification=EvidenceType.NEGATIVE, confidence=0.55), config
+    ) == int(fsrs.Rating.Again)
+    assert derive_recall_rating(
+        _valid_assessment(classification=EvidenceType.INCONCLUSIVE, confidence=0.95), config
+    ) is None
+
+
+def test_attempts_seconds_apart_are_not_independent_observations():
+    """Ponto 2 da correcao v0.2.1: duas tentativas separadas por poucos
+    segundos nao podem contar como duas revisoes espacadas - o intervalo
+    minimo (`recall_min_interval_seconds`) e definido pela regra, nao
+    hardcoded."""
+
+    config = AggregationConfig(recall_min_interval_seconds=3600.0)
+    last_review = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    memory_state = MemoryState(
+        id=new_id(), competency_id="c1", fsrs_card_json="{}", due_at=None,
+        stability=1.0, difficulty=5.0, card_state="review",
+        last_review_at=to_utc_iso(last_review), updated_at=to_utc_iso(last_review),
+    )
+    seconds_later = last_review + timedelta(seconds=17)
+
+    result = evaluate_recall_eligibility(
+        activity=_planned_activity("s1"),
+        evidence_relation=EvidenceRelation.TARGET,
+        evidence_dimension=Dimension.RETENTION,
+        assessment=_valid_assessment(confidence=0.9),
+        memory_state=memory_state,
+        config=config,
+        now=seconds_later,
+    )
+    assert result.eligible is False
+    assert "intervalo" in result.reason
+
+
+def test_attempts_far_apart_are_independent_observations():
+    config = AggregationConfig(recall_min_interval_seconds=3600.0)
+    last_review = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    memory_state = MemoryState(
+        id=new_id(), competency_id="c1", fsrs_card_json="{}", due_at=None,
+        stability=1.0, difficulty=5.0, card_state="review",
+        last_review_at=to_utc_iso(last_review), updated_at=to_utc_iso(last_review),
+    )
+    days_later = last_review + timedelta(days=3)
+
+    result = evaluate_recall_eligibility(
+        activity=_planned_activity("s1"),
+        evidence_relation=EvidenceRelation.TARGET,
+        evidence_dimension=Dimension.RETENTION,
+        assessment=_valid_assessment(confidence=0.9),
+        memory_state=memory_state,
+        config=config,
+        now=days_later,
+    )
+    assert result.eligible is True
+    assert result.interval_days == pytest.approx(3.0)
 
 
 # --- observe_and_review: escrita atomica ------------------------------
@@ -185,8 +315,8 @@ def test_observe_and_review_creates_state_log_and_observation(repos: Repositorie
     activity, interaction, assessment = _real_observation_refs(repos, competency_id)
     eligibility = evaluate_recall_eligibility(
         activity=activity, evidence_relation=EvidenceRelation.TARGET,
-        assessment=assessment, production_result=ProductionResult.SPONTANEOUS_CORRECT,
-        memory_state=None,
+        evidence_dimension=Dimension.RETENTION,
+        assessment=assessment, memory_state=None,
     )
     now = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
@@ -216,8 +346,8 @@ def test_ineligible_observation_never_calls_fsrs(repos: Repositories, make_compe
 
     ineligible = evaluate_recall_eligibility(
         activity=_planned_activity("s1", planned=False), evidence_relation=EvidenceRelation.TARGET,
-        assessment=assessment, production_result=ProductionResult.SPONTANEOUS_CORRECT,
-        memory_state=None,
+        evidence_dimension=Dimension.RETENTION,
+        assessment=assessment, memory_state=None,
     )
     result = adapter.observe_and_review(
         competency_id=competency_id, raw_interaction_id=interaction.id, evidence_assessment_id=assessment.id,
@@ -243,8 +373,8 @@ def test_failure_at_each_write_leaves_prior_state_byte_identical(
     # primeira revisao bem sucedida, estabelece um estado "antes"
     eligibility = evaluate_recall_eligibility(
         activity=activity, evidence_relation=EvidenceRelation.TARGET,
-        assessment=assessment, production_result=ProductionResult.SPONTANEOUS_CORRECT,
-        memory_state=None,
+        evidence_dimension=Dimension.RETENTION,
+        assessment=assessment, memory_state=None,
     )
     adapter.observe_and_review(
         competency_id=competency_id, raw_interaction_id=interaction.id, evidence_assessment_id=assessment.id,
@@ -268,8 +398,8 @@ def test_failure_at_each_write_leaves_prior_state_byte_identical(
 
     second_eligibility = evaluate_recall_eligibility(
         activity=activity, evidence_relation=EvidenceRelation.TARGET,
-        assessment=assessment2, production_result=ProductionResult.SPONTANEOUS_CORRECT,
-        memory_state=before_state, now=datetime(2026, 1, 5, tzinfo=timezone.utc),
+        evidence_dimension=Dimension.RETENTION,
+        assessment=assessment2, memory_state=before_state, now=datetime(2026, 1, 5, tzinfo=timezone.utc),
     )
     outcome = adapter.observe_and_review(
         competency_id=competency_id, raw_interaction_id=interaction2.id, evidence_assessment_id=assessment2.id,
@@ -294,8 +424,8 @@ def test_is_recall_due_reflects_scheduler(repos: Repositories, make_competency):
     now = datetime(2026, 1, 1, tzinfo=timezone.utc)
     eligibility = evaluate_recall_eligibility(
         activity=activity, evidence_relation=EvidenceRelation.TARGET,
-        assessment=assessment, production_result=ProductionResult.SPONTANEOUS_CORRECT,
-        memory_state=None,
+        evidence_dimension=Dimension.RETENTION,
+        assessment=assessment, memory_state=None,
     )
     adapter.observe_and_review(
         competency_id=competency_id, raw_interaction_id=interaction.id, evidence_assessment_id=assessment.id,
@@ -305,9 +435,3 @@ def test_is_recall_due_reflects_scheduler(repos: Repositories, make_competency):
     assert adapter.is_recall_due(competency_id, now=now) is False
     far_future = now + timedelta(days=3650)
     assert adapter.is_recall_due(competency_id, now=far_future) is True
-
-
-def test_rating_from_production_result_maps_known_values():
-    assert rating_from_production_result(ProductionResult.SPONTANEOUS_CORRECT) == int(fsrs.Rating.Easy)
-    assert rating_from_production_result(ProductionResult.INCORRECT) == int(fsrs.Rating.Again)
-    assert rating_from_production_result(ProductionResult.INCONCLUSIVE) is None

@@ -9,6 +9,7 @@ from __future__ import annotations
 import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import urlencode
 
 from fastapi import Depends, FastAPI, Form, Request
 from fastapi.responses import RedirectResponse
@@ -152,10 +153,8 @@ def session_next(
     orchestrator = _orchestrator(repos, provider, rule_version)
     focus = orchestrator.choose_focus_competency(session.learner_id)
     if focus is not None:
-        competency_id, _routing, action, recall_due = focus
-        orchestrator.start_activity(
-            session_id=session_id, competency_id=competency_id, action=action, is_planned_recall=recall_due
-        )
+        competency_id, _routing, action, _recall_due = focus
+        orchestrator.start_activity(session_id=session_id, competency_id=competency_id, action=action)
     return RedirectResponse(f"/session/{session_id}", status_code=303)
 
 
@@ -235,7 +234,12 @@ def competency_detail(request: Request, competency_id: str, repos: Repositories 
 
 
 @app.get("/audit")
-def audit(request: Request, repos: Repositories = Depends(get_repos)):
+def audit(
+    request: Request,
+    repos: Repositories = Depends(get_repos),
+    restore_status: str | None = None,
+    restore_message: str | None = None,
+):
     report = run_integrity_checks(repos)
     return templates.TemplateResponse(
         request,
@@ -247,6 +251,11 @@ def audit(request: Request, repos: Repositories = Depends(get_repos)):
             "active_rule_version": repos.active_rule_version.get(),
             "report": report,
             "backups": list_backups(repos),
+            # Secao 5 do pacote de correcao v0.2.1: "mostre falha ao
+            # usuario quando o restore falhar" - o resultado do POST
+            # anterior chega aqui via querystring do redirect.
+            "restore_status": restore_status,
+            "restore_message": restore_message,
         },
     )
 
@@ -262,10 +271,16 @@ def audit_backup(
 
 @app.post("/audit/restore")
 def audit_restore(backup_path: str = Form(...)):
-    # Secao 14 do pacote de correcao v0.2: restore real, nao so uma copia
-    # de arquivo. `restore_from_backup` valida o snapshot, troca o banco
-    # atomicamente, roda migrations+integrity_check e reverte sozinho se
-    # algo falhar - nao ha conexao de longa duracao aqui para fechar (cada
-    # requisicao HTTP ja abre/fecha a sua).
-    restore_from_backup(DB_PATH, backup_path)
-    return RedirectResponse("/audit", status_code=303)
+    # Secao 14 do pacote de correcao v0.2 / Secao 5 do pacote de correcao
+    # v0.2.1: restore real, nao so uma copia de arquivo.
+    # `restore_from_backup` valida o snapshot, impede novas escritas
+    # (recusa prosseguir se outra conexao ainda estiver aberta), achata o
+    # WAL, troca o banco atomicamente, roda migrations+integrity_check e
+    # reverte sozinho se algo falhar - nao ha conexao de longa duracao
+    # aqui para fechar (cada requisicao HTTP ja abre/fecha a sua). O
+    # resultado (sucesso ou falha, com motivo) e sempre mostrado ao
+    # usuario na propria pagina de auditoria - nunca silenciado.
+    result = restore_from_backup(DB_PATH, backup_path)
+    status = "ok" if result.success else "error"
+    query = urlencode({"restore_status": status, "restore_message": result.message})
+    return RedirectResponse(f"/audit?{query}", status_code=303)

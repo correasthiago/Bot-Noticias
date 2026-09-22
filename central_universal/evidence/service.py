@@ -16,7 +16,11 @@ evidence_event, evidence_assessment e competency_state. Ele:
   (validacao acontece ANTES de chegar aqui - ver `evaluator.contract`);
 - recomputa CompetencyState sempre a partir do historico COMPLETO de
   evidencia daquela (competencia, dimensao), escrevendo na GERACAO ativa
-  (Secao 10 do pacote de correcao v0.2) - nunca apaga geracoes antigas.
+  (Secao 10 do pacote de correcao v0.2) - nunca apaga geracoes antigas;
+- rejeita (IdempotencyConflictError) uma idempotency_key reutilizada com
+  atividade, sessao ou conteudo DIFERENTE do que foi persistido da
+  primeira vez (Secao 3 do pacote de correcao v0.2.1) - nunca aceita
+  silenciosamente qual dos dois "ganha".
 """
 
 from __future__ import annotations
@@ -47,6 +51,15 @@ from central_universal.evidence.aggregation import AggregationConfig, UsableEvid
 from central_universal.evidence.clustering import resolve_cluster
 from central_universal.persistence.db import transaction
 from central_universal.persistence.repositories import Repositories
+
+
+class IdempotencyConflictError(ValueError):
+    """Levantada quando uma `idempotency_key` ja usada e reenviada com
+    atividade, sessao ou conteudo diferente do que foi persistido da
+    primeira vez (Secao 3 do pacote de correcao v0.2.1). Isto NUNCA e
+    resolvido silenciosamente escolhendo uma das duas versoes - e um erro
+    do chamador que precisa ser corrigido (uma idempotency_key deve
+    identificar UMA submissao, nao ser reaproveitada para conteudo novo)."""
 
 
 @dataclass
@@ -105,6 +118,21 @@ class EvidenceService:
 
         existing = self.repos.raw_interactions.get_by_idempotency_key(idempotency_key)
         if existing is not None:
+            if (
+                existing.activity_id != activity.id
+                or existing.session_id != session_id
+                or existing.learner_input != learner_input
+                or existing.help_level != help_level
+                or existing.production_result != production_result
+            ):
+                raise IdempotencyConflictError(
+                    f"idempotency_key '{idempotency_key}' ja foi usada para uma "
+                    f"RawInteraction com atividade/sessao/conteudo diferente "
+                    f"(persistido: activity={existing.activity_id!r} session={existing.session_id!r} "
+                    f"help_level={existing.help_level.value!r} production_result={existing.production_result.value!r}; "
+                    f"recebido agora: activity={activity.id!r} session={session_id!r} "
+                    f"help_level={help_level.value!r} production_result={production_result.value!r})"
+                )
             return existing, False
 
         cluster = resolve_cluster(self.repos, session_id=session_id, activity=activity)
