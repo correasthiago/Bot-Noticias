@@ -986,3 +986,78 @@ reafirmou como aceitavel neste mesmo relato.
 132/132 em todas as execucoes (as 132 ja incluem os 2 testes novos deste
 pacote). Como em todas as correcoes anteriores desta serie, a confirmacao
 em Windows depende do usuario rodar a suite la.
+
+**Atualizacao:** o usuario auditou o commit `c3b9bcb` num Windows real
+(sem alterar o repositorio) e confirmou **132/132**, cobrindo as duas
+falhas de preparacao (fechar conexoes e criar a copia de seguranca).
+
+---
+
+## Correcao pos-entrega: falha na propria limpeza da copia de seguranca podia escapar ou ocultar o resultado (setima auditoria)
+
+A mesma auditoria do commit `c3b9bcb` encontrou um ponto que a correcao
+anterior nao cobria: os TRES lugares em `_restore_from_backup_locked`
+onde a copia de seguranca e removida com `safety_copy.unlink(missing_ok=True)`
+- apos uma falha na propria preparacao (linha 381 na revisao auditada),
+apos uma reversao bem-sucedida (linha 410), e apos uma restauracao
+bem-sucedida (linha 414) - chamavam `unlink` diretamente, sem tratamento
+proprio. Uma falha ali (permissao negada, arquivo preso por
+antivirus/indexador no Windows, disco cheio, o que for) escapava como
+excecao nao tratada exatamente no momento em que um `RestoreResult` ja
+estava prestes a ser devolvido - a mesma classe de problema que a
+correcao anterior (P2) resolveu para `close_connections`/criacao da
+copia, agora reaparecendo um passo depois, na limpeza.
+
+Pior: no terceiro ponto (apos sucesso), o codigo anterior simplesmente
+chamava `unlink` e so DEPOIS montava o `RestoreResult(success=True, ...)`
+- se a limpeza falhasse ali, a excecao impedia esse `RestoreResult` de
+sequer ser construido, escondendo o fato de que a restauracao em si
+(troca de arquivo, migrations, integrity_check) tinha terminado com
+sucesso. Um erro de limpeza teria, na pratica, transformado uma
+restauracao bem-sucedida num erro cru sem mensagem nenhuma.
+
+**Decisao:** um helper novo, `_safe_unlink(path) -> str | None`
+(`persistence/restore.py`), encapsula a remocao - NUNCA levanta, devolve
+`None` em caso de sucesso (ou arquivo ja inexistente) ou uma string
+descrevendo a falha. Os tres pontos de limpeza passaram a usa-lo:
+
+- **Falha na preparacao + falha ao limpar a copia parcial:** a causa
+  original (por que a preparacao falhou) continua na mensagem; se a
+  limpeza tambem falhar, uma nota adicional e anexada ("remova
+  manualmente"). O resultado e SEMPRE `success=False` aqui - a troca
+  nunca comecou, entao o estado do banco ja determina isso,
+  independentemente da limpeza.
+- **Reversao bem-sucedida + falha ao limpar a copia que sobrou:** a
+  causa original (por que a restauracao falhou, forcando a reversao)
+  continua na mensagem, mais a nota de limpeza se aplicavel. O resultado
+  continua `success=False` - a restauracao em si falhou (foi so
+  revertida com sucesso), isso nao muda com uma falha de limpeza.
+- **Restauracao bem-sucedida + falha ao limpar a copia que nao e mais
+  necessaria:** o resultado continua `success=True` e `integrity_ok=True`
+  - a troca, as migrations e a checagem de integridade jah terminaram
+  bem, o ESTADO DO BANCO e quem decide o resultado, nunca um detalhe de
+  limpeza. A mensagem de sucesso ganha uma nota informando que a copia de
+  seguranca sobrou em disco e precisa ser removida manualmente.
+
+Em nenhum dos tres casos uma excecao de `unlink` chega a escapar de
+`_restore_from_backup_locked` - e em nenhum dos tres a limpeza decide
+`success`/`success=False` no lugar do estado real do banco.
+
+Testado em `test_restore.py`:
+- `test_restore_readable_result_when_preparation_failure_and_its_cleanup_both_fail`
+  (injeta falha em `shutil.copy2` E em `Path.unlink` para a copia parcial
+  - confirma resultado legivel com as duas causas na mensagem, banco
+  original intacto).
+- `test_restore_readable_result_when_cleanup_after_successful_revert_fails`
+  (integrity_check forcado a falhar, reversao bem-sucedida, `Path.unlink`
+  falha so para a copia de seguranca - confirma `success=False` com a
+  causa original preservada, copia sobrevive em disco).
+- `test_restore_still_reports_success_when_cleanup_after_successful_restore_fails`
+  (restauracao real bem-sucedida, `Path.unlink` falha so para a copia de
+  seguranca - confirma `success=True`/`integrity_ok=True` apesar da falha
+  de limpeza, copia sobrevive em disco).
+
+**Limite honesto:** suite completa rodada 10 vezes seguidas em Linux,
+135/135 em todas (as 135 ja incluem os 3 testes novos). Confirmacao em
+Windows depende do usuario rodar a suite la, como em todas as correcoes
+anteriores desta serie.

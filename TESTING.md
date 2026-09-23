@@ -6,7 +6,7 @@
 python -m pytest -q
 ```
 
-Resultado atual: **132 testes**, 100% offline (nenhum teste faz chamada
+Resultado atual: **135 testes**, 100% offline (nenhum teste faz chamada
 de rede — `MockProvider` e usado em todos os cenarios que envolvem "IA",
 e `test_P11_offline_execution_fails_if_network_is_attempted` ativamente
 bloqueia qualquer tentativa de `socket.connect`/`create_connection`
@@ -16,11 +16,11 @@ durante o ciclo completo, falhando o teste se algo tentar).
 abaixo; NAO declare um numero como resultado valido para um SO que nao
 foi de fato executado nele):**
 
-- **Linux** (ambiente desta sessao): **132/132 passando**, tempo total
+- **Linux** (ambiente desta sessao): **135/135 passando**, tempo total
   ~3.3s. Rodado 10 vezes consecutivas apos a correcao mais recente (os
-  dois testes novos de falha na preparacao do restore inclusos em todas
-  as 10) sem nenhuma falha.
-- **Windows**: um usuario reportou e CONFIRMOU, em tres rodadas:
+  tres testes novos de falha na propria limpeza do restore inclusos em
+  todas as 10) sem nenhuma falha.
+- **Windows**: um usuario reportou e CONFIRMOU, em quatro rodadas:
   1. Apos o commit `1133ded` (pacote v0.2.2): 120/128 passando, 5 falhas
      em `test_restore.py` (`PermissionError: [WinError 5]`) - corrigido
      no commit `961b5b8` (ver "Correcao pos-entrega: restore quebrava no
@@ -32,18 +32,21 @@ foi de fato executado nele):**
      portao de concorrencia): **130/130 na suite completa e 12/12 em
      `test_restore.py` isolado, CONFIRMADO em Windows real** pelo mesmo
      usuario, via auditoria de codigo E execucao real.
-  A auditoria do commit `c4ce152` tambem encontrou um achado novo (P2:
-  falha na preparacao do restore - `close_connections()`/copia de
-  seguranca - escapava sem virar `RestoreResult`; ver "Correcao
-  pos-entrega: preparacao do restore nao entrava no tratamento de falha"
-  em DECISIONS.md), corrigido nesta revisao (132 testes, os dois novos
-  exercitando exatamente os dois pontos relatados). Esta correcao mais
-  recente foi validada em Linux (10 execucoes consecutivas), mas **ainda
-  nao foi executada num Windows real** - isso depende do usuario
-  confirmar. Ate essa confirmacao chegar, trate "132/132" como "corrigido
-  no codigo e validado em Linux, pendente de confirmacao em Windows" para
-  ESTA correcao especifica - nao como um resultado ja observado em
-  Windows.
+  4. Apos o commit `c3b9bcb` (P2: preparacao do restore entrando no
+     tratamento de falha): **132/132 CONFIRMADO em Windows real** pelo
+     mesmo usuario, via auditoria de codigo (sem alterar o repositorio).
+  Essa mesma auditoria do commit `c3b9bcb` encontrou um achado novo (a
+  propria LIMPEZA da copia de seguranca, em tres pontos, podia escapar
+  como excecao ou ocultar um resultado de sucesso; ver "Correcao
+  pos-entrega: falha na propria limpeza da copia de seguranca podia
+  escapar ou ocultar o resultado" em DECISIONS.md), corrigido nesta
+  revisao (135 testes, os tres novos exercitando exatamente os tres
+  pontos relatados). Esta correcao mais recente foi validada em Linux (10
+  execucoes consecutivas), mas **ainda nao foi executada num Windows
+  real** - isso depende do usuario confirmar. Ate essa confirmacao
+  chegar, trate "135/135" como "corrigido no codigo e validado em Linux,
+  pendente de confirmacao em Windows" para ESTA correcao especifica - nao
+  como um resultado ja observado em Windows.
 - **macOS**: nunca foi executado nesta ou em rodadas anteriores; sem
   dados. O mecanismo de `os.replace` deveria se comportar como Linux
   (semantica POSIX de `rename()`), mas isso e inferencia, nao um
@@ -65,7 +68,7 @@ foi de fato executado nele):**
 | `test_orchestration.py` | ciclo completo via `SessionOrchestrator` com MockProvider; primeiro card FSRS nasce pelo fluxo NORMAL da aplicacao (banco novo, sem `is_planned_recall=True` setado no teste, so a sequencia real de chamadas ate o Decisor escolher SCHEDULE_RECALL, com relogio controlado via `now=`); atividade comum NAO chama FSRS; double-submit no nivel de orquestracao | 3 |
 | `test_integrity.py` | ciclo de pre-requisitos rejeitado na escrita (+ defesa por integrity_check contra bypass via SQL bruto), referencia pendurada, consistencia de geracao (multiplas geracoes 'active'), consistencia memory_state x memory_review_log | 6 |
 | `test_backup.py` | snapshot consistente e restauravel, falha de backup nao apaga estado, retencao mantem so os N mais recentes | 3 |
-| `test_restore.py` | restore real substitui e recupera o banco, snapshot invalido e rejeitado sem tocar no banco ativo, falha pos-troca reverte automaticamente, politica de backup automatico respeita intervalo minimo, WAL genuinamente ativo e achatado antes da troca, conexao concorrente detectada e recusada sem tocar em arquivos, reversao limpa com WAL ativo, NENHUMA conexao sqlite3 aberta no instante do `os.replace` (a causa raiz do bug relatado no Windows), o portao da aplicacao liga durante a operacao e sempre desliga depois, dupla falha (restauracao + reversao) nunca levanta excecao e preserva a copia de seguranca, uma SEGUNDA restauracao concorrente e rejeitada na hora (threads reais), uma requisicao com conexao ja aberta impede a restauracao de tocar arquivos ate fechar, falha em `close_connections()` na preparacao vira `RestoreResult` legivel sem tentar reverter, falha na criacao da copia de seguranca na preparacao idem | 14 |
+| `test_restore.py` | restore real substitui e recupera o banco, snapshot invalido e rejeitado sem tocar no banco ativo, falha pos-troca reverte automaticamente, politica de backup automatico respeita intervalo minimo, WAL genuinamente ativo e achatado antes da troca, conexao concorrente detectada e recusada sem tocar em arquivos, reversao limpa com WAL ativo, NENHUMA conexao sqlite3 aberta no instante do `os.replace` (a causa raiz do bug relatado no Windows), o portao da aplicacao liga durante a operacao e sempre desliga depois, dupla falha (restauracao + reversao) nunca levanta excecao e preserva a copia de seguranca, uma SEGUNDA restauracao concorrente e rejeitada na hora (threads reais), uma requisicao com conexao ja aberta impede a restauracao de tocar arquivos ate fechar, falha em `close_connections()` na preparacao vira `RestoreResult` legivel sem tentar reverter, falha na criacao da copia de seguranca na preparacao idem, falha na propria LIMPEZA da copia de seguranca (apos falha na preparacao, apos reversao bem-sucedida, apos restauracao bem-sucedida) nunca escapa nem oculta o resultado real | 17 |
 | `test_seed_english_graph.py` | seed idempotente, sem ciclos, todas as referencias validas | 3 |
 | `test_web.py` | fluxo HTTP completo (start -> next -> answer -> next -> end), paginas de mapa/auditoria, backup manual via UI, falha de restore mostrada ao usuario na pagina de auditoria, requisicao HTTP recebe 503 se chegar enquanto uma restauracao esta em andamento | 5 |
 | `test_redteam.py` | **P1-P11**, um teste por item do pacote de correcao v0.2 (ver abaixo) | 11 |
@@ -200,11 +203,30 @@ pos-entrega: preparacao do restore nao entrava no tratamento de falha" em
 | 1 | Falha em `close_connections()` na preparacao vira `RestoreResult(success=False, ...)` legivel, sem excecao escapando, sem tentar reverter (a troca nunca comecou) | `test_restore.py::test_restore_returns_readable_result_when_close_connections_fails` |
 | 2 | Falha na criacao da copia de seguranca (`shutil.copy2`) na preparacao idem | `test_restore.py::test_restore_returns_readable_result_when_safety_copy_creation_fails` |
 
+Rodados 10 vezes consecutivas em Linux sem falha. Confirmado pelo usuario
+em Windows real apos esta correcao (commit `c3b9bcb`): **132/132**.
+
+## Correcao pos-entrega: falha na propria limpeza da copia de seguranca podia escapar ou ocultar o resultado
+
+Na mesma auditoria (do commit `c3b9bcb`, sem executar nada), o usuario
+encontrou que os tres pontos onde a copia de seguranca e removida
+(`safety_copy.unlink(...)`) chamavam `unlink` direto, sem tratamento -
+uma falha ali podia escapar como excecao nao tratada, e no caso da
+limpeza APOS uma restauracao bem-sucedida, ate impedir que o
+`RestoreResult(success=True, ...)` fosse sequer construido, ocultando um
+sucesso real por tras de um erro de limpeza. Ver secao "Correcao
+pos-entrega: falha na propria limpeza da copia de seguranca podia escapar
+ou ocultar o resultado" em `DECISIONS.md` para a decisao completa (helper
+`_safe_unlink`, nunca levanta).
+
+| # | Requisito | Teste principal |
+|---|---|---|
+| 1 | Falha na preparacao + falha ao limpar a copia parcial: causa original preservada, nota de limpeza anexada, `success=False` (a troca nunca comecou) | `test_restore.py::test_restore_readable_result_when_preparation_failure_and_its_cleanup_both_fail` |
+| 2 | Reversao bem-sucedida + falha ao limpar a copia que sobrou: causa original preservada, `success=False` (a restauracao em si falhou) | `test_restore.py::test_restore_readable_result_when_cleanup_after_successful_revert_fails` |
+| 3 | Restauracao bem-sucedida + falha ao limpar a copia que sobrou: `success=True`/`integrity_ok=True` (o estado do banco decide, nao a limpeza) | `test_restore.py::test_restore_still_reports_success_when_cleanup_after_successful_restore_fails` |
+
 Rodados 10 vezes consecutivas em Linux sem falha. Validacao em Windows
-ainda pendente (ver "Como rodar" acima). A protecao contra processos
-externos ao SO continua sendo a limitacao ja documentada abaixo - esta
-correcao e so sobre nao deixar excecoes escaparem do tratamento de erro
-do proprio processo.
+ainda pendente (ver "Como rodar" acima).
 
 ## O que NAO esta coberto (limitacoes de teste, nao so de produto)
 

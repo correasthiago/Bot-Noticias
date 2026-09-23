@@ -319,6 +319,24 @@ def _revert_to_safety_copy(db_path: Path, safety_copy: Path | None, had_previous
     return None
 
 
+def _safe_unlink(path: Path) -> str | None:
+    """Remove `path` sem NUNCA levantar - sexta auditoria pos-entrega:
+    a limpeza da copia de seguranca (apos sucesso, apos reversao bem
+    sucedida, ou de uma copia parcial apos falha na propria preparacao)
+    acontecia via `Path.unlink` direto, sem tratamento proprio - uma
+    falha ali (permissao, arquivo em uso por antivirus/indexador no
+    Windows, etc.) escapava por cima de um `RestoreResult` que ja estava
+    prestes a ser devolvido. Devolve None quando a remocao deu certo (ou
+    o arquivo ja nao existia), ou uma mensagem legivel descrevendo a
+    falha de limpeza - NUNCA propaga a excecao."""
+
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        return str(exc)
+    return None
+
+
 def restore_from_backup(
     db_path: str | Path,
     backup_path: str | Path,
@@ -379,12 +397,17 @@ def _restore_from_backup_locked(
                 safety_copy = db_path.with_name(db_path.name + f".pre-restore-{utc_now().strftime('%Y%m%dT%H%M%S%f')}")
                 shutil.copy2(db_path, safety_copy)
         except Exception as prep_exc:  # noqa: BLE001 - fronteira externa deliberada
+            message = f"restauracao abortada antes de tocar o banco ativo: {prep_exc}"
             if safety_copy is not None:
-                safety_copy.unlink(missing_ok=True)
-            return RestoreResult(
-                success=False,
-                message=f"restauracao abortada antes de tocar o banco ativo: {prep_exc}",
-            )
+                cleanup_error = _safe_unlink(safety_copy)
+                if cleanup_error is not None:
+                    message += (
+                        f" (falha adicional ao limpar a copia parcial em {safety_copy}: "
+                        f"{cleanup_error} - remova manualmente)"
+                    )
+            # a troca do banco nunca comecou - o resultado e sempre falha,
+            # independente da limpeza ter dado certo ou nao.
+            return RestoreResult(success=False, message=message)
 
         try:
             # Nenhuma conexao sqlite3 deste processo esta aberta em
@@ -406,11 +429,34 @@ def _restore_from_backup_locked(
             revert_failure = _revert_to_safety_copy(db_path, safety_copy, had_previous_db)
             if revert_failure is not None:
                 return RestoreResult(success=False, message=f"restauracao falhou ({exc}). {revert_failure}")
+            # a reversao terminou com sucesso: `db_path` ja esta de volta ao
+            # estado anterior. O que resta e so limpar a copia de seguranca
+            # que nao e mais necessaria - uma falha NESSA limpeza nao muda o
+            # fato de que a tentativa de restauracao falhou (e por isso o
+            # resultado continua success=False), so precisa ficar registrada
+            # em vez de escapar como excecao ou apagar a copia silenciosamente.
+            message = f"restauracao falhou e foi revertida: {exc}"
             if safety_copy is not None:
-                safety_copy.unlink(missing_ok=True)
-            return RestoreResult(success=False, message=f"restauracao falhou e foi revertida: {exc}")
+                cleanup_error = _safe_unlink(safety_copy)
+                if cleanup_error is not None:
+                    message += (
+                        f" (a copia de seguranca em {safety_copy} nao pode ser removida apos a "
+                        f"reversao: {cleanup_error} - remova manualmente)"
+                    )
+            return RestoreResult(success=False, message=message)
         else:
+            # a troca, as migrations e a checagem de integridade terminaram
+            # com sucesso - o banco ESTA restaurado corretamente. Uma falha
+            # ao limpar a copia de seguranca sobressalente e so um problema
+            # de limpeza, nunca motivo para reportar a restauracao como
+            # tendo falhado (o estado final do banco e quem decide isso).
+            success_message = "restauracao concluida com sucesso"
             if safety_copy is not None:
-                safety_copy.unlink(missing_ok=True)
+                cleanup_error = _safe_unlink(safety_copy)
+                if cleanup_error is not None:
+                    success_message += (
+                        f" (a copia de seguranca em {safety_copy} nao pode ser removida: "
+                        f"{cleanup_error} - remova manualmente)"
+                    )
 
-    return RestoreResult(success=True, message="restauracao concluida com sucesso", integrity_ok=True)
+    return RestoreResult(success=True, message=success_message, integrity_ok=True)

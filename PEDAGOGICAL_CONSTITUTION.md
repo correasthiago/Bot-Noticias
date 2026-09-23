@@ -349,3 +349,30 @@ reforcos que essa auditoria tornou explicitos.
     mudou)
     (`test_restore_returns_readable_result_when_close_connections_fails`,
     `test_restore_returns_readable_result_when_safety_copy_creation_fails`).
+
+34. **Uma falha de LIMPEZA nunca decide o resultado no lugar do estado
+    real do sistema, e nunca escapa da mesma fronteira que o Principio 33
+    ja protegia.**
+    O mesmo usuario, auditando o codigo do Principio 33 sem executar nada,
+    encontrou que os tres pontos onde a copia de seguranca do restore e
+    removida (`safety_copy.unlink(...)`) chamavam a remocao direto, sem
+    tratamento proprio - uma falha ali podia escapar como excecao nao
+    tratada, e, no ponto mais critico, podia ocorrer DEPOIS que a
+    restauracao ja tinha terminado com sucesso (troca, migrations e
+    integrity_check todos bem-sucedidos): uma excecao ali impediria o
+    `RestoreResult(success=True, ...)` de sequer ser construido,
+    escondendo um sucesso real por tras de um detalhe de limpeza. A
+    correcao isolou a remocao num helper que nunca levanta
+    (`_safe_unlink`) e fez o `RestoreResult` em cada um dos tres pontos
+    (falha de preparacao, reversao bem-sucedida, restauracao
+    bem-sucedida) refletir o ESTADO REAL DO BANCO naquele ponto - nunca o
+    sucesso ou falha da limpeza em si: falha na preparacao continua
+    `success=False` mesmo que a limpeza tambem falhe (nada foi trocado);
+    reversao bem-sucedida continua `success=False` (a restauracao falhou,
+    so foi revertida) mesmo que a copia sobrando nao possa ser removida;
+    e restauracao bem-sucedida continua `success=True` mesmo que a copia
+    de seguranca sobressalente nao possa ser removida - so ganha uma nota
+    na mensagem pedindo remocao manual
+    (`test_restore_readable_result_when_preparation_failure_and_its_cleanup_both_fail`,
+    `test_restore_readable_result_when_cleanup_after_successful_revert_fails`,
+    `test_restore_still_reports_success_when_cleanup_after_successful_restore_fails`).

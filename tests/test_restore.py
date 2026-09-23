@@ -574,6 +574,163 @@ def test_restore_returns_readable_result_when_safety_copy_creation_fails(tmp_pat
     untouched.close()
 
 
+def test_restore_readable_result_when_preparation_failure_and_its_cleanup_both_fail(
+    tmp_path: Path, monkeypatch
+):
+    """Achado remanescente da setima auditoria pos-entrega (P2): quando a
+    criacao da copia de seguranca falha E a limpeza da copia parcial
+    TAMBEM falha, o `RestoreResult` ainda precisa ser devolvido de forma
+    legivel - a causa original (falha ao criar a copia) tem que
+    permanecer visivel na mensagem, e a falha de limpeza vira uma nota
+    adicional, nunca uma excecao que escapa por cima do resultado."""
+
+    import central_universal.persistence.restore as restore_module
+
+    db_path = tmp_path / "central.db"
+    conn = connect(db_path)
+    run_migrations(conn)
+    repos = Repositories(conn)
+    original_learner = Learner(id=new_id(), display_name="Intocado", created_at=utc_now_iso())
+    repos.learners.insert(original_learner)
+    backup_event = create_backup(conn, repos, backup_dir=tmp_path / "backups")
+    assert backup_event.success is True
+    conn.close()
+
+    def failing_copy2(src, dst, *args, **kwargs):
+        if "pre-restore" in str(dst):
+            raise OSError("falha simulada ao criar a copia de seguranca")
+        raise AssertionError("copy2 chamado de forma inesperada antes da copia de seguranca")
+
+    monkeypatch.setattr(restore_module.shutil, "copy2", failing_copy2)
+
+    real_unlink = Path.unlink
+
+    def failing_unlink(self, *args, **kwargs):
+        if "pre-restore" in str(self):
+            raise OSError("falha simulada ao remover a copia parcial")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", failing_unlink)
+
+    result = restore_from_backup(db_path, backup_event.backup_path)  # nunca deve levantar excecao
+
+    assert result.success is False
+    assert "antes de tocar o banco ativo" in result.message  # causa original preservada
+    assert "falha simulada ao criar a copia de seguranca" in result.message
+    assert "nao pode ser removida" in result.message.lower() or "remova manualmente" in result.message.lower()
+
+    assert restore_module.is_restore_in_progress() is False
+
+    untouched = connect(db_path)
+    assert Repositories(untouched).learners.get(original_learner.id) is not None
+    untouched.close()
+
+
+def test_restore_readable_result_when_cleanup_after_successful_revert_fails(tmp_path: Path, monkeypatch):
+    """Mesmo achado, segundo ponto: se a reversao (apos falha na propria
+    restauracao) terminar com sucesso mas a limpeza da copia de seguranca
+    que sobrou falhar, o resultado continua devolvendo `success=False`
+    (a restauracao em si falhou - foi so revertida), com a causa original
+    do `except Exception as exc` preservada e uma nota sobre a falha de
+    limpeza anexada - nunca uma excecao escapando por cima disso."""
+
+    db_path = tmp_path / "central.db"
+    conn = connect(db_path)
+    run_migrations(conn)
+    repos = Repositories(conn)
+    original_learner = Learner(id=new_id(), display_name="Fica", created_at=utc_now_iso())
+    repos.learners.insert(original_learner)
+
+    other_db = tmp_path / "other.db"
+    other_conn = connect(other_db)
+    run_migrations(other_conn)
+    other_conn.close()
+
+    conn.close()
+
+    import central_universal.persistence.restore as restore_module
+
+    def fake_run_all(_repos):
+        class _FakeReport:
+            ok = False
+            findings = [type("F", (), {"severity": "error", "message": "forcado no teste"})()]
+
+        return _FakeReport()
+
+    monkeypatch.setattr(restore_module, "run_all", fake_run_all)
+
+    real_unlink = Path.unlink
+
+    def failing_unlink(self, *args, **kwargs):
+        if "pre-restore" in str(self):
+            raise OSError("falha simulada ao remover a copia apos reversao bem-sucedida")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", failing_unlink)
+
+    result = restore_from_backup(db_path, other_db)  # nunca deve levantar excecao
+
+    assert result.success is False
+    assert "revertida" in result.message  # causa original (integrity_check falhou + reversao) preservada
+    assert "nao pode ser removida" in result.message.lower() or "remova manualmente" in result.message.lower()
+    assert restore_module.is_restore_in_progress() is False
+
+    reverted = connect(db_path)
+    assert Repositories(reverted).learners.get(original_learner.id) is not None
+    reverted.close()
+
+    # a copia de seguranca sobrevive no disco - a limpeza falhou de verdade
+    safety_copies = list(tmp_path.glob("central.db.pre-restore-*"))
+    assert len(safety_copies) == 1
+
+
+def test_restore_still_reports_success_when_cleanup_after_successful_restore_fails(
+    tmp_path: Path, monkeypatch
+):
+    """Mesmo achado, ponto central: uma falha de LIMPEZA nao pode ocultar
+    que a restauracao em si deu certo. Se a troca, as migrations e a
+    checagem de integridade terminaram bem, mas so a remocao da copia de
+    seguranca sobressalente falhar, o resultado precisa continuar
+    reportando `success=True` - o estado final do banco e quem decide o
+    resultado, nao um detalhe de limpeza."""
+
+    db_path = tmp_path / "central.db"
+    conn = connect(db_path)
+    run_migrations(conn)
+    repos = Repositories(conn)
+    learner = Learner(id=new_id(), display_name="Restaurado com sucesso", created_at=utc_now_iso())
+    repos.learners.insert(learner)
+    backup_event = create_backup(conn, repos, backup_dir=tmp_path / "backups")
+    assert backup_event.success is True
+    conn.close()
+
+    import central_universal.persistence.restore as restore_module
+
+    real_unlink = Path.unlink
+
+    def failing_unlink(self, *args, **kwargs):
+        if "pre-restore" in str(self):
+            raise OSError("falha simulada ao remover a copia apos restauracao bem-sucedida")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", failing_unlink)
+
+    result = restore_from_backup(db_path, backup_event.backup_path)  # nunca deve levantar excecao
+
+    assert result.success is True  # a restauracao em si deu certo
+    assert result.integrity_ok is True
+    assert "nao pode ser removida" in result.message.lower() or "remova manualmente" in result.message.lower()
+    assert restore_module.is_restore_in_progress() is False
+
+    restored = connect(db_path)
+    assert Repositories(restored).learners.get(learner.id) is not None
+    restored.close()
+
+    # a copia de seguranca sobrevive no disco - a limpeza falhou de verdade
+    safety_copies = list(tmp_path.glob("central.db.pre-restore-*"))
+    assert len(safety_copies) == 1
+
+
 def test_maybe_run_automatic_backup_respects_min_interval(tmp_path: Path):
     db_path = tmp_path / "central.db"
     conn = connect(db_path)
