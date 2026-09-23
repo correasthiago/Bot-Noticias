@@ -314,7 +314,7 @@ def test_ineligible_memory_review_shows_reason_never_a_retry_button(tmp_path, mo
 
         page = client.get(answer_resp.headers["location"])
         assert page.status_code == 200
-        assert "e elegivel para uma" in page.text
+        assert "Revisoes de memoria nao recuperaveis" in page.text
         assert "intervalo" in page.text.lower()
         assert "Tentar revisao de memoria novamente" not in page.text
 
@@ -322,7 +322,7 @@ def test_ineligible_memory_review_shows_reason_never_a_retry_button(tmp_path, mo
         # elegibilidade e permanente para esta interacao especifica.
         again_resp = client.post(f"/session/{session.id}/answer", data=answer_data, follow_redirects=False)
         again_page = client.get(again_resp.headers["location"])
-        assert "e elegivel para uma" in again_page.text
+        assert "Revisoes de memoria nao recuperaveis" in again_page.text
         assert "Tentar revisao de memoria novamente" not in again_page.text
 
 
@@ -447,6 +447,151 @@ def test_pending_memory_review_stays_reachable_after_advancing_to_next_activity(
         conn2 = deps_module.connect(deps_module.DB_PATH)
         repos2 = Repositories(conn2)
         assert len(repos2.memory_observations.list_for_competency(competency_id)) == 1  # nao duplicou
+        conn2.close()
+
+
+def test_superseded_memory_review_becomes_unrecoverable_not_silently_lost(tmp_path, monkeypatch):
+    """Achado remanescente da decima primeira auditoria pos-entrega: uma
+    revisao A falha e fica pendente/recuperavel; o usuario avanca; uma
+    revisao B POSTERIOR da MESMA competencia e registrada com sucesso,
+    avancando o card FSRS. Recalcular a elegibilidade de A nesse ponto
+    usa o `memory_state.last_review_at` ATUAL (de B, mais recente) - o
+    intervalo de A em relacao a essa revisao fica NEGATIVO (A aconteceu
+    ANTES de B), e a checagem generica de 'intervalo minimo' excluiria A
+    silenciosamente da lista de pendencias, sem nenhum registro explicito
+    do motivo. Este teste confirma que A NUNCA some sem explicacao: ela
+    migra para a lista de revisoes NAO RECUPERAVEIS, com um motivo
+    auditavel que deixa claro que foi SUPERADA por uma revisao mais
+    recente - nunca aplicada fora de ordem ao card, e nunca com um botao
+    de retentativa que nao levaria a lugar nenhum."""
+
+    with _fresh_client(tmp_path, monkeypatch) as client:
+        client.get("/")
+
+        from datetime import datetime, timedelta, timezone
+
+        import central_universal.memory.fsrs_adapter as fsrs_adapter_module
+        import central_universal.web.deps as deps_module
+        from central_universal.domain.clock import utc_now_iso
+        from central_universal.domain.entities import Activity, LearningSession
+        from central_universal.domain.enums import DecisionType, HelpLevel, ProductionResult, SessionStatus
+        from central_universal.domain.ids import new_id
+        from central_universal.memory.fsrs_adapter import MemoryReviewError
+        from central_universal.orchestration.session_service import SessionOrchestrator
+        from central_universal.persistence.repositories import Repositories
+        from central_universal.providers.mock import MockProvider
+
+        conn = deps_module.connect(deps_module.DB_PATH)
+        repos = Repositories(conn)
+        learner = repos.learners.list_all()[0]
+        competency_id = repos.competencies.list_all()[0].id
+        rule_version = repos.active_rule_version.get()
+
+        session = LearningSession(
+            id=new_id(), learner_id=learner.id, started_at=utc_now_iso(), status=SessionStatus.ACTIVE
+        )
+        repos.sessions.insert(session)
+
+        priming_orchestrator = SessionOrchestrator(repos, MockProvider(), rule_version, backup_dir=tmp_path / "backups")
+        priming_activity = Activity(
+            id=new_id(),
+            session_id=session.id,
+            competency_targets=[competency_id],
+            activity_type=DecisionType.MINIMAL_EXPLANATION.value,
+            prompt="Atividade de priming",
+            support_level=HelpLevel.A0,
+            created_at=utc_now_iso(),
+            tutor_provider_event_id=None,
+            is_planned_recall=False,
+        )
+        repos.activities.insert(priming_activity)
+        priming_orchestrator.submit_interaction(
+            activity_id=priming_activity.id, session_id=session.id, idempotency_key=new_id(),
+            learner_input="resposta de priming", help_level=HelpLevel.A0,
+            production_result=ProductionResult.SPONTANEOUS_CORRECT, tutor_output_text="",
+            now=datetime.now(timezone.utc) - timedelta(hours=2),
+        )
+
+        activity_a = Activity(
+            id=new_id(),
+            session_id=session.id,
+            competency_targets=[competency_id],
+            activity_type=DecisionType.SCHEDULE_RECALL.value,
+            prompt="Revisao A (vai falhar)",
+            support_level=HelpLevel.A0,
+            created_at=utc_now_iso(),
+            tutor_provider_event_id=None,
+            is_planned_recall=True,
+        )
+        repos.activities.insert(activity_a)
+        activity_b = Activity(
+            id=new_id(),
+            session_id=session.id,
+            competency_targets=[competency_id],
+            activity_type=DecisionType.SCHEDULE_RECALL.value,
+            prompt="Revisao B (vai funcionar, depois de A)",
+            support_level=HelpLevel.A0,
+            created_at=utc_now_iso(),
+            tutor_provider_event_id=None,
+            is_planned_recall=True,
+        )
+        repos.activities.insert(activity_b)
+        conn.close()
+
+        # A falha (FSRS forcado a devolver MemoryReviewError).
+        real_observe_and_review = fsrs_adapter_module.MemoryAdapter.observe_and_review
+
+        def failing_observe_and_review(self, *args, **kwargs):
+            return MemoryReviewError(message="falha simulada no FSRS para A")
+
+        monkeypatch.setattr(fsrs_adapter_module.MemoryAdapter, "observe_and_review", failing_observe_and_review)
+
+        answer_a = {
+            "activity_id": activity_a.id,
+            "learner_input": "She has gone to school before.",
+            "help_level": "A0",
+            "production_result": "spontaneous_correct",
+            "idempotency_key": activity_a.id,
+        }
+        resp_a = client.post(f"/session/{session.id}/answer", data=answer_a, follow_redirects=False)
+        assert resp_a.status_code == 303
+        assert "memory_status=error" in resp_a.headers["location"]
+
+        # confirma que A esta RECUPERAVEL antes de B ser registrada.
+        before_b = client.get(f"/session/{session.id}")
+        assert "Tentar revisao de memoria novamente" in before_b.text
+
+        # o FSRS volta a funcionar - B e registrada com sucesso, MAIS
+        # RECENTE que A (submetida depois, em ordem real de wall-clock).
+        monkeypatch.setattr(fsrs_adapter_module.MemoryAdapter, "observe_and_review", real_observe_and_review)
+        answer_b = {
+            "activity_id": activity_b.id,
+            "learner_input": "She had already left when I arrived.",
+            "help_level": "A0",
+            "production_result": "spontaneous_correct",
+            "idempotency_key": activity_b.id,
+        }
+        resp_b = client.post(f"/session/{session.id}/answer", data=answer_b, follow_redirects=False)
+        assert resp_b.status_code == 303
+
+        # o destino de A: nunca mais some silenciosamente - migra para a
+        # lista de NAO RECUPERAVEIS, com motivo auditavel explicando que
+        # foi superada por uma revisao mais recente. NUNCA um botao de
+        # retentativa (aplicar A fora de ordem corromperia o card).
+        after_b = client.get(f"/session/{session.id}")
+        assert after_b.status_code == 200
+        assert "Tentar revisao de memoria novamente" not in after_b.text
+        assert "Revisoes de memoria nao recuperaveis" in after_b.text
+        assert "Revisao A (vai falhar)" in after_b.text
+        assert "anterior a ultima revisao" in after_b.text
+
+        # A NUNCA foi aplicada ao card - so a revisao de B existe.
+        conn2 = deps_module.connect(deps_module.DB_PATH)
+        repos2 = Repositories(conn2)
+        assert len(repos2.memory_observations.list_for_competency(competency_id)) == 1
+        observation = repos2.memory_observations.list_for_competency(competency_id)[0]
+        raw_interaction_b = repos2.raw_interactions.get_by_idempotency_key(activity_b.id)
+        assert observation.raw_interaction_id == raw_interaction_b.id
         conn2.close()
 
 

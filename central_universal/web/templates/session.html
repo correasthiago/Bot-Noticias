@@ -32,6 +32,23 @@
 </div>
 {% endif %}
 
+{% if unrecoverable_memory_reviews %}
+<div class="card">
+  <p><strong>Revisoes de memoria nao recuperaveis</strong> - estas
+     tentativas de recuperacao planejada nunca chegaram a gerar uma
+     revisao (FSRS) e nao sao mais elegiveis para uma. Registradas aqui
+     para auditoria, nunca silenciosamente descartadas.</p>
+  <ul>
+    {% for lost in unrecoverable_memory_reviews %}
+    <li>
+      <span>{{ lost.activity.prompt }} ({{ lost.interaction.learner_input }}):</span>
+      {{ lost.reason }}
+    </li>
+    {% endfor %}
+  </ul>
+</div>
+{% endif %}
+
 {% if not activity %}
   <p>Nenhuma atividade ainda.</p>
   <form method="post" action="/session/{{ session.id }}/next">
@@ -74,14 +91,6 @@
       <p><strong>Ajuda:</strong> {{ interaction.help_level.value }} &middot;
          <strong>Resultado:</strong> {{ interaction.production_result.value }}</p>
     </div>
-
-    {% if memory_review_reason %}
-    <div class="card">
-      <p>Esta recuperacao nao gerou uma revisao de memoria (FSRS) e NAO
-         e elegivel para uma: {{ memory_review_reason }}. Nao ha nada a
-         tentar de novo para esta tentativa especifica.</p>
-    </div>
-    {% endif %}
 
     {% if dimension_states %}
     <h3>Estado atual da competencia</h3>

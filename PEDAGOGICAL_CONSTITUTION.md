@@ -495,3 +495,28 @@ reforcos que essa auditoria tornou explicitos.
     ainda recuperavel de QUALQUER atividade da sessao - nao so a atual
     (`test_ineligible_memory_review_shows_reason_never_a_retry_button`,
     `test_pending_memory_review_stays_reachable_after_advancing_to_next_activity`).
+
+40. **Uma revisao superada por outra mais recente nunca e aplicada fora
+    de ordem, e nunca desaparece sem deixar um motivo auditavel - "nao
+    elegivel" e um estado permanente que precisa de registro, nao um
+    silenciamento.**
+    O usuario reproduziu o caso que faltava: uma revisao A (planejada)
+    falha e fica recuperavel; depois, uma revisao B POSTERIOR da MESMA
+    competencia e registrada com sucesso, avancando o `memory_state` do
+    card FSRS. Recalcular a elegibilidade de A nesse momento usa
+    `memory_state.last_review_at` (agora de B, mais recente) - o
+    intervalo de A fica NEGATIVO. A checagem generica de "intervalo
+    minimo" ja recusava corretamente aplicar A ao card (`eligible=False`
+    - o Principio 39 ja garantia isso), mas com dois problemas: a
+    mensagem era a mesma de "intervalo curto demais", so que com um
+    numero negativo confuso, sem deixar claro que a causa e outra
+    (superacao por revisao mais recente, nunca "tentou rapido demais"); e
+    a interface, que so listava atividades ELEGIVEIS, deixava A
+    simplesmente desaparecer da pagina assim que ficava inelegivel - sem
+    nenhum registro do que aconteceu com ela. A correcao deu ao caso
+    "anterior a ultima revisao ja registrada" um motivo proprio e
+    auditavel em `evaluate_recall_eligibility`, e fez a interface
+    classificar TODA interacao de recuperacao planejada sem
+    `MemoryObservation` em RECUPERAVEL (com retentativa) ou NAO
+    RECUPERAVEL (motivo mostrado, nunca um botao) - nunca omitida
+    (`test_superseded_memory_review_becomes_unrecoverable_not_silently_lost`).

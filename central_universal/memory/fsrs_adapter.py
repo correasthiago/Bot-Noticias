@@ -255,6 +255,27 @@ def evaluate_recall_eligibility(
     interval_seconds: float | None = None
     if memory_state is not None and memory_state.last_review_at:
         interval_seconds = (reference - parse_iso(memory_state.last_review_at)).total_seconds()
+        # Decima primeira auditoria pos-entrega: `memory_state.last_review_at`
+        # reflete a revisao MAIS RECENTE ja aplicada ao card - que pode ter
+        # vindo de uma tentativa DIFERENTE (e posterior) desta mesma
+        # competencia, nunca necessariamente a tentativa que estamos
+        # avaliando agora. Se esta tentativa e CRONOLOGICAMENTE ANTERIOR a
+        # essa ultima revisao (`interval_seconds < 0`), ela foi SUPERADA -
+        # aplica-la ao card agora seria uma revisao fora de ordem
+        # (`review_datetime` retroativo), que o FSRS nunca foi desenhado
+        # para aceitar e corromperia o historico do card. Isso e uma causa
+        # PERMANENTE e estruturalmente DIFERENTE de "intervalo curto
+        # demais" (que e sobre duas tentativas rapidas demais em sequencia
+        # normal) - merece um motivo auditavel proprio, nunca a mesma
+        # mensagem generica com um numero negativo confuso.
+        if interval_seconds < 0:
+            return MemoryObservationEligibility(
+                False,
+                f"esta tentativa ({to_utc_iso(reference)}) e anterior a ultima revisao ja "
+                f"registrada para esta competencia ({memory_state.last_review_at}) - uma revisao "
+                "mais recente ja foi aplicada ao card; aplicar esta agora seria fora de ordem e "
+                "corromperia o historico do FSRS. Nao recuperavel - so a revisao mais recente conta.",
+            )
         if interval_seconds < config.recall_min_interval_seconds:
             return MemoryObservationEligibility(
                 False,

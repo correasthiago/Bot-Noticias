@@ -6,7 +6,7 @@
 python -m pytest -q
 ```
 
-Resultado atual: **142 testes**, 100% offline (nenhum teste faz chamada
+Resultado atual: **143 testes**, 100% offline (nenhum teste faz chamada
 de rede — `MockProvider` e usado em todos os cenarios que envolvem "IA",
 e `test_P11_offline_execution_fails_if_network_is_attempted` ativamente
 bloqueia qualquer tentativa de `socket.connect`/`create_connection`
@@ -16,12 +16,11 @@ durante o ciclo completo, falhando o teste se algo tentar).
 abaixo; NAO declare um numero como resultado valido para um SO que nao
 foi de fato executado nele):**
 
-- **Linux** (ambiente desta sessao): **142/142 passando**, tempo total
-  ~3.5s. Rodado 10 vezes consecutivas apos a correcao mais recente (os
-  dois testes novos - distincao entre "nao elegivel" e "recuperavel",
-  revisao pendente acessivel apos avancar de atividade - inclusos em
-  todas as 10) sem nenhuma falha.
-- **Windows**: um usuario reportou e CONFIRMOU, em sete rodadas:
+- **Linux** (ambiente desta sessao): **143/143 passando**, tempo total
+  ~3.6s. Rodado 10 vezes consecutivas apos a correcao mais recente (o
+  teste novo - revisao superada por uma mais recente nunca some
+  silenciosamente - incluso em todas as 10) sem nenhuma falha.
+- **Windows**: um usuario reportou e CONFIRMOU, em oito rodadas:
   1. Apos o commit `1133ded` (pacote v0.2.2): 120/128 passando, 5 falhas
      em `test_restore.py` (`PermissionError: [WinError 5]`) - corrigido
      no commit `961b5b8` (ver "Correcao pos-entrega: restore quebrava no
@@ -46,20 +45,23 @@ foi de fato executado nele):**
      recuperacao visivel via web): **140/140 CONFIRMADO em Windows real**
      pelo mesmo usuario, via auditoria de codigo (sem alterar o
      repositorio).
-  Essa mesma auditoria do commit `0902a2f` encontrou mais duas lacunas
-  especificamente na INTERFACE da correcao P2 (o servico ja estava
-  correto): o botao de retentativa aparecia mesmo para tentativas
-  PERMANENTEMENTE nao elegiveis, sem explicar o motivo; e avancar para
-  outra atividade escondia o acesso a uma revisao ainda recuperavel de
-  uma atividade anterior - ver "Correcao pos-entrega: interface nao
-  distinguia 'nao elegivel' de 'recuperavel', e perdia acesso a revisoes
-  pendentes ao avancar (P2 na interface)" em DECISIONS.md. Corrigido
-  nesta revisao (142 testes, dois novos). Esta correcao mais recente foi
-  validada em Linux (10 execucoes consecutivas), mas **ainda nao foi
-  executada num Windows real** - isso depende do usuario confirmar. Ate
-  essa confirmacao chegar, trate "142/142" como "corrigido no codigo e
-  validado em Linux, pendente de confirmacao em Windows" para ESTA
-  correcao especifica - nao como um resultado ja observado em Windows.
+  8. Apos o commit `c756e29` (interface distingue "nao elegivel" de
+     "recuperavel" e mantem revisoes pendentes acessiveis apos avancar):
+     **142/142 CONFIRMADO em Windows real** pelo mesmo usuario, via
+     auditoria de codigo (sem alterar o repositorio).
+  Essa mesma auditoria do commit `c756e29` encontrou mais um caso: uma
+  revisao A que falha e depois e SUPERADA por uma revisao B mais recente
+  da mesma competencia desaparecia da pagina sem nenhum registro do
+  motivo (a checagem de intervalo minimo a excluia silenciosamente, com
+  um intervalo negativo confuso) - ver "Correcao pos-entrega: uma revisao
+  superada por outra mais recente sumia sem registro explicito (P2, ordem
+  temporal)" em DECISIONS.md. Corrigido nesta revisao (143 testes, um
+  novo). Esta correcao mais recente foi validada em Linux (10 execucoes
+  consecutivas), mas **ainda nao foi executada num Windows real** - isso
+  depende do usuario confirmar. Ate essa confirmacao chegar, trate
+  "143/143" como "corrigido no codigo e validado em Linux, pendente de
+  confirmacao em Windows" para ESTA correcao especifica - nao como um
+  resultado ja observado em Windows.
 - **macOS**: nunca foi executado nesta ou em rodadas anteriores; sem
   dados. O mecanismo de `os.replace` deveria se comportar como Linux
   (semantica POSIX de `rename()`), mas isso e inferencia, nao um
@@ -83,7 +85,7 @@ foi de fato executado nele):**
 | `test_backup.py` | snapshot consistente e restauravel, falha de backup nao apaga estado, retencao mantem so os N mais recentes | 3 |
 | `test_restore.py` | restore real substitui e recupera o banco, snapshot invalido e rejeitado sem tocar no banco ativo, falha pos-troca reverte automaticamente, politica de backup automatico respeita intervalo minimo, WAL genuinamente ativo e achatado antes da troca, conexao concorrente detectada e recusada sem tocar em arquivos, reversao limpa com WAL ativo, NENHUMA conexao sqlite3 aberta no instante do `os.replace` (a causa raiz do bug relatado no Windows), o portao da aplicacao liga durante a operacao e sempre desliga depois, dupla falha (restauracao + reversao) nunca levanta excecao e preserva a copia de seguranca, uma SEGUNDA restauracao concorrente e rejeitada na hora (threads reais), uma requisicao com conexao ja aberta impede a restauracao de tocar arquivos ate fechar, falha em `close_connections()` na preparacao vira `RestoreResult` legivel sem tentar reverter, falha na criacao da copia de seguranca na preparacao idem, falha na propria LIMPEZA da copia de seguranca (apos falha na preparacao, apos reversao bem-sucedida, apos restauracao bem-sucedida) nunca escapa nem oculta o resultado real | 17 |
 | `test_seed_english_graph.py` | seed idempotente, sem ciclos, todas as referencias validas | 3 |
-| `test_web.py` | fluxo HTTP completo (start -> next -> answer -> next -> end), paginas de mapa/auditoria, backup manual via UI, falha de restore mostrada ao usuario na pagina de auditoria, requisicao HTTP recebe 503 se chegar enquanto uma restauracao esta em andamento, falha na revisao de memoria e mostrada ao usuario na pagina da sessao com um caminho de retentativa visivel que recupera a revisao (usando o horario da tentativa original) sem duplicar, tentativa NAO elegivel mostra o motivo e nunca um botao de retentativa, revisao pendente de uma atividade anterior continua acessivel apos avancar para a proxima | 8 |
+| `test_web.py` | fluxo HTTP completo (start -> next -> answer -> next -> end), paginas de mapa/auditoria, backup manual via UI, falha de restore mostrada ao usuario na pagina de auditoria, requisicao HTTP recebe 503 se chegar enquanto uma restauracao esta em andamento, falha na revisao de memoria e mostrada ao usuario na pagina da sessao com um caminho de retentativa visivel que recupera a revisao (usando o horario da tentativa original) sem duplicar, tentativa NAO elegivel mostra o motivo e nunca um botao de retentativa, revisao pendente de uma atividade anterior continua acessivel apos avancar para a proxima, revisao superada por uma mais recente da mesma competencia migra para "nao recuperaveis" com motivo auditavel, nunca some silenciosamente | 9 |
 | `test_redteam.py` | **P1-P11**, um teste por item do pacote de correcao v0.2 (ver abaixo) | 11 |
 
 ## Red Team pos-correcao v0.2 — P1 a P11
@@ -299,6 +301,27 @@ reutilizada pelo orquestrador e pela interface web).
 | 2 | Uma revisao ainda RECUPERAVEL (elegivel, FSRS falhou) continua acessivel na pagina da sessao mesmo depois de avancar para uma nova atividade | `test_web.py::test_pending_memory_review_stays_reachable_after_advancing_to_next_activity` |
 
 Rodados 10 vezes consecutivas em Linux sem falha (142/142, suite
+completa). Confirmado pelo usuario em Windows real apos esta correcao
+(commit `c756e29`): **142/142**.
+
+## Correcao pos-entrega: revisao superada por outra mais recente sumia sem registro explicito (P2, ordem temporal)
+
+Auditando o commit `c756e29` (sem executar nada), o usuario encontrou um
+ultimo caso: uma revisao A que falha, fica recuperavel, mas depois e
+SUPERADA por uma revisao B mais recente da mesma competencia - a
+checagem de intervalo minimo excluia A silenciosamente (intervalo
+negativo, mensagem confusa), sem nenhum registro explicito do motivo.
+Ver "Correcao pos-entrega: uma revisao superada por outra mais recente
+sumia sem registro explicito (P2, ordem temporal)" em `DECISIONS.md` para
+a decisao completa (`evaluate_recall_eligibility` distingue "superada"
+de "intervalo curto"; `session_view` classifica em RECUPERAVEL ou NAO
+RECUPERAVEL, nunca omite).
+
+| # | Requisito | Teste principal |
+|---|---|---|
+| 1 | Uma revisao superada por uma mais recente da mesma competencia migra para "nao recuperaveis" com motivo auditavel explicito, nunca some silenciosamente nem mostra um botao de retentativa inutil | `test_web.py::test_superseded_memory_review_becomes_unrecoverable_not_silently_lost` |
+
+Rodado 10 vezes consecutivas em Linux sem falha (143/143, suite
 completa). Validacao em Windows ainda pendente (ver "Como rodar" acima).
 
 ## O que NAO esta coberto (limitacoes de teste, nao so de produto)

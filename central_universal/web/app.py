@@ -130,35 +130,29 @@ def session_view(
         dimension_states = repos.competency_states.current_all_dimensions(target_id)
         recent_decisions = repos.decision_events.list_for_competency(target_id)[-3:]
 
-    # Decima auditoria pos-entrega: "nao elegivel" (intervalo
-    # insuficiente, avaliacao inconclusiva, atividade nao planejada, etc.)
-    # e PERMANENTE para esta interacao - so descobre isso computando a
+    # Decima/decima primeira auditoria pos-entrega: "nao elegivel"
+    # (intervalo insuficiente, avaliacao inconclusiva, atividade nao
+    # planejada, ou SUPERADA por uma revisao mais recente da mesma
+    # competencia - ver `evaluate_recall_eligibility`) e PERMANENTE para
+    # esta interacao especifica - so descobre isso computando a
     # elegibilidade de verdade (`compute_memory_review_eligibility`, SEM
-    # chamar o FSRS), nunca so checando "existe MemoryObservation?" como a
-    # correcao anterior fazia (isso mostrava um botao de retentativa que
-    # reaparecia identico apos cada clique, sem nenhuma explicacao).
-    # Quando NAO elegivel, o motivo e mostrado; quando elegivel (falhou
-    # antes, ou nunca foi tentado), entra na lista de revisoes recuperaveis
-    # abaixo.
-    memory_review_reason: str | None = None
-    if current_activity is not None and current_activity.is_planned_recall and interaction is not None:
-        if repos.memory_observations.get_by_raw_interaction(interaction.id) is None:
-            result = compute_memory_review_eligibility(
-                repos, rule_version, activity=current_activity, raw_interaction=interaction,
-                now=parse_iso(interaction.occurred_at),
-            )
-            if result is not None and not result[0].eligible:
-                memory_review_reason = result[0].reason
-
-    # Mesma auditoria: a pagina so mostrava a atividade mais recente - ao
-    # avancar para uma nova atividade (`/session/{id}/next`), uma revisao
-    # ainda RECUPERAVEL de uma atividade anterior deixava de ter qualquer
-    # caminho de acesso. A lista abaixo cobre TODAS as atividades desta
-    # sessao (nao so a atual), listando toda `RawInteraction` de
-    # recuperacao planejada que ainda nao tem `MemoryObservation` E que
-    # continua elegivel agora - a mesma checagem de elegibilidade acima,
-    # so que sem se limitar a atividade corrente.
+    # chamar o FSRS), nunca so checando "existe MemoryObservation?" (isso
+    # mostrava um botao de retentativa que reaparecia identico apos cada
+    # clique, sem nenhuma explicacao - ou, pior, deixava a interacao
+    # simplesmente SUMIR da pagina sem nenhum registro do motivo, quando
+    # ela nao era mais a atividade corrente).
+    #
+    # A pagina tambem nao pode se limitar a atividade mais recente: ao
+    # avancar (`/session/{id}/next`), uma interacao de recuperacao
+    # planejada anterior - recuperavel OU nao - precisa continuar visivel
+    # em algum lugar. O loop abaixo cobre TODAS as atividades da sessao e
+    # classifica cada `RawInteraction` de recuperacao planejada ainda sem
+    # `MemoryObservation` em uma de duas listas: RECUPERAVEL (elegivel
+    # agora - falhou antes, ou nunca foi tentada - com um caminho de
+    # retentativa) ou NAO RECUPERAVEL (motivo auditavel mostrado, nunca um
+    # botao que nao levaria a nada).
     pending_memory_reviews = []
+    unrecoverable_memory_reviews = []
     for act in activities:
         if not act.is_planned_recall:
             continue
@@ -172,8 +166,15 @@ def session_view(
             repos, rule_version, activity=act, raw_interaction=act_interaction,
             now=parse_iso(act_interaction.occurred_at),
         )
-        if result is not None and result[0].eligible:
+        if result is None:
+            continue
+        eligibility, _matching_assessment = result
+        if eligibility.eligible:
             pending_memory_reviews.append({"activity": act, "interaction": act_interaction})
+        else:
+            unrecoverable_memory_reviews.append(
+                {"activity": act, "interaction": act_interaction, "reason": eligibility.reason}
+            )
 
     return templates.TemplateResponse(
         request,
@@ -187,8 +188,8 @@ def session_view(
             "recent_decisions": recent_decisions,
             "help_levels": list(HelpLevel),
             "production_results": list(ProductionResult),
-            "memory_review_reason": memory_review_reason,
             "pending_memory_reviews": pending_memory_reviews,
+            "unrecoverable_memory_reviews": unrecoverable_memory_reviews,
             "memory_status": memory_status,
             "memory_message": memory_message,
         },

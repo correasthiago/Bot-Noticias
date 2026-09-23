@@ -1364,3 +1364,63 @@ Testado em `test_web.py`:
 142/142 em todas as execucoes (as 142 ja incluem os dois testes novos
 deste pacote). Confirmacao em Windows depende do usuario rodar a suite
 la, como em todas as correcoes anteriores desta serie.
+
+**Atualizacao:** o usuario auditou o commit `c756e29` num Windows real
+(sem alterar o repositorio) e confirmou **142/142** - "as duas correcoes
+solicitadas funcionam nos cenarios testados". Ainda nao recomendou o
+merge: sobrou um caso especifico que nenhum teste anterior exercitava.
+
+---
+
+## Correcao pos-entrega: uma revisao superada por outra mais recente sumia sem registro explicito (P2, ordem temporal)
+
+O caso: uma revisao A (planejada) falha e fica pendente/recuperavel;
+depois, uma revisao B POSTERIOR da MESMA competencia e registrada com
+sucesso, avancando o `memory_state` do card FSRS. Recalcular a
+elegibilidade de A nesse momento usa `memory_state.last_review_at`, que
+agora reflete B (mais recente) - o intervalo de A em relacao a essa
+ultima revisao fica NEGATIVO (A aconteceu ANTES de B). A checagem
+generica de "intervalo minimo" (`evaluate_recall_eligibility`) ja tratava
+esse caso como `eligible=False` (correto - aplicar A fora de ordem
+corromperia o historico do card), mas com DOIS problemas: a mensagem era
+a mesma de "intervalo curto demais" so que com um numero NEGATIVO
+confuso, sem deixar claro que a causa e ESTRUTURALMENTE diferente
+(superacao por revisao mais recente, nao "tentou de novo rapido demais");
+e, como a correcao anterior so listava atividades ELEGIVEIS na pagina, A
+simplesmente DESAPARECIA da interface assim que se tornava inelegivel -
+sem nenhum registro do que aconteceu com ela.
+
+**Decisao:**
+
+- `evaluate_recall_eligibility` (`memory/fsrs_adapter.py`) agora distingue
+  explicitamente `interval_seconds < 0` (esta tentativa e anterior a
+  ultima revisao ja aplicada ao card) de `interval_seconds < minimo`
+  (intervalo curto demais entre duas tentativas em ordem normal) - o
+  primeiro caso devolve um motivo proprio e auditavel: a tentativa e
+  anterior a ultima revisao ja registrada, aplica-la agora seria fora de
+  ordem e corromperia o historico do FSRS, e ela NUNCA sera recuperavel
+  (so a revisao mais recente conta).
+- `session_view` (`web/app.py`) deixou de listar SO as atividades
+  elegiveis. Agora classifica toda interacao de recuperacao planejada
+  ainda sem `MemoryObservation` em uma de duas listas: RECUPERAVEL
+  (elegivel agora, com formulario de retentativa - inalterado da correcao
+  anterior) ou NAO RECUPERAVEL (motivo auditavel mostrado, nunca um
+  botao). A antiga secao inline `memory_review_reason`, que so cobria a
+  atividade CORRENTE, foi substituida por esta lista geral - que cobre
+  TODAS as atividades da sessao, corrente ou nao, e nunca deixa uma
+  interacao desaparecer sem explicacao.
+
+Testado em
+`test_web.py::test_superseded_memory_review_becomes_unrecoverable_not_silently_lost`:
+registra A (FSRS forcado a falhar) e confirma que ela aparece como
+recuperavel; registra B (mesma competencia, FSRS funcionando, submetida
+DEPOIS de A em ordem real de wall-clock) com sucesso; confirma que A
+NUNCA mais mostra um botao de retentativa, que ela aparece na lista de
+"revisoes de memoria nao recuperaveis" com o motivo explicando que foi
+superada por uma revisao mais recente, e que apenas a `MemoryObservation`
+de B existe no banco - A nunca foi aplicada ao card fora de ordem.
+
+**Limite honesto:** suite completa rodada 10 vezes seguidas em Linux,
+143/143 em todas as execucoes (as 143 ja incluem o teste novo deste
+pacote). Confirmacao em Windows depende do usuario rodar a suite la,
+como em todas as correcoes anteriores desta serie.
