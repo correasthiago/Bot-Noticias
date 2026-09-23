@@ -82,6 +82,74 @@ _DIMENSION_BY_ACTION: dict[str, Dimension] = {
 }
 
 
+def compute_memory_review_eligibility(
+    repos: Repositories,
+    rule_version: RuleVersion,
+    *,
+    activity: Activity,
+    raw_interaction: RawInteraction,
+    now: datetime | None = None,
+) -> tuple[MemoryObservationEligibility, EvidenceAssessment | None] | None:
+    """So-leitura: calcula se `raw_interaction` e elegivel para uma
+    observacao de memoria (FSRS) - SEM chamar o FSRS. Devolve None se a
+    atividade nao tem competencia alvo (nada a avaliar).
+
+    Extraido de `SessionOrchestrator._review_memory_if_pending` (decima
+    auditoria pos-entrega) para ser reutilizavel FORA do orquestrador: a
+    interface web precisa da MESMA resposta - "esta interacao e elegivel
+    agora?" - para decidir SE vale a pena mostrar um caminho de
+    retentativa, sem chegar a chamar `observe_and_review`. 'Nao elegivel'
+    (por exemplo intervalo insuficiente, avaliacao inconclusiva, atividade
+    nao planejada como recuperacao) e permanente para esta interacao
+    especifica - reapresentar um botao de retentativa sem NENHUMA
+    explicacao do motivo, so para ele reaparecer identico apos cada
+    clique, era enganoso."""
+
+    target_id = activity.competency_targets[0] if activity.competency_targets else None
+    if target_id is None:
+        return None
+
+    # Secao 2 do pacote de correcao v0.2.1: a observacao de memoria exige
+    # especificamente a avaliacao da dimensao RETENTION - nunca "qualquer
+    # evento desta competencia".
+    events_for_interaction = [
+        e
+        for e in repos.evidence_events.list_by_raw_interaction(raw_interaction.id)
+        if e.competency_id == target_id
+    ]
+    matching_event = next(
+        (e for e in events_for_interaction if e.dimension == Dimension.RETENTION),
+        events_for_interaction[0] if events_for_interaction else None,
+    )
+    matching_assessment = None
+    if matching_event is not None:
+        candidates = repos.evidence_assessments.get_for_evidence_event(matching_event.id)
+        matching_assessment = max(candidates, key=lambda a: a.created_at) if candidates else None
+
+    memory_state_before = repos.memory_states.get(target_id)
+    config = AggregationConfig.from_json(rule_version.config_json)
+    # Secao 2 da terceira auditoria pos-entrega: a nota FSRS vem dos
+    # sinais OBSERVAVEIS desta tentativa especifica (help_level/
+    # production_result da RawInteraction PERSISTIDA - nunca de parametros
+    # frescos), nunca da confianca do avaliador. Na PRIMEIRA revisao (sem
+    # memory_state ainda), o intervalo e verificado desde a primeira
+    # evidencia registrada para a competencia.
+    first_evidence_at = repos.evidence_events.first_created_at_for_competency(target_id)
+    eligibility = evaluate_recall_eligibility(
+        activity=activity,
+        evidence_relation=matching_event.relation if matching_event else None,
+        evidence_dimension=matching_event.dimension if matching_event else None,
+        assessment=matching_assessment,
+        help_level=raw_interaction.help_level,
+        production_result=raw_interaction.production_result,
+        memory_state=memory_state_before,
+        first_evidence_at=first_evidence_at,
+        config=config,
+        now=now,
+    )
+    return eligibility, matching_assessment
+
+
 @dataclass
 class InteractionOutcome:
     raw_interaction: RawInteraction
@@ -248,45 +316,13 @@ class SessionOrchestrator:
             # interacao UMA unica vez, nunca duplicar.
             return None, None
 
-        # Secao 2 do pacote de correcao v0.2.1: a observacao de memoria
-        # exige especificamente a avaliacao da dimensao RETENTION - nunca
-        # "qualquer evento desta competencia".
-        events_for_interaction = [
-            e
-            for e in self.repos.evidence_events.list_by_raw_interaction(raw_interaction.id)
-            if e.competency_id == target_id
-        ]
-        matching_event = next(
-            (e for e in events_for_interaction if e.dimension == Dimension.RETENTION),
-            events_for_interaction[0] if events_for_interaction else None,
+        result = compute_memory_review_eligibility(
+            self.repos, self.rule_version, activity=activity, raw_interaction=raw_interaction, now=now
         )
-        matching_assessment = None
-        if matching_event is not None:
-            candidates = self.repos.evidence_assessments.get_for_evidence_event(matching_event.id)
-            matching_assessment = max(candidates, key=lambda a: a.created_at) if candidates else None
+        if result is None:
+            return None, None
+        eligibility, matching_assessment = result
 
-        memory_state_before = self.repos.memory_states.get(target_id)
-        config = AggregationConfig.from_json(self.rule_version.config_json)
-        # Secao 2 da terceira auditoria pos-entrega: a nota FSRS vem dos
-        # sinais OBSERVAVEIS desta tentativa especifica (help_level/
-        # production_result da RawInteraction PERSISTIDA - nunca de
-        # parametros frescos), nunca da confianca do avaliador. Na
-        # PRIMEIRA revisao (sem memory_state ainda), o intervalo e
-        # verificado desde a primeira evidencia registrada para a
-        # competencia.
-        first_evidence_at = self.repos.evidence_events.first_created_at_for_competency(target_id)
-        eligibility = evaluate_recall_eligibility(
-            activity=activity,
-            evidence_relation=matching_event.relation if matching_event else None,
-            evidence_dimension=matching_event.dimension if matching_event else None,
-            assessment=matching_assessment,
-            help_level=raw_interaction.help_level,
-            production_result=raw_interaction.production_result,
-            memory_state=memory_state_before,
-            first_evidence_at=first_evidence_at,
-            config=config,
-            now=now,
-        )
         # Secao 2 do pacote de correcao v0.2: se nao for elegivel, o FSRS
         # NUNCA e chamado - nem para avaliador que falhou, nem payload
         # invalido, nem inconclusive, nem mere_presence/incidental, nem

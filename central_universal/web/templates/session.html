@@ -7,6 +7,31 @@
 <p class="{{ 'ok' if memory_status == 'ok' else 'error' }}"><strong>Revisao de memoria:</strong> {{ memory_message }}</p>
 {% endif %}
 
+{% if pending_memory_reviews %}
+<div class="card">
+  <p><strong>Revisoes de memoria pendentes de recuperacao</strong> - a
+     revisao (FSRS) destas tentativas ainda nao foi registrada, pode ter
+     falhado antes. Continuam acessiveis aqui mesmo depois de avancar
+     para outra atividade. Tentar de novo reenvia a MESMA resposta e usa
+     o horario da tentativa original, sem duplicar.</p>
+  <ul>
+    {% for pending in pending_memory_reviews %}
+    <li>
+      <span>{{ pending.activity.prompt }} ({{ pending.interaction.learner_input }})</span>
+      <form method="post" action="/session/{{ session.id }}/answer" style="display:inline">
+        <input type="hidden" name="activity_id" value="{{ pending.activity.id }}">
+        <input type="hidden" name="idempotency_key" value="{{ pending.activity.id }}">
+        <input type="hidden" name="learner_input" value="{{ pending.interaction.learner_input }}">
+        <input type="hidden" name="help_level" value="{{ pending.interaction.help_level.value }}">
+        <input type="hidden" name="production_result" value="{{ pending.interaction.production_result.value }}">
+        <button type="submit">Tentar revisao de memoria novamente</button>
+      </form>
+    </li>
+    {% endfor %}
+  </ul>
+</div>
+{% endif %}
+
 {% if not activity %}
   <p>Nenhuma atividade ainda.</p>
   <form method="post" action="/session/{{ session.id }}/next">
@@ -50,21 +75,11 @@
          <strong>Resultado:</strong> {{ interaction.production_result.value }}</p>
     </div>
 
-    {% if memory_review_pending %}
+    {% if memory_review_reason %}
     <div class="card">
-      <p>A revisao de memoria (FSRS) desta recuperacao ainda nao foi
-         registrada - pode ter falhado numa tentativa anterior. Tentar de
-         novo reenvia a MESMA resposta (nunca uma nova) e usa o horario
-         da tentativa original, sem duplicar a revisao se ela ja tiver
-         funcionado.</p>
-      <form method="post" action="/session/{{ session.id }}/answer">
-        <input type="hidden" name="activity_id" value="{{ activity.id }}">
-        <input type="hidden" name="idempotency_key" value="{{ activity.id }}">
-        <input type="hidden" name="learner_input" value="{{ interaction.learner_input }}">
-        <input type="hidden" name="help_level" value="{{ interaction.help_level.value }}">
-        <input type="hidden" name="production_result" value="{{ interaction.production_result.value }}">
-        <button type="submit">Tentar revisao de memoria novamente</button>
-      </form>
+      <p>Esta recuperacao nao gerou uma revisao de memoria (FSRS) e NAO
+         e elegivel para uma: {{ memory_review_reason }}. Nao ha nada a
+         tentar de novo para esta tentativa especifica.</p>
     </div>
     {% endif %}
 

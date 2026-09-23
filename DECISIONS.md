@@ -1285,3 +1285,82 @@ nunca com o horario do clique de retentativa.
 deste pacote - dois de P1, um de P2). Confirmacao em Windows depende do
 usuario rodar a suite la, como em todas as correcoes anteriores desta
 serie.
+
+**Atualizacao:** o usuario auditou o commit `0902a2f` num Windows real
+(sem alterar o repositorio) e confirmou **140/140** - "a regra agora
+distingue corretamente um erro anterior ao domino de uma regressao
+posterior, e o teste HTTP comprova a retentativa imediata do FSRS".
+Ainda nao recomendou o merge: encontrou mais duas lacunas especificamente
+na INTERFACE da correcao P2 (a logica do servico ja estava correta).
+
+---
+
+## Correcao pos-entrega: interface nao distinguia "nao elegivel" de "recuperavel", e perdia acesso a revisoes pendentes ao avancar (P2 na interface)
+
+A mesma auditoria (sobre o commit `0902a2f`, sem executar nada) encontrou
+dois problemas especificos na INTERFACE web da correcao P2 anterior - o
+servico (`_review_memory_if_pending`) ja se comportava corretamente,
+mas `session_view` nao usava a mesma informacao que ele ja calculava:
+
+1. **"Nao elegivel" tratado como "pendente/recuperavel".** `session_view`
+   decidia mostrar o botao de retentativa checando SO se existia um
+   `MemoryObservation` gravado - sem checar se a interacao era realmente
+   ELEGIVEL. Uma tentativa genuinamente nao elegivel (intervalo
+   insuficiente, avaliacao inconclusiva, atividade nao planejada como
+   recuperacao, confianca abaixo do minimo) mostrava o MESMO botao de
+   retentativa que uma tentativa que so falhou no FSRS - e como a
+   elegibilidade e calculada com o horario FIXO da tentativa original
+   (nunca muda entre cliques), clicar retentar simplesmente reproduzia o
+   mesmo resultado "nao elegivel" pela enesima vez, sem nenhuma
+   explicacao visivel do motivo.
+2. **Avancar para outra atividade escondia revisoes ainda recuperaveis.**
+   `session_view` so olhava para a atividade MAIS RECENTE da sessao
+   (`activities[-1]`). Uma revisao genuinamente recuperavel (elegivel,
+   FSRS falhou antes) de uma atividade ANTERIOR ficava sem NENHUM caminho
+   de acesso assim que o usuario avancava para a proxima atividade -
+   mesmo o servico continuando perfeitamente capaz de retentar aquela
+   revisao especifica se a mesma resposta fosse reenviada.
+
+**Decisao:**
+
+- A logica de elegibilidade foi extraida de
+  `SessionOrchestrator._review_memory_if_pending` para uma funcao de
+  MODULO reutilizavel, `compute_memory_review_eligibility(repos,
+  rule_version, *, activity, raw_interaction, now)` - so-leitura, NUNCA
+  chama o FSRS, devolve `(MemoryObservationEligibility, EvidenceAssessment
+  | None)` ou `None` (sem competencia alvo). O orquestrador passou a
+  chamar essa mesma funcao internamente (nenhuma duplicacao de logica) -
+  garantindo que a interface web e o servico SEMPRE concordam sobre o que
+  conta como elegivel.
+- `session_view` agora usa essa funcao para a atividade corrente: se a
+  interacao existe, nao tem `MemoryObservation` ainda, e NAO e elegivel,
+  a pagina mostra o motivo (`eligibility.reason`, o mesmo texto legivel
+  ja usado internamente) - SEM nenhum botao, porque retentar nunca
+  mudaria o resultado.
+- `session_view` tambem percorre TODAS as atividades da sessao (nao so a
+  mais recente) procurando qualquer `RawInteraction` de recuperacao
+  planejada sem `MemoryObservation` que CONTINUE elegivel agora - essas
+  entram numa lista persistente de "revisoes de memoria pendentes de
+  recuperacao", mostrada no TOPO da pagina, independente de qual
+  atividade estiver em foco no momento. Cada entrada da lista tem seu
+  proprio formulario de retentativa, reenviando exatamente os dados
+  daquela `RawInteraction` especifica (mesmo `activity_id`,
+  `idempotency_key`, resposta, nivel de ajuda, resultado).
+
+Testado em `test_web.py`:
+- `test_ineligible_memory_review_shows_reason_never_a_retry_button`
+  (submete uma recuperacao planejada sem nenhuma evidencia anterior da
+  competencia - intervalo zero, abaixo do minimo - confirma que a pagina
+  mostra o motivo e NUNCA o botao de retentativa, inclusive apos reenviar
+  de novo).
+- `test_pending_memory_review_stays_reachable_after_advancing_to_next_activity`
+  (forca a falha do FSRS numa recuperacao planejada elegivel, confirma o
+  botao de retentativa antes de avancar, avanca via `/session/{id}/next`
+  para uma NOVA atividade, confirma que o botao de retentativa da
+  atividade ANTERIOR continua presente na pagina, e que clicar nele a
+  partir dali recupera a revisao sem duplicar).
+
+**Limite honesto:** suite completa rodada 10 vezes seguidas em Linux,
+142/142 em todas as execucoes (as 142 ja incluem os dois testes novos
+deste pacote). Confirmacao em Windows depende do usuario rodar a suite
+la, como em todas as correcoes anteriores desta serie.

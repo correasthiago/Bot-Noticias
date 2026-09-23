@@ -6,7 +6,7 @@
 python -m pytest -q
 ```
 
-Resultado atual: **140 testes**, 100% offline (nenhum teste faz chamada
+Resultado atual: **142 testes**, 100% offline (nenhum teste faz chamada
 de rede — `MockProvider` e usado em todos os cenarios que envolvem "IA",
 e `test_P11_offline_execution_fails_if_network_is_attempted` ativamente
 bloqueia qualquer tentativa de `socket.connect`/`create_connection`
@@ -16,12 +16,12 @@ durante o ciclo completo, falhando o teste se algo tentar).
 abaixo; NAO declare um numero como resultado valido para um SO que nao
 foi de fato executado nele):**
 
-- **Linux** (ambiente desta sessao): **140/140 passando**, tempo total
-  ~3.4s. Rodado 10 vezes consecutivas apos a correcao mais recente (os
-  tres testes novos - dois de P1/regressao pre-aprendizagem, um de P2/
-  recuperacao da revisao de memoria via web - inclusos em todas as 10)
-  sem nenhuma falha.
-- **Windows**: um usuario reportou e CONFIRMOU, em seis rodadas:
+- **Linux** (ambiente desta sessao): **142/142 passando**, tempo total
+  ~3.5s. Rodado 10 vezes consecutivas apos a correcao mais recente (os
+  dois testes novos - distincao entre "nao elegivel" e "recuperavel",
+  revisao pendente acessivel apos avancar de atividade - inclusos em
+  todas as 10) sem nenhuma falha.
+- **Windows**: um usuario reportou e CONFIRMOU, em sete rodadas:
   1. Apos o commit `1133ded` (pacote v0.2.2): 120/128 passando, 5 falhas
      em `test_restore.py` (`PermissionError: [WinError 5]`) - corrigido
      no commit `961b5b8` (ver "Correcao pos-entrega: restore quebrava no
@@ -42,18 +42,22 @@ foi de fato executado nele):**
   6. Apos o commit `c208fee` (revisao de memoria retentada + suspeita de
      regressao permanente): **137/137 CONFIRMADO em Windows real** pelo
      mesmo usuario, via auditoria de codigo (sem alterar o repositorio).
-  Essa mesma auditoria do commit `c208fee` encontrou mais dois achados no
-  fluxo de aprendizagem: um FALSO sinal de regressao para erros
-  anteriores a qualquer dominio demonstrado (P1), e a recuperacao da
-  revisao de memoria nunca chegando ao usuario pela rota web (P2) - ver
-  "Correcao pos-entrega: sinal de regressao passou a acender para erros
-  ANTERIORES a qualquer dominio demonstrado (P1)" e "Correcao
-  pos-entrega: recuperacao da revisao de memoria nunca chegava ao usuario
-  (P2)" em DECISIONS.md. Ambos corrigidos nesta revisao (140 testes, tres
-  novos - dois de P1, um de P2). Esta correcao mais recente foi validada
-  em Linux (10 execucoes consecutivas), mas **ainda nao foi executada num
-  Windows real** - isso depende do usuario confirmar. Ate essa
-  confirmacao chegar, trate "140/140" como "corrigido no codigo e
+  7. Apos o commit `0902a2f` (P1: timing correto da regressao; P2:
+     recuperacao visivel via web): **140/140 CONFIRMADO em Windows real**
+     pelo mesmo usuario, via auditoria de codigo (sem alterar o
+     repositorio).
+  Essa mesma auditoria do commit `0902a2f` encontrou mais duas lacunas
+  especificamente na INTERFACE da correcao P2 (o servico ja estava
+  correto): o botao de retentativa aparecia mesmo para tentativas
+  PERMANENTEMENTE nao elegiveis, sem explicar o motivo; e avancar para
+  outra atividade escondia o acesso a uma revisao ainda recuperavel de
+  uma atividade anterior - ver "Correcao pos-entrega: interface nao
+  distinguia 'nao elegivel' de 'recuperavel', e perdia acesso a revisoes
+  pendentes ao avancar (P2 na interface)" em DECISIONS.md. Corrigido
+  nesta revisao (142 testes, dois novos). Esta correcao mais recente foi
+  validada em Linux (10 execucoes consecutivas), mas **ainda nao foi
+  executada num Windows real** - isso depende do usuario confirmar. Ate
+  essa confirmacao chegar, trate "142/142" como "corrigido no codigo e
   validado em Linux, pendente de confirmacao em Windows" para ESTA
   correcao especifica - nao como um resultado ja observado em Windows.
 - **macOS**: nunca foi executado nesta ou em rodadas anteriores; sem
@@ -79,7 +83,7 @@ foi de fato executado nele):**
 | `test_backup.py` | snapshot consistente e restauravel, falha de backup nao apaga estado, retencao mantem so os N mais recentes | 3 |
 | `test_restore.py` | restore real substitui e recupera o banco, snapshot invalido e rejeitado sem tocar no banco ativo, falha pos-troca reverte automaticamente, politica de backup automatico respeita intervalo minimo, WAL genuinamente ativo e achatado antes da troca, conexao concorrente detectada e recusada sem tocar em arquivos, reversao limpa com WAL ativo, NENHUMA conexao sqlite3 aberta no instante do `os.replace` (a causa raiz do bug relatado no Windows), o portao da aplicacao liga durante a operacao e sempre desliga depois, dupla falha (restauracao + reversao) nunca levanta excecao e preserva a copia de seguranca, uma SEGUNDA restauracao concorrente e rejeitada na hora (threads reais), uma requisicao com conexao ja aberta impede a restauracao de tocar arquivos ate fechar, falha em `close_connections()` na preparacao vira `RestoreResult` legivel sem tentar reverter, falha na criacao da copia de seguranca na preparacao idem, falha na propria LIMPEZA da copia de seguranca (apos falha na preparacao, apos reversao bem-sucedida, apos restauracao bem-sucedida) nunca escapa nem oculta o resultado real | 17 |
 | `test_seed_english_graph.py` | seed idempotente, sem ciclos, todas as referencias validas | 3 |
-| `test_web.py` | fluxo HTTP completo (start -> next -> answer -> next -> end), paginas de mapa/auditoria, backup manual via UI, falha de restore mostrada ao usuario na pagina de auditoria, requisicao HTTP recebe 503 se chegar enquanto uma restauracao esta em andamento, falha na revisao de memoria e mostrada ao usuario na pagina da sessao com um caminho de retentativa visivel que recupera a revisao (usando o horario da tentativa original) sem duplicar | 6 |
+| `test_web.py` | fluxo HTTP completo (start -> next -> answer -> next -> end), paginas de mapa/auditoria, backup manual via UI, falha de restore mostrada ao usuario na pagina de auditoria, requisicao HTTP recebe 503 se chegar enquanto uma restauracao esta em andamento, falha na revisao de memoria e mostrada ao usuario na pagina da sessao com um caminho de retentativa visivel que recupera a revisao (usando o horario da tentativa original) sem duplicar, tentativa NAO elegivel mostra o motivo e nunca um botao de retentativa, revisao pendente de uma atividade anterior continua acessivel apos avancar para a proxima | 8 |
 | `test_redteam.py` | **P1-P11**, um teste por item do pacote de correcao v0.2 (ver abaixo) | 11 |
 
 ## Red Team pos-correcao v0.2 — P1 a P11
@@ -276,6 +280,25 @@ para as decisoes completas.
 | 3 (P2) | Falha na revisao de memoria e visivel na pagina da sessao, com um formulario de retentativa que reenvia a MESMA resposta e recupera a revisao usando o horario da tentativa ORIGINAL, sem duplicar | `test_web.py::test_memory_review_recovery_is_visible_and_retryable_over_http` |
 
 Rodados 10 vezes consecutivas em Linux sem falha (140/140, suite
+completa). Confirmado pelo usuario em Windows real apos esta correcao
+(commit `0902a2f`): **140/140**.
+
+## Correcao pos-entrega: interface nao distinguia "nao elegivel" de "recuperavel" (P2 na interface)
+
+Auditando o commit `0902a2f` (sem executar nada), o usuario encontrou
+duas lacunas especificamente na INTERFACE da correcao P2 anterior - o
+servico ja se comportava corretamente. Ver "Correcao pos-entrega:
+interface nao distinguia 'nao elegivel' de 'recuperavel', e perdia acesso
+a revisoes pendentes ao avancar (P2 na interface)" em `DECISIONS.md` para
+a decisao completa (funcao `compute_memory_review_eligibility`,
+reutilizada pelo orquestrador e pela interface web).
+
+| # | Requisito | Teste principal |
+|---|---|---|
+| 1 | Uma tentativa PERMANENTEMENTE nao elegivel (ex.: intervalo insuficiente) mostra o motivo, nunca um botao de retentativa que reapareceria identico apos cada clique | `test_web.py::test_ineligible_memory_review_shows_reason_never_a_retry_button` |
+| 2 | Uma revisao ainda RECUPERAVEL (elegivel, FSRS falhou) continua acessivel na pagina da sessao mesmo depois de avancar para uma nova atividade | `test_web.py::test_pending_memory_review_stays_reachable_after_advancing_to_next_activity` |
+
+Rodados 10 vezes consecutivas em Linux sem falha (142/142, suite
 completa). Validacao em Windows ainda pendente (ver "Como rodar" acima).
 
 ## O que NAO esta coberto (limitacoes de teste, nao so de produto)

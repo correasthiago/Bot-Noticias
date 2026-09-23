@@ -22,7 +22,10 @@ from central_universal.domain.enums import ALL_DIMENSIONS, HelpLevel, Production
 from central_universal.domain.entities import RuleVersion
 from central_universal.integrity.checks import run_all as run_integrity_checks
 from central_universal.memory.fsrs_adapter import MemoryAdapter, MemoryReviewError
-from central_universal.orchestration.session_service import SessionOrchestrator
+from central_universal.orchestration.session_service import (
+    SessionOrchestrator,
+    compute_memory_review_eligibility,
+)
 from central_universal.persistence.backup import create_backup, list_backups
 from central_universal.persistence.repositories import Repositories
 from central_universal.persistence.restore import restore_from_backup
@@ -102,6 +105,7 @@ def session_view(
     request: Request,
     session_id: str,
     repos: Repositories = Depends(get_repos),
+    rule_version: RuleVersion = Depends(get_active_rule_version),
     memory_status: str | None = None,
     memory_message: str | None = None,
 ):
@@ -126,21 +130,50 @@ def session_view(
         dimension_states = repos.competency_states.current_all_dimensions(target_id)
         recent_decisions = repos.decision_events.list_for_competency(target_id)[-3:]
 
-    # Nona auditoria pos-entrega (P2): a revisao de memoria (FSRS) pode
-    # ter falhado numa tentativa anterior e ainda estar pendente - o
-    # formulario de resposta some assim que `interaction` existe (nao ha
-    # o que reenviar), mas SEM um caminho visivel para recuperar so a
-    # revisao, ela ficava perdida na pratica mesmo com o servico ja
-    # sabendo tentar de novo (`_review_memory_if_pending`). Uma atividade
-    # planejada como recuperacao, ja respondida, sem nenhum
-    # `MemoryObservation` gravado ainda, e o sinal de que ha algo a
-    # recuperar - o botao de retentativa so aparece nesse caso.
-    memory_review_pending = (
-        current_activity is not None
-        and current_activity.is_planned_recall
-        and interaction is not None
-        and repos.memory_observations.get_by_raw_interaction(interaction.id) is None
-    )
+    # Decima auditoria pos-entrega: "nao elegivel" (intervalo
+    # insuficiente, avaliacao inconclusiva, atividade nao planejada, etc.)
+    # e PERMANENTE para esta interacao - so descobre isso computando a
+    # elegibilidade de verdade (`compute_memory_review_eligibility`, SEM
+    # chamar o FSRS), nunca so checando "existe MemoryObservation?" como a
+    # correcao anterior fazia (isso mostrava um botao de retentativa que
+    # reaparecia identico apos cada clique, sem nenhuma explicacao).
+    # Quando NAO elegivel, o motivo e mostrado; quando elegivel (falhou
+    # antes, ou nunca foi tentado), entra na lista de revisoes recuperaveis
+    # abaixo.
+    memory_review_reason: str | None = None
+    if current_activity is not None and current_activity.is_planned_recall and interaction is not None:
+        if repos.memory_observations.get_by_raw_interaction(interaction.id) is None:
+            result = compute_memory_review_eligibility(
+                repos, rule_version, activity=current_activity, raw_interaction=interaction,
+                now=parse_iso(interaction.occurred_at),
+            )
+            if result is not None and not result[0].eligible:
+                memory_review_reason = result[0].reason
+
+    # Mesma auditoria: a pagina so mostrava a atividade mais recente - ao
+    # avancar para uma nova atividade (`/session/{id}/next`), uma revisao
+    # ainda RECUPERAVEL de uma atividade anterior deixava de ter qualquer
+    # caminho de acesso. A lista abaixo cobre TODAS as atividades desta
+    # sessao (nao so a atual), listando toda `RawInteraction` de
+    # recuperacao planejada que ainda nao tem `MemoryObservation` E que
+    # continua elegivel agora - a mesma checagem de elegibilidade acima,
+    # so que sem se limitar a atividade corrente.
+    pending_memory_reviews = []
+    for act in activities:
+        if not act.is_planned_recall:
+            continue
+        act_interactions = repos.raw_interactions.list_by_activity(act.id)
+        act_interaction = act_interactions[-1] if act_interactions else None
+        if act_interaction is None:
+            continue
+        if repos.memory_observations.get_by_raw_interaction(act_interaction.id) is not None:
+            continue
+        result = compute_memory_review_eligibility(
+            repos, rule_version, activity=act, raw_interaction=act_interaction,
+            now=parse_iso(act_interaction.occurred_at),
+        )
+        if result is not None and result[0].eligible:
+            pending_memory_reviews.append({"activity": act, "interaction": act_interaction})
 
     return templates.TemplateResponse(
         request,
@@ -154,7 +187,8 @@ def session_view(
             "recent_decisions": recent_decisions,
             "help_levels": list(HelpLevel),
             "production_results": list(ProductionResult),
-            "memory_review_pending": memory_review_pending,
+            "memory_review_reason": memory_review_reason,
+            "pending_memory_reviews": pending_memory_reviews,
             "memory_status": memory_status,
             "memory_message": memory_message,
         },

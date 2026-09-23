@@ -250,6 +250,206 @@ def test_memory_review_recovery_is_visible_and_retryable_over_http(tmp_path, mon
         conn2.close()
 
 
+def test_ineligible_memory_review_shows_reason_never_a_retry_button(tmp_path, monkeypatch):
+    """Achado remanescente da decima auditoria pos-entrega: `session_view`
+    tratava TODA recuperacao planejada sem `MemoryObservation` como
+    'pendente', inclusive tentativas NAO ELEGIVEIS (intervalo
+    insuficiente, avaliacao inconclusiva, etc.) - o botao de retentativa
+    reaparecia identico apos cada clique, sem explicar por que nada
+    mudava (retentar nunca muda o resultado: a elegibilidade e calculada
+    com o horario FIXO da tentativa original). Este teste submete uma
+    recuperacao planejada SEM nenhuma evidencia anterior da competencia -
+    intervalo desde a 'aprendizagem' e zero, abaixo do minimo exigido -
+    e confirma que a pagina explica o motivo (nao esconde) e NUNCA mostra
+    um botao de retentativa para essa tentativa."""
+
+    with _fresh_client(tmp_path, monkeypatch) as client:
+        client.get("/")
+
+        import central_universal.web.deps as deps_module
+        from central_universal.domain.clock import utc_now_iso
+        from central_universal.domain.entities import Activity, LearningSession
+        from central_universal.domain.enums import DecisionType, HelpLevel, SessionStatus
+        from central_universal.domain.ids import new_id
+        from central_universal.persistence.repositories import Repositories
+
+        conn = deps_module.connect(deps_module.DB_PATH)
+        repos = Repositories(conn)
+        learner = repos.learners.list_all()[0]
+        competency_id = repos.competencies.list_all()[0].id
+
+        session = LearningSession(
+            id=new_id(), learner_id=learner.id, started_at=utc_now_iso(), status=SessionStatus.ACTIVE
+        )
+        repos.sessions.insert(session)
+        # SEM nenhuma interacao/evidencia previa para esta competencia -
+        # esta sera a PRIMEIRA evidencia, entao o intervalo desde a
+        # "aprendizagem" e zero (abaixo do minimo de 3600s por padrao).
+        activity = Activity(
+            id=new_id(),
+            session_id=session.id,
+            competency_targets=[competency_id],
+            activity_type=DecisionType.SCHEDULE_RECALL.value,
+            prompt="Revisao sem intervalo suficiente",
+            support_level=HelpLevel.A0,
+            created_at=utc_now_iso(),
+            tutor_provider_event_id=None,
+            is_planned_recall=True,
+        )
+        repos.activities.insert(activity)
+        conn.close()
+
+        answer_data = {
+            "activity_id": activity.id,
+            "learner_input": "She has gone to school before.",
+            "help_level": "A0",
+            "production_result": "spontaneous_correct",
+            "idempotency_key": activity.id,
+        }
+        answer_resp = client.post(f"/session/{session.id}/answer", data=answer_data, follow_redirects=False)
+        assert answer_resp.status_code == 303
+        # nao elegivel - nenhuma revisao aconteceu, entao nenhum flash de
+        # sucesso/erro de FSRS e disparado por esta submissao.
+        assert "memory_status" not in answer_resp.headers["location"]
+
+        page = client.get(answer_resp.headers["location"])
+        assert page.status_code == 200
+        assert "e elegivel para uma" in page.text
+        assert "intervalo" in page.text.lower()
+        assert "Tentar revisao de memoria novamente" not in page.text
+
+        # reenviar de novo (mesma idempotency_key) nao muda nada - a
+        # elegibilidade e permanente para esta interacao especifica.
+        again_resp = client.post(f"/session/{session.id}/answer", data=answer_data, follow_redirects=False)
+        again_page = client.get(again_resp.headers["location"])
+        assert "e elegivel para uma" in again_page.text
+        assert "Tentar revisao de memoria novamente" not in again_page.text
+
+
+def test_pending_memory_review_stays_reachable_after_advancing_to_next_activity(tmp_path, monkeypatch):
+    """Segundo achado remanescente da decima auditoria pos-entrega: a
+    pagina da sessao so mostrava a atividade mais recente - ao avancar
+    para uma nova atividade, uma revisao de memoria ainda RECUPERAVEL
+    (elegivel, so o FSRS falhou) de uma atividade anterior deixava de ter
+    qualquer caminho de acesso. Este teste forca a falha do FSRS numa
+    recuperacao planejada, avanca para outra atividade via
+    `/session/{id}/next`, e confirma que a revisao anterior CONTINUA
+    visivel e retentavel na pagina da sessao - e que retentar a partir
+    dali funciona e nao deixa duplicata."""
+
+    with _fresh_client(tmp_path, monkeypatch) as client:
+        client.get("/")
+
+        from datetime import datetime, timedelta, timezone
+
+        import central_universal.memory.fsrs_adapter as fsrs_adapter_module
+        import central_universal.web.deps as deps_module
+        from central_universal.domain.clock import utc_now_iso
+        from central_universal.domain.entities import Activity, LearningSession
+        from central_universal.domain.enums import DecisionType, HelpLevel, ProductionResult, SessionStatus
+        from central_universal.domain.ids import new_id
+        from central_universal.memory.fsrs_adapter import MemoryReviewError
+        from central_universal.orchestration.session_service import SessionOrchestrator
+        from central_universal.persistence.repositories import Repositories
+        from central_universal.providers.mock import MockProvider
+
+        conn = deps_module.connect(deps_module.DB_PATH)
+        repos = Repositories(conn)
+        learner = repos.learners.list_all()[0]
+        competency_id = repos.competencies.list_all()[0].id
+        rule_version = repos.active_rule_version.get()
+
+        session = LearningSession(
+            id=new_id(), learner_id=learner.id, started_at=utc_now_iso(), status=SessionStatus.ACTIVE
+        )
+        repos.sessions.insert(session)
+
+        priming_orchestrator = SessionOrchestrator(repos, MockProvider(), rule_version, backup_dir=tmp_path / "backups")
+        priming_activity = Activity(
+            id=new_id(),
+            session_id=session.id,
+            competency_targets=[competency_id],
+            activity_type=DecisionType.MINIMAL_EXPLANATION.value,
+            prompt="Atividade de priming",
+            support_level=HelpLevel.A0,
+            created_at=utc_now_iso(),
+            tutor_provider_event_id=None,
+            is_planned_recall=False,
+        )
+        repos.activities.insert(priming_activity)
+        priming_orchestrator.submit_interaction(
+            activity_id=priming_activity.id, session_id=session.id, idempotency_key=new_id(),
+            learner_input="resposta de priming", help_level=HelpLevel.A0,
+            production_result=ProductionResult.SPONTANEOUS_CORRECT, tutor_output_text="",
+            now=datetime.now(timezone.utc) - timedelta(hours=2),
+        )
+
+        recall_activity = Activity(
+            id=new_id(),
+            session_id=session.id,
+            competency_targets=[competency_id],
+            activity_type=DecisionType.SCHEDULE_RECALL.value,
+            prompt="Revisao recuperavel",
+            support_level=HelpLevel.A0,
+            created_at=utc_now_iso(),
+            tutor_provider_event_id=None,
+            is_planned_recall=True,
+        )
+        repos.activities.insert(recall_activity)
+        conn.close()
+
+        real_observe_and_review = fsrs_adapter_module.MemoryAdapter.observe_and_review
+
+        def failing_observe_and_review(self, *args, **kwargs):
+            return MemoryReviewError(message="falha simulada no FSRS")
+
+        monkeypatch.setattr(fsrs_adapter_module.MemoryAdapter, "observe_and_review", failing_observe_and_review)
+
+        answer_data = {
+            "activity_id": recall_activity.id,
+            "learner_input": "She has gone to school before.",
+            "help_level": "A0",
+            "production_result": "spontaneous_correct",
+            "idempotency_key": recall_activity.id,
+        }
+        first_resp = client.post(f"/session/{session.id}/answer", data=answer_data, follow_redirects=False)
+        assert first_resp.status_code == 303
+        assert "memory_status=error" in first_resp.headers["location"]
+
+        # confirma que a revisao esta recuperavel ENQUANTO ainda e a
+        # atividade corrente.
+        before_advancing = client.get(f"/session/{session.id}")
+        assert "Tentar revisao de memoria novamente" in before_advancing.text
+
+        # avanca para uma NOVA atividade - `recall_activity` deixa de ser
+        # a atividade corrente da sessao.
+        next_resp = client.post(f"/session/{session.id}/next", follow_redirects=False)
+        assert next_resp.status_code == 303
+
+        after_advancing = client.get(f"/session/{session.id}")
+        assert after_advancing.status_code == 200
+        # a revisao pendente da atividade ANTERIOR continua acessivel.
+        assert "Tentar revisao de memoria novamente" in after_advancing.text
+        assert 'value="{}"'.format(recall_activity.id) in after_advancing.text
+
+        # o FSRS volta a funcionar - retentar a partir da lista de
+        # pendencias (mesmos dados escondidos no formulario) recupera a
+        # revisao.
+        monkeypatch.setattr(fsrs_adapter_module.MemoryAdapter, "observe_and_review", real_observe_and_review)
+        retry_resp = client.post(f"/session/{session.id}/answer", data=answer_data, follow_redirects=False)
+        assert retry_resp.status_code == 303
+        assert "memory_status=ok" in retry_resp.headers["location"]
+
+        recovered_page = client.get(f"/session/{session.id}")
+        # a revisao ja foi recuperada - some da lista de pendencias.
+        assert "Tentar revisao de memoria novamente" not in recovered_page.text
+
+        conn2 = deps_module.connect(deps_module.DB_PATH)
+        repos2 = Repositories(conn2)
+        assert len(repos2.memory_observations.list_for_competency(competency_id)) == 1  # nao duplicou
+        conn2.close()
+
+
 def test_restore_rejects_new_requests_while_in_progress(tmp_path, monkeypatch):
     """Quarta auditoria pos-entrega, Secao 3: 'coordene a pausa de
     requisicoes no nivel da aplicacao'. Uma requisicao HTTP que chega

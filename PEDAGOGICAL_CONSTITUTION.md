@@ -468,3 +468,30 @@ reforcos que essa auditoria tornou explicitos.
     o momento real da tentativa e o momento em que a revisao foi
     finalmente registrada
     (`test_memory_review_recovery_is_visible_and_retryable_over_http`).
+
+39. **"Sem observacao ainda" nao e o mesmo que "pendente de
+    retentativa" - so e recuperavel o que continua ELEGIVEL, e o que e
+    recuperavel precisa continuar acessivel mesmo depois que a interface
+    avanca para outra coisa.**
+    O Principio 38 corrigiu a interface para mostrar E permitir retentar
+    a revisao de memoria - mas a mesma auditoria encontrou que
+    `session_view` decidia mostrar o botao SO checando "existe
+    `MemoryObservation`?", sem checar se a tentativa era genuinamente
+    ELEGIVEL. Uma tentativa permanentemente nao elegivel (intervalo
+    insuficiente, avaliacao inconclusiva, atividade nao planejada) mostrava
+    o MESMO botao que uma tentativa recuperavel - e como a elegibilidade e
+    calculada com o horario FIXO da tentativa original, clicar retentar
+    reproduzia o mesmo "nao elegivel" indefinidamente, sem nenhuma
+    explicacao visivel. Alem disso, a pagina so olhava para a atividade
+    MAIS RECENTE da sessao - avancar para uma nova atividade escondia
+    completamente o acesso a uma revisao ainda recuperavel de uma
+    atividade anterior, mesmo o servico continuando capaz de retenta-la.
+    A correcao extraiu a elegibilidade para uma funcao reutilizavel,
+    `compute_memory_review_eligibility` (so-leitura, nunca chama o FSRS),
+    usada tanto pelo orquestrador quanto pela interface - garantindo que
+    as duas SEMPRE concordam sobre o que conta como elegivel. A interface
+    passou a mostrar o MOTIVO (nunca um botao) quando a tentativa nao e
+    elegivel, e a listar, persistentemente no topo da pagina, TODA revisao
+    ainda recuperavel de QUALQUER atividade da sessao - nao so a atual
+    (`test_ineligible_memory_review_shows_reason_never_a_retry_button`,
+    `test_pending_memory_review_stays_reachable_after_advancing_to_next_activity`).
