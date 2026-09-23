@@ -376,3 +376,48 @@ reforcos que essa auditoria tornou explicitos.
     (`test_restore_readable_result_when_preparation_failure_and_its_cleanup_both_fail`,
     `test_restore_readable_result_when_cleanup_after_successful_revert_fails`,
     `test_restore_still_reports_success_when_cleanup_after_successful_restore_fails`).
+
+35. **Uma avaliacao gravada com sucesso e uma revisao de memoria
+    concluida sao dois fatos DIFERENTES - "ja avaliada" nunca pode
+    significar "nada mais a fazer" se a memoria ainda estiver pendente.**
+    Com o restore validado em Linux e Windows, o mesmo usuario passou a
+    auditar o resto do fluxo de aprendizagem e encontrou que
+    `SessionOrchestrator.submit_interaction` tratava
+    `raw_interaction.evaluation_status == COMPLETED` como sinonimo de
+    "nada a reprocessar" - correto para a AVALIACAO em si (Principio de
+    idempotencia, T8), mas incorreto para a revisao de MEMORIA: se uma
+    submissao anterior tivesse avaliado com sucesso mas o FSRS falhasse
+    DEPOIS, reenviar a mesma resposta saia direto nesse atalho sem
+    sequer tentar a memoria de novo, perdendo a revisao DEFINITIVAMENTE.
+    A correcao extraiu a logica de observacao/revisao para
+    `_review_memory_if_pending`, chamada tanto na primeira quanto em
+    qualquer submissao repetida, mas gated por um fato verificavel e
+    unico - existe um `MemoryObservation` gravado para esta interacao? -
+    nunca pelo status da avaliacao: se nao existir, tenta (de novo, se
+    for o caso); se ja existir, nunca tenta de novo (o FSRS so pode
+    revisar uma interacao uma unica vez)
+    (`test_memory_review_retries_after_fsrs_failure_without_duplicating`).
+
+36. **Uma suspeita de regressao e permanente ate uma validacao
+    DELIBERADA resolve-la - nenhuma evidencia comum, por mais recente
+    que seja, pode silenciar sozinha o que o Principio 12 exige
+    validacao explicita para resolver.**
+    A mesma auditoria encontrou que `classify_dimension` computava
+    `possible_regression` comparando qual evidencia TARGET era mais
+    recente (positiva forte vs. negativa/contraditoria, ja deduplicadas
+    por cluster) - se a evidencia positiva fosse a mais nova, a suspeita
+    simplesmente nao acendia na proxima recomputacao, mesmo que a
+    evidencia positiva viesse de uma atividade COMUM, nunca de uma
+    `TARGETED_REGRESSION_CHECK` deliberada (Secao 17, regra 8). Na
+    pratica, isso implementava exatamente o tipo de resolucao automatica
+    que o Principio 12 proibe - so que como um SILENCIAMENTO em vez de um
+    REBAIXAMENTO, mais dificil de perceber porque o tier nunca caia, so a
+    bandeira de suspeita desaparecia silenciosamente. A correcao removeu
+    essa comparacao: existir QUALQUER evidencia TARGET negativa/
+    contraditoria ainda no event log (deduplicada por cluster) e
+    suficiente para manter o sinal ligado, independente de quantas
+    evidencias positivas comuns cheguem depois - resolver isso de
+    verdade continua sendo trabalho futuro nao implementado na V0 (ja
+    documentado em `KNOWN_LIMITATIONS.md`), nunca algo que a propria
+    agregacao decide sozinha
+    (`test_common_positive_evidence_after_regression_never_silences_the_signal`).

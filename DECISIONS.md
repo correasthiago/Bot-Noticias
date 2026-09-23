@@ -1061,3 +1061,107 @@ Testado em `test_restore.py`:
 135/135 em todas (as 135 ja incluem os 3 testes novos). Confirmacao em
 Windows depende do usuario rodar a suite la, como em todas as correcoes
 anteriores desta serie.
+
+**Atualizacao:** o usuario auditou o commit `3a5f988` num Windows real
+(sem alterar o repositorio) e confirmou **135/135**, cobrindo os tres
+pontos de limpeza. Com o restore validado em ambos os SOs, o usuario deu
+o proximo passo: revisar duas lacunas no fluxo de aprendizagem antes de
+considerar a PR pronta para merge.
+
+---
+
+## Correcao pos-entrega: revisao de memoria podia se perder para sempre apos falha do FSRS
+
+Auditoria de codigo (sem executar nada) sobre `SessionOrchestrator.submit_interaction`
+(`orchestration/session_service.py`): se a AVALIACAO de uma interacao
+fosse gravada com sucesso (transicao `pending -> completed`,
+`evaluation_status`) mas a revisao de memoria (FSRS) falhasse DEPOIS
+(`MemoryAdapter.observe_and_review` nunca levanta - devolve um
+`MemoryReviewError` - mas nada reenviava a tentativa), reenviar a MESMA
+resposta (mesma `idempotency_key`) batia direto no atalho de "ja
+avaliada, nada a reprocessar" (`if raw_interaction.evaluation_status ==
+EvaluationStatus.COMPLETED: return ...`) e saia SEM sequer tentar a
+memoria de novo. A revisao ficava perdida DEFINITIVAMENTE, mesmo a
+avaliacao em si estando integra e a interacao continuando elegivel para
+recuperacao.
+
+**Decisao:** o bloco que calcula elegibilidade e chama
+`observe_and_review` foi extraido para um metodo dedicado,
+`_review_memory_if_pending`, que e seguro chamar tanto na primeira
+quanto em qualquer submissao repetida: ele SO tenta o FSRS se AINDA nao
+existir um `MemoryObservation` gravado para aquela `raw_interaction_id`
+(`repos.memory_observations.get_by_raw_interaction`, o UNICO registro
+que `observe_and_review` grava quando tem sucesso - Secao 1 do pacote de
+correcao v0.2). O atalho de "ja avaliada" deixou de retornar direto -
+agora chama `_review_memory_if_pending` antes de devolver o resultado, e
+o caminho normal (primeira submissao) passou a usar o MESMO metodo, em
+vez de duplicar a logica inline. Isso garante:
+
+- Se a revisao nunca aconteceu (nem por falta de elegibilidade, nem por
+  ter falhado antes), uma submissao repetida TENTA de novo.
+- Se a revisao ja aconteceu com sucesso antes, uma submissao repetida
+  NUNCA tenta de novo - o FSRS so pode revisar uma interacao UMA unica
+  vez (a checagem por `MemoryObservation` existente e o que impede a
+  duplicacao).
+
+Testado em `test_orchestration.py::test_memory_review_retries_after_fsrs_failure_without_duplicating`:
+avanca uma competencia ate `SCHEDULE_RECALL` pelo fluxo real do
+orquestrador (`drive_to_schedule_recall`), forca `observe_and_review` a
+devolver um `MemoryReviewError` (a falha REAL que o metodo pode produzir
+- ele nunca levanta) na primeira submissao, confirma que a interacao fica
+`COMPLETED` sem nenhum `MemoryObservation`/`MemoryState` gravado, reenvia
+a MESMA resposta com o FSRS funcionando de novo e confirma que a revisao
+acontece desta vez, e reenvia uma TERCEIRA vez confirmando que a revisao
+NAO duplica (`memory_observations.list_for_competency` continua com
+exatamente 1 registro).
+
+---
+
+## Correcao pos-entrega: suspeita de regressao podia ser silenciada por evidencia comum, sem validacao deliberada
+
+Mesma auditoria de codigo: `classify_dimension`
+(`evidence/aggregation.py`) computava `possible_regression` comparando
+qual evidencia TARGET era mais recente - a evidencia positiva forte mais
+recente contra a evidencia negativa/contraditoria mais recente (ambas ja
+deduplicadas por cluster) - e so sinalizava a suspeita se a NEGATIVA
+fosse a mais recente das duas. Isso diverge diretamente do Principio 12
+("um erro isolado ... so acende `possible_regression=True`; rebaixar o
+estado exige validacao deliberada ... nunca a agregacao sozinha") e do
+que `KNOWN_LIMITATIONS.md` ja documentava explicitamente ("nada hoje
+fecha esse ciclo automaticamente"): na pratica, QUALQUER evidencia
+positiva mais nova - mesmo vinda de uma atividade COMUM, nunca de uma
+`TARGETED_REGRESSION_CHECK` deliberada (Secao 17, regra 8) - silenciava a
+suspeita sozinha, na proxima vez que o estado fosse recalculado. Era, sem
+querer, exatamente o tipo de resolucao automatica que o Principio 12
+proibe - so que implementada como um SILENCIAMENTO em vez de um
+REBAIXAMENTO, o que a tornava facil de nao perceber (o tier nunca caia,
+so a bandeira de suspeita desaparecia).
+
+**Decisao:** removida a comparacao "quem e mais recente". Agora, existir
+QUALQUER evidencia TARGET negativa/contraditoria ainda no event log
+(deduplicada por cluster, `regression_by_cluster`) e suficiente para
+manter `possible_regression=True`, com o tier em `demonstrated`/
+`consolidated` - independente de quantas evidencias positivas COMUNS
+cheguem depois. `CompetencyState` continua sendo recalculavel do zero a
+qualquer momento (Principio Constitucional 6) - o que mudou e que o
+resultado desse recalculo agora reflete fielmente o que
+`KNOWN_LIMITATIONS.md` sempre disse: nada na propria agregacao resolve
+essa suspeita; isso continua sendo trabalho futuro (o Decisor ja roteia
+para `TARGETED_REGRESSION_CHECK`, mas fechar esse ciclo automaticamente -
+reavaliar e confirmar ou descartar - nao existe na V0).
+
+Testado em `test_evidence_aggregation.py::test_common_positive_evidence_after_regression_never_silences_the_signal`:
+tres clusters positivos fortes levam o tier a `consolidated`, um quarto
+cluster produz evidencia TARGET negativa, e um QUINTO cluster produz
+evidencia positiva COMUM mais recente que a negativa - `possible_regression`
+precisa continuar `True` apesar da evidencia positiva mais nova. Os
+testes preexistentes (`test_isolated_negative_does_not_erase_consolidated_state`,
+`test_regression_never_auto_downgrades_even_with_many_negatives`,
+`test_two_negatives_from_same_cluster_do_not_double_count`,
+`test_incidental_negative_never_sets_possible_regression`) continuam
+verdes sem alteracao - nenhum deles dependia da comparacao removida.
+
+**Limite honesto:** suite completa rodada 10 vezes seguidas em Linux,
+137/137 em todas as execucoes (as 137 ja incluem os 2 testes novos deste
+pacote - um por lacuna). Confirmacao em Windows depende do usuario rodar
+a suite la.

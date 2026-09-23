@@ -115,6 +115,30 @@ def test_two_negatives_from_same_cluster_do_not_double_count():
     assert with_two.possible_regression == with_one.possible_regression is True
 
 
+def test_common_positive_evidence_after_regression_never_silences_the_signal():
+    """Achado da oitava auditoria pos-entrega: `possible_regression` e um
+    sinal PERMANENTE ate uma validacao DELIBERADA resolve-lo (Principio
+    12, Secao 17 regra 8 - TARGETED_REGRESSION_CHECK; KNOWN_LIMITATIONS.md
+    diz explicitamente que nada hoje fecha esse ciclo automaticamente). A
+    versao anterior comparava qual evidencia TARGET era mais recente e
+    silenciava o sinal assim que QUALQUER evidencia positiva mais nova
+    aparecesse - mesmo vinda de uma atividade COMUM, nunca de uma
+    validacao deliberada. Este teste reproduz exatamente isso: a
+    regressao e sinalizada primeiro, e uma resposta positiva COMUM chega
+    DEPOIS (mais recente) - o sinal precisa continuar ligado."""
+
+    events = [
+        ev(cluster="c1"), ev(cluster="c2"), ev(cluster="c3"),
+        ev(cluster="c4", evidence_type=EvidenceType.NEGATIVE, minute_offset=50),
+        # evidencia positiva COMUM, MAIS RECENTE que a negativa acima -
+        # nao e uma validacao deliberada, so mais uma resposta comum.
+        ev(cluster="c5", minute_offset=99),
+    ]
+    result = classify_dimension(Dimension.ACCURACY, events)
+    assert result.state == CompetencyDimensionState.CONSOLIDATED
+    assert result.possible_regression is True  # NAO foi silenciado pela evidencia positiva posterior
+
+
 def test_incidental_negative_never_sets_possible_regression():
     events = [
         ev(cluster="c1"), ev(cluster="c2"), ev(cluster="c3"),

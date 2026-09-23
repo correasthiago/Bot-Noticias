@@ -279,22 +279,33 @@ def classify_dimension(
             "superada pela evidencia positiva: estado mantido em incerteza."
         )
 
-    # Regressao (Secao 8 do pacote de correcao v0.2): NUNCA rebaixa o tier
-    # automaticamente aqui. So sinaliza, e so quando a evidencia TARGET
-    # mais recente (comparando positiva forte contra negativa/contraditoria,
-    # ja deduplicadas por cluster) e desfavoravel - "erro isolado" nao
-    # movimenta esse sinal se uma evidencia positiva mais recente já o
-    # superou.
-    possible_regression = False
-    if tier in (CompetencyDimensionState.DEMONSTRATED, CompetencyDimensionState.CONSOLIDATED) and regression_by_cluster:
-        combined = list(strong_by_cluster.values()) + list(regression_by_cluster.values())
-        most_recent = max(combined, key=lambda e: e.created_at)
-        if most_recent.evidence_type in (EvidenceType.NEGATIVE, EvidenceType.CONTRADICTORY):
-            possible_regression = True
-            explanation_parts.append(
-                f"{len(regression_by_cluster)} cluster(s) com evidencia alvo negativa/contraditoria "
-                "mais recente que a ultima confirmacao positiva: possivel regressao sinalizada, "
-                "pendente de validacao deliberada (sem rebaixamento automatico)."
-            )
+    # Regressao (Secao 8 do pacote de correcao v0.2, Principio 12): NUNCA
+    # rebaixa o tier automaticamente aqui. So sinaliza - e o sinal e
+    # PERMANENTE ate uma validacao DELIBERADA resolve-lo (Secao 17, regra
+    # 8 - TARGETED_REGRESSION_CHECK; KNOWN_LIMITATIONS.md: "nada hoje
+    # fecha esse ciclo automaticamente"). Achado da oitava auditoria
+    # pos-entrega: a versao anterior comparava a evidencia TARGET mais
+    # recente (positiva forte vs. negativa/contraditoria, ja deduplicadas
+    # por cluster) e silenciava o sinal sozinha assim que QUALQUER
+    # evidencia positiva mais nova aparecesse - mesmo vindo de uma
+    # atividade comum, nunca de uma TARGETED_REGRESSION_CHECK deliberada.
+    # Isso implementava, sem querer, exatamente o rebaixamento automatico
+    # (na verdade um SILENCIAMENTO automatico) que o Principio 12 proibe.
+    # Agora: existir QUALQUER evidencia TARGET negativa/contraditoria
+    # ainda no event log (deduplicada por cluster) e suficiente para
+    # manter o sinal ligado, independente de quantas evidencias positivas
+    # comuns cheguem depois - resolver isso de verdade continua sendo
+    # trabalho futuro (ver KNOWN_LIMITATIONS.md), nao algo que a propria
+    # agregacao decide.
+    possible_regression = bool(regression_by_cluster) and tier in (
+        CompetencyDimensionState.DEMONSTRATED,
+        CompetencyDimensionState.CONSOLIDATED,
+    )
+    if possible_regression:
+        explanation_parts.append(
+            f"{len(regression_by_cluster)} cluster(s) com evidencia alvo negativa/contraditoria "
+            "registrada: possivel regressao sinalizada, pendente de validacao deliberada - o sinal "
+            "nao e silenciado por evidencia positiva comum posterior (sem rebaixamento automatico)."
+        )
 
     return AggregationResult(tier, possible_regression, has_unresolved_contradiction, " ".join(explanation_parts))

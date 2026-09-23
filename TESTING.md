@@ -6,7 +6,7 @@
 python -m pytest -q
 ```
 
-Resultado atual: **135 testes**, 100% offline (nenhum teste faz chamada
+Resultado atual: **137 testes**, 100% offline (nenhum teste faz chamada
 de rede — `MockProvider` e usado em todos os cenarios que envolvem "IA",
 e `test_P11_offline_execution_fails_if_network_is_attempted` ativamente
 bloqueia qualquer tentativa de `socket.connect`/`create_connection`
@@ -16,11 +16,12 @@ durante o ciclo completo, falhando o teste se algo tentar).
 abaixo; NAO declare um numero como resultado valido para um SO que nao
 foi de fato executado nele):**
 
-- **Linux** (ambiente desta sessao): **135/135 passando**, tempo total
+- **Linux** (ambiente desta sessao): **137/137 passando**, tempo total
   ~3.3s. Rodado 10 vezes consecutivas apos a correcao mais recente (os
-  tres testes novos de falha na propria limpeza do restore inclusos em
+  dois testes novos - revisao de memoria retentada apos falha do FSRS e
+  suspeita de regressao nao silenciada por evidencia comum - inclusos em
   todas as 10) sem nenhuma falha.
-- **Windows**: um usuario reportou e CONFIRMOU, em quatro rodadas:
+- **Windows**: um usuario reportou e CONFIRMOU, em cinco rodadas:
   1. Apos o commit `1133ded` (pacote v0.2.2): 120/128 passando, 5 falhas
      em `test_restore.py` (`PermissionError: [WinError 5]`) - corrigido
      no commit `961b5b8` (ver "Correcao pos-entrega: restore quebrava no
@@ -35,18 +36,23 @@ foi de fato executado nele):**
   4. Apos o commit `c3b9bcb` (P2: preparacao do restore entrando no
      tratamento de falha): **132/132 CONFIRMADO em Windows real** pelo
      mesmo usuario, via auditoria de codigo (sem alterar o repositorio).
-  Essa mesma auditoria do commit `c3b9bcb` encontrou um achado novo (a
-  propria LIMPEZA da copia de seguranca, em tres pontos, podia escapar
-  como excecao ou ocultar um resultado de sucesso; ver "Correcao
-  pos-entrega: falha na propria limpeza da copia de seguranca podia
-  escapar ou ocultar o resultado" em DECISIONS.md), corrigido nesta
-  revisao (135 testes, os tres novos exercitando exatamente os tres
-  pontos relatados). Esta correcao mais recente foi validada em Linux (10
-  execucoes consecutivas), mas **ainda nao foi executada num Windows
-  real** - isso depende do usuario confirmar. Ate essa confirmacao
-  chegar, trate "135/135" como "corrigido no codigo e validado em Linux,
-  pendente de confirmacao em Windows" para ESTA correcao especifica - nao
-  como um resultado ja observado em Windows.
+  5. Apos o commit `3a5f988` (falha na propria limpeza da copia de
+     seguranca): **135/135 CONFIRMADO em Windows real** pelo mesmo
+     usuario - o restore foi dado como validado em ambos os SOs.
+  Com o restore fechado, o usuario passou a auditar o FLUXO DE
+  APRENDIZAGEM (fora do restore) e encontrou dois achados novos: revisao
+  de memoria perdida para sempre apos falha do FSRS numa submissao
+  repetida, e suspeita de regressao silenciada por evidencia comum sem
+  validacao deliberada (ver "Correcao pos-entrega: revisao de memoria
+  podia se perder para sempre apos falha do FSRS" e "Correcao
+  pos-entrega: suspeita de regressao podia ser silenciada por evidencia
+  comum, sem validacao deliberada" em DECISIONS.md), corrigidos nesta
+  revisao (137 testes, um novo por achado). Esta correcao mais recente
+  foi validada em Linux (10 execucoes consecutivas), mas **ainda nao foi
+  executada num Windows real** - isso depende do usuario confirmar. Ate
+  essa confirmacao chegar, trate "137/137" como "corrigido no codigo e
+  validado em Linux, pendente de confirmacao em Windows" para ESTA
+  correcao especifica - nao como um resultado ja observado em Windows.
 - **macOS**: nunca foi executado nesta ou em rodadas anteriores; sem
   dados. O mecanismo de `os.replace` deveria se comportar como Linux
   (semantica POSIX de `rename()`), mas isso e inferencia, nao um
@@ -57,7 +63,7 @@ foi de fato executado nele):**
 | Arquivo | O que cobre | Testes |
 |---|---|---|
 | `test_persistence.py` | foreign keys, migrations idempotentes, roundtrip de entidades, imutabilidade de `raw_interaction` (incluindo a UNICA transicao permitida, `pending->completed`), `sequence_number` monotonico com RELOGIO CONGELADO (`current`/`history` deterministicos mesmo com todas as linhas no mesmo `computed_at`) | 7 |
-| `test_evidence_aggregation.py` | `classify_dimension` pura: todos os limiares de estado (config-driven), retencao longitudinal, independencia A0/A1, contradicao, cap de contribuicao por cluster, exclusao por confianca baixa, ausencia TOTAL de rebaixamento automatico, thresholds nao hardcoded | 17 |
+| `test_evidence_aggregation.py` | `classify_dimension` pura: todos os limiares de estado (config-driven), retencao longitudinal, independencia A0/A1, contradicao, cap de contribuicao por cluster, exclusao por confianca baixa, ausencia TOTAL de rebaixamento automatico, thresholds nao hardcoded, suspeita de regressao NUNCA silenciada por evidencia positiva comum mais recente (so validacao deliberada resolveria) | 18 |
 | `test_evidence_service.py` | idempotencia, rejeicao de `idempotency_key` reutilizada com conteudo diferente (inclusive apos reinicio do processo), reprocessamento a partir da `RawInteraction` persistida, `mere_presence`, payload invalido, reconstrucao completa preservando geracoes, reprocessamento idempotente de interacao `pending`, exclusao de `inconclusive`/`alternative_cause` | 10 |
 | `test_clustering.py` | cluster computado no servidor a partir de `(activity_type, competency_targets)` - nunca do prompt: mesmo contexto/sessao colide (mesmo com prompts textualmente diferentes mas previsiveis), contextos/competencias/sessoes diferentes nao colidem, API nao aceita cluster id do chamador | 6 |
 | `test_decision_engine.py` | as 9 regras da Secao 17 (`choose_next_action`) e o roteamento SKIP/VALIDATE/STUDY (Secao 18), incluindo prioridade entre regras | 14 |
@@ -65,7 +71,7 @@ foi de fato executado nele):**
 | `test_memory_adapter.py` | criacao/idempotencia de card, elegibilidade de observacao (dimensao RETENTION + relacao target + confianca + intervalo minimo, config-driven), nota FSRS derivada EXCLUSIVAMENTE de sinais observaveis (help_level/production_result, nunca confianca nem ProductionResult bruto - alta confianca + pista explicita = Hard, nunca Easy), intervalo desde a aprendizagem verificado tambem na PRIMEIRA revisao, review avanca due date, escrita atomica card+log+observation (falha em CADA uma das tres gravacoes testada via parametrize, byte a byte), reconstrucao do Card a partir do JSON, `is_recall_due` | 23 (21 defs, 1 parametrizado em 3) |
 | `test_migrations.py` | migration 0002 atomica (rollback completo diante de falha sintetica no meio do script), preserva TODAS as avaliacoes v0.1 (normalizando em vez de descartar as incompativeis com o novo CHECK), backup automatico antes de atualizar um banco existente, banco novo vazio nao dispara backup, falha ao GRAVAR o registro em schema_migrations reverte o esquema inteiro | 5 |
 | `test_providers.py` | MockProvider produz tutor/evaluator validos (avaliando a dimensao que a atividade foi desenhada para exercitar); falha de provider e payload malformado nunca alteram estado | 4 |
-| `test_orchestration.py` | ciclo completo via `SessionOrchestrator` com MockProvider; primeiro card FSRS nasce pelo fluxo NORMAL da aplicacao (banco novo, sem `is_planned_recall=True` setado no teste, so a sequencia real de chamadas ate o Decisor escolher SCHEDULE_RECALL, com relogio controlado via `now=`); atividade comum NAO chama FSRS; double-submit no nivel de orquestracao | 3 |
+| `test_orchestration.py` | ciclo completo via `SessionOrchestrator` com MockProvider; primeiro card FSRS nasce pelo fluxo NORMAL da aplicacao (banco novo, sem `is_planned_recall=True` setado no teste, so a sequencia real de chamadas ate o Decisor escolher SCHEDULE_RECALL, com relogio controlado via `now=`); atividade comum NAO chama FSRS; double-submit no nivel de orquestracao; falha do FSRS numa primeira submissao NAO perde a revisao para sempre - uma submissao repetida tenta de novo, sem nunca duplicar numa terceira | 4 |
 | `test_integrity.py` | ciclo de pre-requisitos rejeitado na escrita (+ defesa por integrity_check contra bypass via SQL bruto), referencia pendurada, consistencia de geracao (multiplas geracoes 'active'), consistencia memory_state x memory_review_log | 6 |
 | `test_backup.py` | snapshot consistente e restauravel, falha de backup nao apaga estado, retencao mantem so os N mais recentes | 3 |
 | `test_restore.py` | restore real substitui e recupera o banco, snapshot invalido e rejeitado sem tocar no banco ativo, falha pos-troca reverte automaticamente, politica de backup automatico respeita intervalo minimo, WAL genuinamente ativo e achatado antes da troca, conexao concorrente detectada e recusada sem tocar em arquivos, reversao limpa com WAL ativo, NENHUMA conexao sqlite3 aberta no instante do `os.replace` (a causa raiz do bug relatado no Windows), o portao da aplicacao liga durante a operacao e sempre desliga depois, dupla falha (restauracao + reversao) nunca levanta excecao e preserva a copia de seguranca, uma SEGUNDA restauracao concorrente e rejeitada na hora (threads reais), uma requisicao com conexao ja aberta impede a restauracao de tocar arquivos ate fechar, falha em `close_connections()` na preparacao vira `RestoreResult` legivel sem tentar reverter, falha na criacao da copia de seguranca na preparacao idem, falha na propria LIMPEZA da copia de seguranca (apos falha na preparacao, apos reversao bem-sucedida, apos restauracao bem-sucedida) nunca escapa nem oculta o resultado real | 17 |
@@ -225,8 +231,27 @@ ou ocultar o resultado" em `DECISIONS.md` para a decisao completa (helper
 | 2 | Reversao bem-sucedida + falha ao limpar a copia que sobrou: causa original preservada, `success=False` (a restauracao em si falhou) | `test_restore.py::test_restore_readable_result_when_cleanup_after_successful_revert_fails` |
 | 3 | Restauracao bem-sucedida + falha ao limpar a copia que sobrou: `success=True`/`integrity_ok=True` (o estado do banco decide, nao a limpeza) | `test_restore.py::test_restore_still_reports_success_when_cleanup_after_successful_restore_fails` |
 
-Rodados 10 vezes consecutivas em Linux sem falha. Validacao em Windows
-ainda pendente (ver "Como rodar" acima).
+Rodados 10 vezes consecutivas em Linux sem falha. Confirmado pelo usuario
+em Windows real apos esta correcao (commit `3a5f988`): **135/135** - o
+restore foi dado como validado em ambos os SOs.
+
+## Correcao pos-entrega: duas lacunas no fluxo de aprendizagem (fora do restore)
+
+Com o restore fechado, o usuario passou a auditar o restante do fluxo de
+aprendizagem e encontrou dois achados independentes, ambos so por leitura
+de codigo (sem executar nada). Ver "Correcao pos-entrega: revisao de
+memoria podia se perder para sempre apos falha do FSRS" e "Correcao
+pos-entrega: suspeita de regressao podia ser silenciada por evidencia
+comum, sem validacao deliberada" em `DECISIONS.md` para as decisoes
+completas.
+
+| # | Requisito | Teste principal |
+|---|---|---|
+| 1 | Uma submissao repetida (mesma idempotency_key) de uma interacao ja avaliada tenta a revisao de memoria de novo se ela ainda nao aconteceu - nunca duplica se ja tiver acontecido | `test_orchestration.py::test_memory_review_retries_after_fsrs_failure_without_duplicating` |
+| 2 | `possible_regression` nunca e silenciado por evidencia positiva COMUM mais recente - so validacao deliberada (fora de escopo da V0) resolveria | `test_evidence_aggregation.py::test_common_positive_evidence_after_regression_never_silences_the_signal` |
+
+Rodados 10 vezes consecutivas em Linux sem falha (137/137, suite
+completa). Validacao em Windows ainda pendente (ver "Como rodar" acima).
 
 ## O que NAO esta coberto (limitacoes de teste, nao so de produto)
 

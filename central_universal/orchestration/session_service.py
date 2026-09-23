@@ -207,6 +207,102 @@ class SessionOrchestrator:
 
     # ---- interacao / evidencia / memoria / decisao -----------------
 
+    def _review_memory_if_pending(
+        self,
+        *,
+        activity: Activity,
+        raw_interaction: RawInteraction,
+        now: datetime | None,
+    ) -> tuple[MemoryObservationEligibility | None, object | None]:
+        """Tenta a observacao/revisao de memoria (FSRS) para
+        `raw_interaction`, mas SOMENTE se ainda nao existir um
+        `MemoryObservation` gravado para ela.
+
+        Achado da oitava auditoria pos-entrega: antes, esta logica so
+        rodava na primeira submissao (`evaluation_status` ainda `PENDING`
+        no momento da chamada). Se a avaliacao fosse gravada com sucesso
+        mas a revisao FSRS falhasse DEPOIS (`MemoryAdapter.observe_and_review`
+        NUNCA levanta - devolve `MemoryReviewError` - mas o chamador via
+        web podia mesmo assim nao persistir/reapresentar esse resultado,
+        ou o processo cair entre os dois passos), reenviar a MESMA
+        resposta (mesma `idempotency_key`) batia direto no atalho de
+        "ja avaliada, nada a reprocessar" e saia sem sequer tentar a
+        memoria de novo - a revisao ficava perdida DEFINITIVAMENTE, mesmo
+        a avaliacao em si estando integra e a interacao continuando
+        elegivel.
+
+        A checagem por um `MemoryObservation` ja existente (unico registro
+        que `observe_and_review` grava quando tem sucesso, `Secao 1 do
+        pacote de correcao v0.2`) e o que torna isto seguro chamar tanto
+        na primeira quanto em qualquer submissao repetida: se a revisao
+        JA aconteceu com sucesso antes, nunca tenta de novo (o FSRS so
+        pode revisar uma interacao uma unica vez); se nunca aconteceu
+        (nem por nao ser elegivel, nem por ter falhado), tenta agora."""
+
+        target_id = activity.competency_targets[0] if activity.competency_targets else None
+        if target_id is None:
+            return None, None
+
+        if self.repos.memory_observations.get_by_raw_interaction(raw_interaction.id) is not None:
+            # Ja revisado com sucesso antes - o FSRS so pode revisar uma
+            # interacao UMA unica vez, nunca duplicar.
+            return None, None
+
+        # Secao 2 do pacote de correcao v0.2.1: a observacao de memoria
+        # exige especificamente a avaliacao da dimensao RETENTION - nunca
+        # "qualquer evento desta competencia".
+        events_for_interaction = [
+            e
+            for e in self.repos.evidence_events.list_by_raw_interaction(raw_interaction.id)
+            if e.competency_id == target_id
+        ]
+        matching_event = next(
+            (e for e in events_for_interaction if e.dimension == Dimension.RETENTION),
+            events_for_interaction[0] if events_for_interaction else None,
+        )
+        matching_assessment = None
+        if matching_event is not None:
+            candidates = self.repos.evidence_assessments.get_for_evidence_event(matching_event.id)
+            matching_assessment = max(candidates, key=lambda a: a.created_at) if candidates else None
+
+        memory_state_before = self.repos.memory_states.get(target_id)
+        config = AggregationConfig.from_json(self.rule_version.config_json)
+        # Secao 2 da terceira auditoria pos-entrega: a nota FSRS vem dos
+        # sinais OBSERVAVEIS desta tentativa especifica (help_level/
+        # production_result da RawInteraction PERSISTIDA - nunca de
+        # parametros frescos), nunca da confianca do avaliador. Na
+        # PRIMEIRA revisao (sem memory_state ainda), o intervalo e
+        # verificado desde a primeira evidencia registrada para a
+        # competencia.
+        first_evidence_at = self.repos.evidence_events.first_created_at_for_competency(target_id)
+        eligibility = evaluate_recall_eligibility(
+            activity=activity,
+            evidence_relation=matching_event.relation if matching_event else None,
+            evidence_dimension=matching_event.dimension if matching_event else None,
+            assessment=matching_assessment,
+            help_level=raw_interaction.help_level,
+            production_result=raw_interaction.production_result,
+            memory_state=memory_state_before,
+            first_evidence_at=first_evidence_at,
+            config=config,
+            now=now,
+        )
+        # Secao 2 do pacote de correcao v0.2: se nao for elegivel, o FSRS
+        # NUNCA e chamado - nem para avaliador que falhou, nem payload
+        # invalido, nem inconclusive, nem mere_presence/incidental, nem
+        # atividade que nao e uma recuperacao planejada, nem intervalo/
+        # confianca abaixo do minimo.
+        memory_result: object | None = None
+        if eligibility.eligible and matching_assessment is not None:
+            memory_result = self.memory_adapter.observe_and_review(
+                competency_id=target_id,
+                raw_interaction_id=raw_interaction.id,
+                evidence_assessment_id=matching_assessment.id,
+                eligibility=eligibility,
+                review_datetime=now,
+            )
+        return eligibility, memory_result
+
     def submit_interaction(
         self,
         *,
@@ -251,13 +347,28 @@ class SessionOrchestrator:
 
         if raw_interaction.evaluation_status == EvaluationStatus.COMPLETED:
             # Ja foi avaliada ate o fim antes (submissao repetida de uma
-            # interacao ja concluida, T8) - nao ha nada a reprocessar.
+            # interacao ja concluida, T8) - a AVALIACAO em si (RawInteraction
+            # + EvidenceEvent/EvidenceAssessment) nao e reprocessada, o
+            # resultado ja persistido e definitivo. Achado da oitava
+            # auditoria pos-entrega: isso NAO significa que nao ha mais
+            # nada a fazer - se uma tentativa anterior tiver avaliado com
+            # sucesso mas falhado DEPOIS, so na propria revisao de memoria
+            # (FSRS), reenviar a MESMA resposta saia aqui direto, sem
+            # tentar a memoria de novo - a revisao ficava perdida para
+            # sempre, mesmo a avaliacao estando integra. `_review_memory_if_pending`
+            # e seguro chamar aqui: ele so tenta o FSRS se AINDA nao existir
+            # um `MemoryObservation` gravado para esta interacao, nunca
+            # duplicando uma revisao ja bem-sucedida.
+            memory_eligibility, memory_result = self._review_memory_if_pending(
+                activity=activity, raw_interaction=raw_interaction, now=now
+            )
             return InteractionOutcome(
                 raw_interaction=raw_interaction,
                 created_now=created_now,
                 evaluator_output=None,
                 competency_states=[],
-                memory_result=None,
+                memory_result=memory_result,
+                memory_eligibility=memory_eligibility,
             )
 
         # Secao 3 do pacote de correcao v0.2.1: o EvaluatorInput e montado
@@ -302,62 +413,10 @@ class SessionOrchestrator:
         # invalido), a RawInteraction ja gravada permanece como esta e a
         # avaliacao fica pendente (Secao 25) - nada mais e feito aqui.
 
-        memory_result: object | None = None
-        memory_eligibility: MemoryObservationEligibility | None = None
+        memory_eligibility, memory_result = self._review_memory_if_pending(
+            activity=activity, raw_interaction=raw_interaction, now=now
+        )
         target_id = activity.competency_targets[0] if activity.competency_targets else None
-        if target_id is not None:
-            # Secao 2 do pacote de correcao v0.2.1: a observacao de
-            # memoria exige especificamente a avaliacao da dimensao
-            # RETENTION - nunca "qualquer evento desta competencia".
-            events_for_interaction = [
-                e
-                for e in self.repos.evidence_events.list_by_raw_interaction(raw_interaction.id)
-                if e.competency_id == target_id
-            ]
-            matching_event = next(
-                (e for e in events_for_interaction if e.dimension == Dimension.RETENTION),
-                events_for_interaction[0] if events_for_interaction else None,
-            )
-            matching_assessment = None
-            if matching_event is not None:
-                candidates = self.repos.evidence_assessments.get_for_evidence_event(matching_event.id)
-                matching_assessment = max(candidates, key=lambda a: a.created_at) if candidates else None
-
-            memory_state_before = self.repos.memory_states.get(target_id)
-            config = AggregationConfig.from_json(self.rule_version.config_json)
-            # Secao 2 da terceira auditoria pos-entrega: a nota FSRS vem
-            # dos sinais OBSERVAVEIS desta tentativa especifica
-            # (help_level/production_result da RawInteraction PERSISTIDA -
-            # nunca de parametros frescos, mesmo motivo do ponto 3), nunca
-            # da confianca do avaliador. Na PRIMEIRA revisao (sem
-            # memory_state ainda), o intervalo e verificado desde a
-            # primeira evidencia registrada para a competencia.
-            first_evidence_at = self.repos.evidence_events.first_created_at_for_competency(target_id)
-            memory_eligibility = evaluate_recall_eligibility(
-                activity=activity,
-                evidence_relation=matching_event.relation if matching_event else None,
-                evidence_dimension=matching_event.dimension if matching_event else None,
-                assessment=matching_assessment,
-                help_level=raw_interaction.help_level,
-                production_result=raw_interaction.production_result,
-                memory_state=memory_state_before,
-                first_evidence_at=first_evidence_at,
-                config=config,
-                now=now,
-            )
-            # Secao 2 do pacote de correcao v0.2: se nao for elegivel, o
-            # FSRS NUNCA e chamado - nem para avaliador que falhou, nem
-            # payload invalido, nem inconclusive, nem mere_presence/
-            # incidental, nem atividade que nao e uma recuperacao
-            # planejada, nem intervalo/confianca abaixo do minimo.
-            if memory_eligibility.eligible and matching_assessment is not None:
-                memory_result = self.memory_adapter.observe_and_review(
-                    competency_id=target_id,
-                    raw_interaction_id=raw_interaction.id,
-                    evidence_assessment_id=matching_assessment.id,
-                    eligibility=memory_eligibility,
-                    review_datetime=now,
-                )
 
         next_routing: RoutingOutcome | None = None
         next_action: ActionOutcome | None = None

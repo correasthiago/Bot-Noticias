@@ -28,7 +28,12 @@ da V0, nao de principio.
   descartando a suspeita). Na pratica, uma competencia com
   `possible_regression=True` fica assim indefinidamente ate uma
   intervencao futura - correto pelo Principio 12, mas uma limitacao real
-  de completude do ciclo.
+  de completude do ciclo. (Oitava auditoria pos-entrega: ate essa
+  correcao, `classify_dimension` na pratica NAO respeitava este paragrafo
+  - uma evidencia positiva comum mais recente silenciava
+  `possible_regression` sozinha, sem validacao deliberada nenhuma. A
+  correcao fez o codigo finalmente bater com o que este paragrafo sempre
+  documentou - ver Principio 36 e DECISIONS.md.)
 - **Uma unica dimensao "escolhida" por interacao no MockProvider -
   PARCIALMENTE RESOLVIDA em v0.2.1.** Ate a v0.2, o `MockProvider`
   avaliava sempre a dimensao `accuracy`, o que impedia o Decisor de
