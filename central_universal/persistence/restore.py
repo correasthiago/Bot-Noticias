@@ -349,25 +349,42 @@ def _restore_from_backup_locked(
     close_connections: Callable[[], None] | None,
 ) -> RestoreResult:
     with _pause_for_restore():
-        if close_connections is not None:
-            close_connections()
-
-        had_previous_db = db_path.exists()
         safety_copy: Path | None = None
         staging_path = db_path.with_name(db_path.name + ".restoring")
 
-        if had_previous_db:
-            if not _check_exclusive(db_path):
-                return RestoreResult(
-                    success=False,
-                    message=(
-                        "restauracao abortada: outra conexao ainda esta aberta no banco ativo "
-                        "(nao foi possivel obter exclusividade) - feche todas as conexoes/sessoes "
-                        "e tente novamente. Nenhum arquivo foi alterado."
-                    ),
-                )
-            safety_copy = db_path.with_name(db_path.name + f".pre-restore-{utc_now().strftime('%Y%m%dT%H%M%S%f')}")
-            shutil.copy2(db_path, safety_copy)
+        # Preparacao (fechar conexoes de longa duracao do chamador,
+        # confirmar exclusividade, tirar a copia de seguranca) tambem
+        # participa do tratamento de falha (Secao 2, sexta auditoria
+        # pos-entrega): se QUALQUER passo daqui falhar, a troca do banco
+        # NUNCA comecou - `_atomic_replace` nem foi chamado, `db_path`
+        # continua exatamente como estava - entao nao ha o que reverter.
+        # Descartamos qualquer copia de seguranca parcial e devolvemos um
+        # `RestoreResult` legivel, nunca deixamos a excecao escapar ate o
+        # chamador web (que nao a capturaria).
+        try:
+            if close_connections is not None:
+                close_connections()
+
+            had_previous_db = db_path.exists()
+            if had_previous_db:
+                if not _check_exclusive(db_path):
+                    return RestoreResult(
+                        success=False,
+                        message=(
+                            "restauracao abortada: outra conexao ainda esta aberta no banco ativo "
+                            "(nao foi possivel obter exclusividade) - feche todas as conexoes/sessoes "
+                            "e tente novamente. Nenhum arquivo foi alterado."
+                        ),
+                    )
+                safety_copy = db_path.with_name(db_path.name + f".pre-restore-{utc_now().strftime('%Y%m%dT%H%M%S%f')}")
+                shutil.copy2(db_path, safety_copy)
+        except Exception as prep_exc:  # noqa: BLE001 - fronteira externa deliberada
+            if safety_copy is not None:
+                safety_copy.unlink(missing_ok=True)
+            return RestoreResult(
+                success=False,
+                message=f"restauracao abortada antes de tocar o banco ativo: {prep_exc}",
+            )
 
         try:
             # Nenhuma conexao sqlite3 deste processo esta aberta em

@@ -330,3 +330,22 @@ reforcos que essa auditoria tornou explicitos.
     `test_restore_waits_for_an_in_flight_request_before_touching_files`,
     ambos com threads reais e `threading.Event` para sincronizacao
     deterministica, nunca `sleep`).
+
+33. **"Nunca deixar uma excecao escapar da fronteira" (Principio 31) vale
+    para TODA a operacao, inclusive os passos que rodam antes de qualquer
+    arquivo ser tocado - e reverter so faz sentido depois que algo de fato
+    mudou.**
+    O mesmo usuario, auditando o codigo do Principio 32 sem executar nada,
+    encontrou que o callback `close_connections()` do chamador e a
+    criacao da copia de seguranca (`shutil.copy2`) rodavam ANTES do bloco
+    que converte falhas em `RestoreResult` - uma excecao ali escapava sem
+    tratamento ate a rota web, quebrando a mesma promessa que o Principio
+    31 ja fazia, so que num ponto anterior da operacao. A correcao isolou
+    essa fase de preparacao no seu proprio tratamento de falha: qualquer
+    excecao ali descarta uma copia de seguranca parcial e devolve um
+    `RestoreResult(success=False, ...)` legivel - e, precisamente porque
+    `_atomic_replace` nunca chegou a ser chamado nesse caminho, NUNCA
+    tenta `_revert_to_safety_copy` (nao ha o que reverter quando nada
+    mudou)
+    (`test_restore_returns_readable_result_when_close_connections_fails`,
+    `test_restore_returns_readable_result_when_safety_copy_creation_fails`).

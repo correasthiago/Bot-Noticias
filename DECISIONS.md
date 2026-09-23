@@ -916,3 +916,73 @@ documentado na correcao anterior.
 determinista (`threading.Event`, nunca `sleep`), rodados repetidamente em
 Linux sem falha - mas, como na correcao anterior, a confirmacao final em
 Windows depende do usuario rodar a suite de novo la.
+
+**Atualizacao:** o usuario auditou o commit `c4ce152` (sem alterar o
+repositorio) e confirmou que as duas condicoes de corrida acima estao de
+fato corrigidas no codigo, e rodou a suite num Windows real: **130/130**
+testes, incluindo **12/12** em `test_restore.py`.
+
+---
+
+## Correcao pos-entrega: preparacao do restore nao entrava no tratamento de falha (sexta auditoria)
+
+O mesmo usuario, auditando o codigo do commit `c4ce152` (sem rodar nada,
+so leitura), encontrou um ponto que nenhuma correcao anterior havia
+coberto: dentro de `_restore_from_backup_locked`, o callback
+`close_connections()` (fornecido pelo chamador, tipicamente para fechar
+conexoes de longa duracao do lado da aplicacao web) e a criacao da copia
+de seguranca (`shutil.copy2`) rodavam ANTES do bloco `try` que converte
+falhas em `RestoreResult`. Se qualquer um dos dois levantasse uma
+excecao, ela escapava direto de `_restore_from_backup_locked` - o
+`try/except RestoreAlreadyInProgressError` em `restore_from_backup` nao
+captura excecoes genericas, e a rota web em `app.py` tambem nao. Ou seja:
+a promessa (repetida em correcoes anteriores) de que o tratamento de
+falha do restore "deve preservar o banco original e sempre devolver um
+resultado legivel, mesmo se a reversao encontrar outro erro" tinha um
+buraco - essas duas falhas especificas nunca tinham sido cobertas por
+teste algum, e um usuario real veria um erro cru (provavelmente HTTP 500)
+em vez de uma mensagem legivel.
+
+**Decisao:** a fase de preparacao (chamar `close_connections()`, checar
+`had_previous_db`, confirmar exclusividade com `_check_exclusive`, e
+criar a copia de seguranca) passou a rodar dentro do seu proprio `try`,
+separado do `try` que cobre a troca de arquivo em si
+(`persistence/restore.py`, `_restore_from_backup_locked`). Qualquer
+excecao nessa fase:
+
+- Apaga qualquer copia de seguranca parcial que tenha chegado a ser
+  criada (`safety_copy.unlink(missing_ok=True)`).
+- Devolve `RestoreResult(success=False, message=...)` - nunca deixa a
+  excecao subir.
+- **Nao tenta reverter** (`_revert_to_safety_copy` nao e chamado): como a
+  falha aconteceu antes de `_atomic_replace` ser sequer chamado, `db_path`
+  nunca foi tocado - nao ha nada para reverter, e tentar reverter algo que
+  nunca mudou seria trabalho (e risco) desnecessario.
+
+O segundo `try` (troca de arquivo, migracoes, checagem de integridade, e
+reversao via `_revert_to_safety_copy` em caso de falha) continua
+inalterado - so e alcancado depois que a preparacao termina com sucesso,
+entao `had_previous_db` e `safety_copy` sempre estao definidos quando ele
+roda.
+
+Testado em
+`test_restore.py::test_restore_returns_readable_result_when_close_connections_fails`
+(injeta uma excecao no callback `close_connections`) e
+`test_restore.py::test_restore_returns_readable_result_when_safety_copy_creation_fails`
+(injeta uma excecao em `shutil.copy2` no momento exato da copia de
+seguranca, via `monkeypatch`, filtrando pelo destino conter
+"pre-restore"). Ambos confirmam: `RestoreResult(success=False, ...)`
+legivel (nunca uma excecao crua), nenhuma copia de seguranca parcial
+sobra no disco, o portao da aplicacao (`is_restore_in_progress()`) volta
+a `False`, e o banco original permanece completamente intacto.
+
+**Escopo:** esta correcao e puramente sobre tratamento de erro dentro do
+proprio processo - nao muda a protecao contra processos externos do SO
+tocando o arquivo diretamente, que continua sendo a limitacao ja
+documentada (best-effort via `_check_exclusive`) e que o proprio usuario
+reafirmou como aceitavel neste mesmo relato.
+
+**Limite honesto:** suite completa rodada 10 vezes seguidas em Linux,
+132/132 em todas as execucoes (as 132 ja incluem os 2 testes novos deste
+pacote). Como em todas as correcoes anteriores desta serie, a confirmacao
+em Windows depende do usuario rodar a suite la.

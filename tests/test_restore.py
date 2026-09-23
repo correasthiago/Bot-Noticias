@@ -496,6 +496,84 @@ def test_restore_never_raises_when_revert_itself_also_fails(tmp_path: Path, monk
     assert restore_module.is_restore_in_progress() is False
 
 
+def test_restore_returns_readable_result_when_close_connections_fails(tmp_path: Path):
+    """Achado remanescente da sexta auditoria pos-entrega (P2): o callback
+    `close_connections()` roda ANTES do bloco que converte falhas em
+    `RestoreResult`. Se ele levantar, a excecao nao pode escapar ate o
+    chamador web - a troca do banco nem comecou, entao nao ha nada para
+    reverter, so um resultado legivel para devolver."""
+
+    import central_universal.persistence.restore as restore_module
+
+    db_path = tmp_path / "central.db"
+    conn = connect(db_path)
+    run_migrations(conn)
+    repos = Repositories(conn)
+    original_learner = Learner(id=new_id(), display_name="Intocado", created_at=utc_now_iso())
+    repos.learners.insert(original_learner)
+    backup_event = create_backup(conn, repos, backup_dir=tmp_path / "backups")
+    assert backup_event.success is True
+    conn.close()
+
+    def failing_close_connections():
+        raise RuntimeError("falha simulada ao fechar conexoes do chamador")
+
+    result = restore_from_backup(db_path, backup_event.backup_path, close_connections=failing_close_connections)
+
+    assert result.success is False
+    assert "antes de tocar o banco ativo" in result.message
+
+    # nenhuma copia de seguranca parcial ficou para tras
+    assert list(tmp_path.glob("central.db.pre-restore-*")) == []
+
+    # o portao da aplicacao foi desligado mesmo com a falha na preparacao
+    assert restore_module.is_restore_in_progress() is False
+
+    # o banco original continua absolutamente intacto - a troca nunca comecou
+    untouched = connect(db_path)
+    assert Repositories(untouched).learners.get(original_learner.id) is not None
+    untouched.close()
+
+
+def test_restore_returns_readable_result_when_safety_copy_creation_fails(tmp_path: Path, monkeypatch):
+    """Mesmo achado (P2), segundo ponto: a criacao da copia de seguranca
+    (`shutil.copy2`) tambem roda antes do bloco de tratamento de falha.
+    Uma falha ali (ex.: disco cheio) precisa virar um `RestoreResult`
+    legivel, sem tentar reverter (nada foi trocado ainda) e sem deixar
+    nenhuma copia parcial no disco."""
+
+    import central_universal.persistence.restore as restore_module
+
+    db_path = tmp_path / "central.db"
+    conn = connect(db_path)
+    run_migrations(conn)
+    repos = Repositories(conn)
+    original_learner = Learner(id=new_id(), display_name="Intocado", created_at=utc_now_iso())
+    repos.learners.insert(original_learner)
+    backup_event = create_backup(conn, repos, backup_dir=tmp_path / "backups")
+    assert backup_event.success is True
+    conn.close()
+
+    def failing_copy2(src, dst, *args, **kwargs):
+        if "pre-restore" in str(dst):
+            raise OSError("falha simulada ao criar a copia de seguranca (ex.: disco cheio)")
+        raise AssertionError("copy2 chamado de forma inesperada antes da copia de seguranca")
+
+    monkeypatch.setattr(restore_module.shutil, "copy2", failing_copy2)
+
+    result = restore_from_backup(db_path, backup_event.backup_path)
+
+    assert result.success is False
+    assert "antes de tocar o banco ativo" in result.message
+
+    assert list(tmp_path.glob("central.db.pre-restore-*")) == []
+    assert restore_module.is_restore_in_progress() is False
+
+    untouched = connect(db_path)
+    assert Repositories(untouched).learners.get(original_learner.id) is not None
+    untouched.close()
+
+
 def test_maybe_run_automatic_backup_respects_min_interval(tmp_path: Path):
     db_path = tmp_path / "central.db"
     conn = connect(db_path)
