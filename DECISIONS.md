@@ -1165,3 +1165,123 @@ verdes sem alteracao - nenhum deles dependia da comparacao removida.
 137/137 em todas as execucoes (as 137 ja incluem os 2 testes novos deste
 pacote - um por lacuna). Confirmacao em Windows depende do usuario rodar
 a suite la.
+
+**Atualizacao:** o usuario auditou o commit `c208fee` num Windows real
+(sem alterar o repositorio) e confirmou **137/137**. Ainda nao recomendou
+integrar a PR: encontrou mais dois achados nesse mesmo par de correcoes,
+ambos so por leitura de codigo.
+
+---
+
+## Correcao pos-entrega: sinal de regressao passou a acender para erros ANTERIORES a qualquer dominio demonstrado (P1)
+
+A correcao anterior (ver secao acima) foi longe demais: ao remover a
+comparacao "quem e mais recente" para nunca mais silenciar o sinal por
+evidencia positiva comum posterior, passou a sinalizar `possible_regression=True`
+para QUALQUER evidencia TARGET negativa, mesmo uma que aconteceu ANTES de
+qualquer evidencia positiva ter sido registrada. O usuario reproduziu a
+sequencia exata: "erro inicial -> tres acertos independentes" - o
+resultado era `consolidated` com `possible_regression=True`, mas um erro
+anterior a aprendizagem nao e uma regressao - nao ha o que regredir de um
+dominio que ainda nao existia.
+
+**Decisao:** `classify_dimension` (`evidence/aggregation.py`) agora so
+conta uma evidencia TARGET negativa/contraditoria como REGRESSAO se ja
+existia dominio suficiente (>= `demonstrated_min_clusters` clusters
+fortes, ou >= `retention_demonstrated_min_days` dias distintos para
+retencao) NO MOMENTO em que ela ocorreu - calculado usando apenas a
+evidencia positiva forte com `created_at` estritamente ANTERIOR a essa
+evidencia negativa especifica, nunca o estado FINAL (que inclui toda a
+evidencia, passada e futura). Um erro cronologicamente anterior a
+qualquer dominio demonstrado e ruido normal de aquisicao, nunca
+regressao. A permanencia do sinal (Secao anterior: nunca silenciado por
+evidencia positiva comum posterior) continua exatamente igual - a unica
+mudanca e QUANDO o sinal acende pela primeira vez, nao se ele pode
+apagar sozinho depois de aceso.
+
+Testado em `test_evidence_aggregation.py`:
+- `test_error_before_any_demonstrated_mastery_is_not_a_regression`
+  (erro inicial, sem nenhuma evidencia positiva anterior, seguido de tres
+  acertos independentes que sozinhos levam a `consolidated` - o resultado
+  precisa ser `consolidated` com `possible_regression=False`).
+- `test_error_after_demonstrated_mastery_is_still_a_regression` (contraste
+  direto: dois clusters fortes primeiro ja bastam para `demonstrated`, um
+  terceiro leva a `consolidated`, e SO ENTAO um erro acontece - o sinal
+  continua `True`, exatamente como antes desta correcao).
+
+Os testes preexistentes de regressao (`test_isolated_negative_does_not_erase_consolidated_state`,
+`test_regression_never_auto_downgrades_even_with_many_negatives`,
+`test_two_negatives_from_same_cluster_do_not_double_count`,
+`test_common_positive_evidence_after_regression_never_silences_the_signal`)
+continuam verdes sem alteracao - em todos eles, a evidencia positiva ja
+existia ANTES da evidencia negativa, entao a nova checagem de timing
+sempre foi satisfeita.
+
+---
+
+## Correcao pos-entrega: recuperacao da revisao de memoria nunca chegava ao usuario (P2)
+
+O servico (`SessionOrchestrator._review_memory_if_pending`, correcao
+anterior) ja sabia retentar a revisao de memoria numa submissao repetida
+- mas a ROTA WEB nunca dava a chance de isso acontecer de um jeito
+visivel. Dois problemas concretos: (1) `POST /session/{id}/answer`
+chamava `orchestrator.submit_interaction(...)` e descartava o
+`InteractionOutcome` inteiro, inclusive um `memory_result` que fosse um
+`MemoryReviewError` - o usuario nunca via que a revisao tinha falhado;
+(2) `session.html` so mostra o formulario de resposta quando
+`interaction` ainda NAO existe (`{% if not interaction %}`) - assim que a
+RawInteraction e criada (o que acontece mesmo quando so o FSRS falha
+depois), o formulario some e nao sobra NENHUM caminho, nem para reenviar
+a mesma resposta, nem para saber que algo ficou pendente.
+
+**Decisao:**
+
+- `GET /session/{session_id}` (`session_view`) agora calcula
+  `memory_review_pending`: a atividade atual e uma recuperacao planejada
+  (`is_planned_recall`), ja tem uma interacao registrada, mas AINDA nao
+  tem nenhum `MemoryObservation` gravado
+  (`repos.memory_observations.get_by_raw_interaction`) - o mesmo fato
+  verificavel que `_review_memory_if_pending` usa para decidir se ha algo
+  a tentar. Tambem aceita `memory_status`/`memory_message` via
+  querystring (mesmo padrao ja usado pelo restore em `/audit`).
+- `POST /session/{session_id}/answer` (`session_answer`) agora captura o
+  `InteractionOutcome` e inspeciona `memory_result`: se for um
+  `MemoryReviewError`, o redirect carrega `memory_status=error` e a
+  mensagem; se a submissao era uma RETENTATIVA (ja existia uma
+  `RawInteraction` para essa `idempotency_key` antes desta chamada) e a
+  revisao teve sucesso desta vez, carrega `memory_status=ok`.
+- `session.html` mostra a mensagem de status (quando presente) logo no
+  topo, no mesmo padrao visual do restore, e - dentro do bloco "ja
+  respondida" (`{% else %}`, quando o formulario normal ja sumiu) -
+  acrescenta um card com um FORMULARIO DE RETENTATIVA quando
+  `memory_review_pending` e verdadeiro: campos ocultos reenviando
+  EXATAMENTE a mesma `learner_input`/`help_level`/`production_result`/
+  `idempotency_key` ja gravados, nunca uma resposta nova.
+- **Horario da tentativa original, nao do clique de retentativa:**
+  `session_answer` busca a `RawInteraction` existente ANTES de chamar
+  `submit_interaction` e, se ela ja existir, passa
+  `now=parse_iso(existing.occurred_at)` - o `review_datetime` que o FSRS
+  usa na retentativa e o mesmo da tentativa ORIGINAL, nunca o instante em
+  que o usuario clicou em "tentar de novo" (que pode ser muito depois,
+  inflando artificialmente o intervalo que o FSRS enxerga). Numa
+  submissao NOVA (sem `RawInteraction` previa), `now` continua `None` -
+  usa o relogio real, exatamente como antes.
+
+Testado em `test_web.py::test_memory_review_recovery_is_visible_and_retryable_over_http`:
+constroi uma atividade de recuperacao planejada diretamente (com uma
+interacao de "priming" 2h no passado para satisfazer o intervalo minimo
+desde a aprendizagem), forca a PRIMEIRA chamada a `observe_and_review` a
+devolver `MemoryReviewError` (a falha REAL que o metodo produz - ele
+nunca levanta), confirma via HTTP que a pagina da sessao mostra o aviso
+de erro E o botao de retentativa, clica nele reenviando a MESMA resposta,
+confirma que a revisao e recuperada (`memory_status=ok`, o botao some),
+que nao ha duplicacao (`memory_observations.list_for_competency` continua
+com exatamente 1 registro), e que o `MemoryState.last_review_at` gravado
+bate exatamente com `RawInteraction.occurred_at` da tentativa original -
+nunca com o horario do clique de retentativa.
+
+**Limite honesto:** suite completa rodada 10 vezes seguidas em Linux,
+140/140 em todas as execucoes (as 140 ja incluem os tres testes novos
+deste pacote - dois de P1, um de P2). Confirmacao em Windows depende do
+usuario rodar a suite la, como em todas as correcoes anteriores desta
+serie.

@@ -283,29 +283,51 @@ def classify_dimension(
     # rebaixa o tier automaticamente aqui. So sinaliza - e o sinal e
     # PERMANENTE ate uma validacao DELIBERADA resolve-lo (Secao 17, regra
     # 8 - TARGETED_REGRESSION_CHECK; KNOWN_LIMITATIONS.md: "nada hoje
-    # fecha esse ciclo automaticamente"). Achado da oitava auditoria
-    # pos-entrega: a versao anterior comparava a evidencia TARGET mais
-    # recente (positiva forte vs. negativa/contraditoria, ja deduplicadas
-    # por cluster) e silenciava o sinal sozinha assim que QUALQUER
-    # evidencia positiva mais nova aparecesse - mesmo vindo de uma
-    # atividade comum, nunca de uma TARGETED_REGRESSION_CHECK deliberada.
-    # Isso implementava, sem querer, exatamente o rebaixamento automatico
-    # (na verdade um SILENCIAMENTO automatico) que o Principio 12 proibe.
-    # Agora: existir QUALQUER evidencia TARGET negativa/contraditoria
-    # ainda no event log (deduplicada por cluster) e suficiente para
-    # manter o sinal ligado, independente de quantas evidencias positivas
-    # comuns cheguem depois - resolver isso de verdade continua sendo
-    # trabalho futuro (ver KNOWN_LIMITATIONS.md), nao algo que a propria
-    # agregacao decide.
-    possible_regression = bool(regression_by_cluster) and tier in (
-        CompetencyDimensionState.DEMONSTRATED,
-        CompetencyDimensionState.CONSOLIDATED,
-    )
+    # fecha esse ciclo automaticamente"). Oitava auditoria pos-entrega: a
+    # versao anterior comparava a evidencia TARGET mais recente (positiva
+    # forte vs. negativa/contraditoria) e silenciava o sinal sozinha assim
+    # que QUALQUER evidencia positiva mais nova aparecesse - mesmo vinda
+    # de uma atividade comum, nunca de uma TARGETED_REGRESSION_CHECK
+    # deliberada - exatamente o rebaixamento (na verdade um SILENCIAMENTO)
+    # automatico que o Principio 12 proibe. A correcao entao removeu essa
+    # comparacao, mas foi longe demais: passou a sinalizar QUALQUER
+    # evidencia TARGET negativa, mesmo uma anterior a qualquer dominio
+    # demonstrado - "erro inicial -> tres acertos independentes" virava
+    # CONSOLIDATED com possible_regression=True, mas um erro ANTES da
+    # aprendizagem nunca foi uma regressao (nao ha o que regredir de algo
+    # que ainda nao existia). Nona auditoria pos-entrega corrige isso: uma
+    # evidencia TARGET negativa/contraditoria so conta como REGRESSAO se
+    # ja existia dominio suficiente (>= demonstrated) no momento em que
+    # ela ocorreu - nao no estado FINAL, no estado NAQUELE INSTANTE,
+    # calculado so com a evidencia positiva forte estritamente anterior a
+    # ela. Um erro cronologicamente anterior a qualquer dominio
+    # demonstrado e ruido normal de aquisicao, nunca regressao. Uma vez
+    # que essa condicao seja satisfeita para QUALQUER cluster em
+    # `regression_by_cluster`, o sinal permanece ligado do mesmo jeito de
+    # antes - continua NUNCA sendo silenciado por evidencia positiva
+    # comum posterior (isso resolveria a suspeita sem validacao
+    # deliberada, o mesmo erro da correcao anterior).
+    possible_regression = False
+    if tier in (CompetencyDimensionState.DEMONSTRATED, CompetencyDimensionState.CONSOLIDATED):
+        for regression_event in regression_by_cluster.values():
+            prior_strong = [e for e in strong_positive if e.created_at < regression_event.created_at]
+            if dimension == Dimension.RETENTION:
+                already_demonstrated = (
+                    len({e.created_at.date() for e in prior_strong}) >= config.retention_demonstrated_min_days
+                )
+            else:
+                already_demonstrated = (
+                    len({e.evidence_cluster_id for e in prior_strong}) >= config.demonstrated_min_clusters
+                )
+            if already_demonstrated:
+                possible_regression = True
+                break
     if possible_regression:
         explanation_parts.append(
             f"{len(regression_by_cluster)} cluster(s) com evidencia alvo negativa/contraditoria "
-            "registrada: possivel regressao sinalizada, pendente de validacao deliberada - o sinal "
-            "nao e silenciado por evidencia positiva comum posterior (sem rebaixamento automatico)."
+            "registrada apos dominio ja demonstrado: possivel regressao sinalizada, pendente de "
+            "validacao deliberada - o sinal nao e silenciado por evidencia positiva comum posterior "
+            "(sem rebaixamento automatico)."
         )
 
     return AggregationResult(tier, possible_regression, has_unresolved_contradiction, " ".join(explanation_parts))

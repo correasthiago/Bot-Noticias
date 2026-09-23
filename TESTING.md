@@ -6,7 +6,7 @@
 python -m pytest -q
 ```
 
-Resultado atual: **137 testes**, 100% offline (nenhum teste faz chamada
+Resultado atual: **140 testes**, 100% offline (nenhum teste faz chamada
 de rede — `MockProvider` e usado em todos os cenarios que envolvem "IA",
 e `test_P11_offline_execution_fails_if_network_is_attempted` ativamente
 bloqueia qualquer tentativa de `socket.connect`/`create_connection`
@@ -16,12 +16,12 @@ durante o ciclo completo, falhando o teste se algo tentar).
 abaixo; NAO declare um numero como resultado valido para um SO que nao
 foi de fato executado nele):**
 
-- **Linux** (ambiente desta sessao): **137/137 passando**, tempo total
-  ~3.3s. Rodado 10 vezes consecutivas apos a correcao mais recente (os
-  dois testes novos - revisao de memoria retentada apos falha do FSRS e
-  suspeita de regressao nao silenciada por evidencia comum - inclusos em
-  todas as 10) sem nenhuma falha.
-- **Windows**: um usuario reportou e CONFIRMOU, em cinco rodadas:
+- **Linux** (ambiente desta sessao): **140/140 passando**, tempo total
+  ~3.4s. Rodado 10 vezes consecutivas apos a correcao mais recente (os
+  tres testes novos - dois de P1/regressao pre-aprendizagem, um de P2/
+  recuperacao da revisao de memoria via web - inclusos em todas as 10)
+  sem nenhuma falha.
+- **Windows**: um usuario reportou e CONFIRMOU, em seis rodadas:
   1. Apos o commit `1133ded` (pacote v0.2.2): 120/128 passando, 5 falhas
      em `test_restore.py` (`PermissionError: [WinError 5]`) - corrigido
      no commit `961b5b8` (ver "Correcao pos-entrega: restore quebrava no
@@ -39,18 +39,21 @@ foi de fato executado nele):**
   5. Apos o commit `3a5f988` (falha na propria limpeza da copia de
      seguranca): **135/135 CONFIRMADO em Windows real** pelo mesmo
      usuario - o restore foi dado como validado em ambos os SOs.
-  Com o restore fechado, o usuario passou a auditar o FLUXO DE
-  APRENDIZAGEM (fora do restore) e encontrou dois achados novos: revisao
-  de memoria perdida para sempre apos falha do FSRS numa submissao
-  repetida, e suspeita de regressao silenciada por evidencia comum sem
-  validacao deliberada (ver "Correcao pos-entrega: revisao de memoria
-  podia se perder para sempre apos falha do FSRS" e "Correcao
-  pos-entrega: suspeita de regressao podia ser silenciada por evidencia
-  comum, sem validacao deliberada" em DECISIONS.md), corrigidos nesta
-  revisao (137 testes, um novo por achado). Esta correcao mais recente
-  foi validada em Linux (10 execucoes consecutivas), mas **ainda nao foi
-  executada num Windows real** - isso depende do usuario confirmar. Ate
-  essa confirmacao chegar, trate "137/137" como "corrigido no codigo e
+  6. Apos o commit `c208fee` (revisao de memoria retentada + suspeita de
+     regressao permanente): **137/137 CONFIRMADO em Windows real** pelo
+     mesmo usuario, via auditoria de codigo (sem alterar o repositorio).
+  Essa mesma auditoria do commit `c208fee` encontrou mais dois achados no
+  fluxo de aprendizagem: um FALSO sinal de regressao para erros
+  anteriores a qualquer dominio demonstrado (P1), e a recuperacao da
+  revisao de memoria nunca chegando ao usuario pela rota web (P2) - ver
+  "Correcao pos-entrega: sinal de regressao passou a acender para erros
+  ANTERIORES a qualquer dominio demonstrado (P1)" e "Correcao
+  pos-entrega: recuperacao da revisao de memoria nunca chegava ao usuario
+  (P2)" em DECISIONS.md. Ambos corrigidos nesta revisao (140 testes, tres
+  novos - dois de P1, um de P2). Esta correcao mais recente foi validada
+  em Linux (10 execucoes consecutivas), mas **ainda nao foi executada num
+  Windows real** - isso depende do usuario confirmar. Ate essa
+  confirmacao chegar, trate "140/140" como "corrigido no codigo e
   validado em Linux, pendente de confirmacao em Windows" para ESTA
   correcao especifica - nao como um resultado ja observado em Windows.
 - **macOS**: nunca foi executado nesta ou em rodadas anteriores; sem
@@ -63,7 +66,7 @@ foi de fato executado nele):**
 | Arquivo | O que cobre | Testes |
 |---|---|---|
 | `test_persistence.py` | foreign keys, migrations idempotentes, roundtrip de entidades, imutabilidade de `raw_interaction` (incluindo a UNICA transicao permitida, `pending->completed`), `sequence_number` monotonico com RELOGIO CONGELADO (`current`/`history` deterministicos mesmo com todas as linhas no mesmo `computed_at`) | 7 |
-| `test_evidence_aggregation.py` | `classify_dimension` pura: todos os limiares de estado (config-driven), retencao longitudinal, independencia A0/A1, contradicao, cap de contribuicao por cluster, exclusao por confianca baixa, ausencia TOTAL de rebaixamento automatico, thresholds nao hardcoded, suspeita de regressao NUNCA silenciada por evidencia positiva comum mais recente (so validacao deliberada resolveria) | 18 |
+| `test_evidence_aggregation.py` | `classify_dimension` pura: todos os limiares de estado (config-driven), retencao longitudinal, independencia A0/A1, contradicao, cap de contribuicao por cluster, exclusao por confianca baixa, ausencia TOTAL de rebaixamento automatico, thresholds nao hardcoded, suspeita de regressao NUNCA silenciada por evidencia positiva comum mais recente (so validacao deliberada resolveria), erro ANTES de dominio demonstrado nunca e regressao, erro DEPOIS de dominio demonstrado continua sendo | 20 |
 | `test_evidence_service.py` | idempotencia, rejeicao de `idempotency_key` reutilizada com conteudo diferente (inclusive apos reinicio do processo), reprocessamento a partir da `RawInteraction` persistida, `mere_presence`, payload invalido, reconstrucao completa preservando geracoes, reprocessamento idempotente de interacao `pending`, exclusao de `inconclusive`/`alternative_cause` | 10 |
 | `test_clustering.py` | cluster computado no servidor a partir de `(activity_type, competency_targets)` - nunca do prompt: mesmo contexto/sessao colide (mesmo com prompts textualmente diferentes mas previsiveis), contextos/competencias/sessoes diferentes nao colidem, API nao aceita cluster id do chamador | 6 |
 | `test_decision_engine.py` | as 9 regras da Secao 17 (`choose_next_action`) e o roteamento SKIP/VALIDATE/STUDY (Secao 18), incluindo prioridade entre regras | 14 |
@@ -76,7 +79,7 @@ foi de fato executado nele):**
 | `test_backup.py` | snapshot consistente e restauravel, falha de backup nao apaga estado, retencao mantem so os N mais recentes | 3 |
 | `test_restore.py` | restore real substitui e recupera o banco, snapshot invalido e rejeitado sem tocar no banco ativo, falha pos-troca reverte automaticamente, politica de backup automatico respeita intervalo minimo, WAL genuinamente ativo e achatado antes da troca, conexao concorrente detectada e recusada sem tocar em arquivos, reversao limpa com WAL ativo, NENHUMA conexao sqlite3 aberta no instante do `os.replace` (a causa raiz do bug relatado no Windows), o portao da aplicacao liga durante a operacao e sempre desliga depois, dupla falha (restauracao + reversao) nunca levanta excecao e preserva a copia de seguranca, uma SEGUNDA restauracao concorrente e rejeitada na hora (threads reais), uma requisicao com conexao ja aberta impede a restauracao de tocar arquivos ate fechar, falha em `close_connections()` na preparacao vira `RestoreResult` legivel sem tentar reverter, falha na criacao da copia de seguranca na preparacao idem, falha na propria LIMPEZA da copia de seguranca (apos falha na preparacao, apos reversao bem-sucedida, apos restauracao bem-sucedida) nunca escapa nem oculta o resultado real | 17 |
 | `test_seed_english_graph.py` | seed idempotente, sem ciclos, todas as referencias validas | 3 |
-| `test_web.py` | fluxo HTTP completo (start -> next -> answer -> next -> end), paginas de mapa/auditoria, backup manual via UI, falha de restore mostrada ao usuario na pagina de auditoria, requisicao HTTP recebe 503 se chegar enquanto uma restauracao esta em andamento | 5 |
+| `test_web.py` | fluxo HTTP completo (start -> next -> answer -> next -> end), paginas de mapa/auditoria, backup manual via UI, falha de restore mostrada ao usuario na pagina de auditoria, requisicao HTTP recebe 503 se chegar enquanto uma restauracao esta em andamento, falha na revisao de memoria e mostrada ao usuario na pagina da sessao com um caminho de retentativa visivel que recupera a revisao (usando o horario da tentativa original) sem duplicar | 6 |
 | `test_redteam.py` | **P1-P11**, um teste por item do pacote de correcao v0.2 (ver abaixo) | 11 |
 
 ## Red Team pos-correcao v0.2 — P1 a P11
@@ -251,6 +254,28 @@ completas.
 | 2 | `possible_regression` nunca e silenciado por evidencia positiva COMUM mais recente - so validacao deliberada (fora de escopo da V0) resolveria | `test_evidence_aggregation.py::test_common_positive_evidence_after_regression_never_silences_the_signal` |
 
 Rodados 10 vezes consecutivas em Linux sem falha (137/137, suite
+completa). Confirmado pelo usuario em Windows real apos esta correcao
+(commit `c208fee`): **137/137**.
+
+## Correcao pos-entrega: falso sinal de regressao e recuperacao de memoria invisivel na web (P1 e P2)
+
+Auditando o commit `c208fee` (sem executar nada), o usuario encontrou
+mais dois achados: a correcao anterior do sinal de regressao passou a
+sinalizar erros ANTERIORES a qualquer dominio demonstrado (P1), e a
+retentativa de revisao de memoria que o servico ja sabia fazer nunca
+chegava a aparecer para o usuario na interface web (P2). Ver "Correcao
+pos-entrega: sinal de regressao passou a acender para erros ANTERIORES a
+qualquer dominio demonstrado (P1)" e "Correcao pos-entrega: recuperacao
+da revisao de memoria nunca chegava ao usuario (P2)" em `DECISIONS.md`
+para as decisoes completas.
+
+| # | Requisito | Teste principal |
+|---|---|---|
+| 1 (P1) | Um erro ANTES de qualquer dominio demonstrado (>= `demonstrated_min_clusters`/dias na evidencia estritamente anterior a ele) nunca sinaliza regressao | `test_evidence_aggregation.py::test_error_before_any_demonstrated_mastery_is_not_a_regression` |
+| 2 (P1, contraste) | Um erro DEPOIS de dominio ja demonstrado continua sinalizando regressao, permanente | `test_evidence_aggregation.py::test_error_after_demonstrated_mastery_is_still_a_regression` |
+| 3 (P2) | Falha na revisao de memoria e visivel na pagina da sessao, com um formulario de retentativa que reenvia a MESMA resposta e recupera a revisao usando o horario da tentativa ORIGINAL, sem duplicar | `test_web.py::test_memory_review_recovery_is_visible_and_retryable_over_http` |
+
+Rodados 10 vezes consecutivas em Linux sem falha (140/140, suite
 completa). Validacao em Windows ainda pendente (ver "Como rodar" acima).
 
 ## O que NAO esta coberto (limitacoes de teste, nao so de produto)

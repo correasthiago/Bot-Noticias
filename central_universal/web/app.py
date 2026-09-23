@@ -17,10 +17,11 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from central_universal.decision.service import DecisionService
+from central_universal.domain.clock import parse_iso
 from central_universal.domain.enums import ALL_DIMENSIONS, HelpLevel, ProductionResult
 from central_universal.domain.entities import RuleVersion
 from central_universal.integrity.checks import run_all as run_integrity_checks
-from central_universal.memory.fsrs_adapter import MemoryAdapter
+from central_universal.memory.fsrs_adapter import MemoryAdapter, MemoryReviewError
 from central_universal.orchestration.session_service import SessionOrchestrator
 from central_universal.persistence.backup import create_backup, list_backups
 from central_universal.persistence.repositories import Repositories
@@ -101,6 +102,8 @@ def session_view(
     request: Request,
     session_id: str,
     repos: Repositories = Depends(get_repos),
+    memory_status: str | None = None,
+    memory_message: str | None = None,
 ):
     session = repos.sessions.get(session_id)
     if session is None:
@@ -123,6 +126,22 @@ def session_view(
         dimension_states = repos.competency_states.current_all_dimensions(target_id)
         recent_decisions = repos.decision_events.list_for_competency(target_id)[-3:]
 
+    # Nona auditoria pos-entrega (P2): a revisao de memoria (FSRS) pode
+    # ter falhado numa tentativa anterior e ainda estar pendente - o
+    # formulario de resposta some assim que `interaction` existe (nao ha
+    # o que reenviar), mas SEM um caminho visivel para recuperar so a
+    # revisao, ela ficava perdida na pratica mesmo com o servico ja
+    # sabendo tentar de novo (`_review_memory_if_pending`). Uma atividade
+    # planejada como recuperacao, ja respondida, sem nenhum
+    # `MemoryObservation` gravado ainda, e o sinal de que ha algo a
+    # recuperar - o botao de retentativa so aparece nesse caso.
+    memory_review_pending = (
+        current_activity is not None
+        and current_activity.is_planned_recall
+        and interaction is not None
+        and repos.memory_observations.get_by_raw_interaction(interaction.id) is None
+    )
+
     return templates.TemplateResponse(
         request,
         "session.html",
@@ -135,6 +154,9 @@ def session_view(
             "recent_decisions": recent_decisions,
             "help_levels": list(HelpLevel),
             "production_results": list(ProductionResult),
+            "memory_review_pending": memory_review_pending,
+            "memory_status": memory_status,
+            "memory_message": memory_message,
         },
     )
 
@@ -172,7 +194,21 @@ def session_answer(
 ):
     orchestrator = _orchestrator(repos, provider, rule_version)
     activity = repos.activities.get(activity_id)
-    orchestrator.submit_interaction(
+
+    # Nona auditoria pos-entrega (P2): quando esta submissao esta
+    # RECUPERANDO a revisao de memoria de uma tentativa ja registrada
+    # (mesma idempotency_key ja tem uma RawInteraction persistida), o
+    # `now` usado pelo FSRS precisa ser o horario da tentativa ORIGINAL
+    # (`RawInteraction.occurred_at`) - nunca o horario deste clique de
+    # retentativa, que pode acontecer muito depois. Usar o horario real
+    # do clique inflaria artificialmente o intervalo que o FSRS enxerga
+    # entre "quando o aprendiz respondeu" e "quando a revisao foi
+    # registrada", derivando uma nota/agendamento que nao corresponde ao
+    # que realmente aconteceu.
+    existing = repos.raw_interactions.get_by_idempotency_key(idempotency_key)
+    retry_now = parse_iso(existing.occurred_at) if existing is not None else None
+
+    outcome = orchestrator.submit_interaction(
         activity_id=activity_id,
         session_id=session_id,
         idempotency_key=idempotency_key,
@@ -180,8 +216,23 @@ def session_answer(
         help_level=HelpLevel(help_level),
         production_result=ProductionResult(production_result),
         tutor_output_text=activity.prompt if activity else "",
+        now=retry_now,
     )
-    return RedirectResponse(f"/session/{session_id}", status_code=303)
+
+    # A revisao de memoria nunca e silenciada aqui: uma falha
+    # (`MemoryReviewError`, que `observe_and_review` devolve mas nunca
+    # levanta) chega visivel ao usuario na propria pagina da sessao, no
+    # mesmo padrao ja usado para o resultado do restore em `/audit`. Uma
+    # RETENTATIVA bem-sucedida (so possivel quando `existing` ja existia
+    # antes desta chamada) tambem e confirmada explicitamente.
+    query: dict[str, str] = {}
+    if isinstance(outcome.memory_result, MemoryReviewError):
+        query = {"memory_status": "error", "memory_message": outcome.memory_result.message}
+    elif existing is not None and outcome.memory_result is not None:
+        query = {"memory_status": "ok", "memory_message": "Revisao de memoria recuperada com sucesso."}
+
+    suffix = f"?{urlencode(query)}" if query else ""
+    return RedirectResponse(f"/session/{session_id}{suffix}", status_code=303)
 
 
 @app.post("/session/{session_id}/end")

@@ -107,6 +107,149 @@ def test_restore_failure_is_shown_to_the_user(tmp_path, monkeypatch):
         assert 'class="error"' in audit_page.text
 
 
+def test_memory_review_recovery_is_visible_and_retryable_over_http(tmp_path, monkeypatch):
+    """Achado P2 da nona auditoria pos-entrega: o servico ja sabia
+    retentar a revisao de memoria numa submissao repetida (Principio 35),
+    mas a rota web descartava `MemoryReviewError` sem mostrar nada ao
+    usuario, e o formulario de resposta sumia assim que a interacao
+    existia - nao havia caminho VISIVEL nem TESTADO para recuperar a
+    revisao. Constroi uma atividade de recuperacao planejada diretamente
+    (sem percorrer a ladder inteira, ja coberta em outros testes), forca
+    o FSRS a falhar na primeira resposta via HTTP, confirma que a pagina
+    da sessao mostra o aviso de falha E o botao de retentativa, clica
+    nele (reenviando a MESMA resposta) e confirma que a revisao e
+    recuperada - usando o horario da tentativa ORIGINAL (nunca o do
+    clique de retentativa) e sem duplicar."""
+
+    with _fresh_client(tmp_path, monkeypatch) as client:
+        client.get("/")  # garante que o app ja fez bootstrap do banco
+
+        from datetime import datetime, timedelta, timezone
+
+        import central_universal.memory.fsrs_adapter as fsrs_adapter_module
+        import central_universal.web.deps as deps_module
+        from central_universal.domain.clock import parse_iso, utc_now_iso
+        from central_universal.domain.entities import Activity, LearningSession
+        from central_universal.domain.enums import DecisionType, HelpLevel, ProductionResult, SessionStatus
+        from central_universal.domain.ids import new_id
+        from central_universal.memory.fsrs_adapter import MemoryReviewError
+        from central_universal.orchestration.session_service import SessionOrchestrator
+        from central_universal.persistence.repositories import Repositories
+        from central_universal.providers.mock import MockProvider
+
+        conn = deps_module.connect(deps_module.DB_PATH)
+        repos = Repositories(conn)
+        learner = repos.learners.list_all()[0]
+        competency_id = repos.competencies.list_all()[0].id
+        rule_version = repos.active_rule_version.get()
+
+        session = LearningSession(
+            id=new_id(), learner_id=learner.id, started_at=utc_now_iso(), status=SessionStatus.ACTIVE
+        )
+        repos.sessions.insert(session)
+
+        # evidencia PRIMING, 2h no passado - sem ela, a checagem de
+        # intervalo desde a primeira evidencia (Secao 2 da terceira
+        # auditoria pos-entrega) rejeitaria a recuperacao abaixo por
+        # intervalo zero (a propria tentativa seria a unica evidencia).
+        priming_orchestrator = SessionOrchestrator(repos, MockProvider(), rule_version, backup_dir=tmp_path / "backups")
+        priming_activity = Activity(
+            id=new_id(),
+            session_id=session.id,
+            competency_targets=[competency_id],
+            activity_type=DecisionType.MINIMAL_EXPLANATION.value,
+            prompt="Atividade de priming",
+            support_level=HelpLevel.A0,
+            created_at=utc_now_iso(),
+            tutor_provider_event_id=None,
+            is_planned_recall=False,
+        )
+        repos.activities.insert(priming_activity)
+        priming_orchestrator.submit_interaction(
+            activity_id=priming_activity.id, session_id=session.id, idempotency_key=new_id(),
+            learner_input="resposta de priming", help_level=HelpLevel.A0,
+            production_result=ProductionResult.SPONTANEOUS_CORRECT, tutor_output_text="",
+            now=datetime.now(timezone.utc) - timedelta(hours=2),
+        )
+
+        activity = Activity(
+            id=new_id(),
+            session_id=session.id,
+            competency_targets=[competency_id],
+            activity_type=DecisionType.SCHEDULE_RECALL.value,
+            prompt="Revisao de teste",
+            support_level=HelpLevel.A0,
+            created_at=utc_now_iso(),
+            tutor_provider_event_id=None,
+            is_planned_recall=True,
+        )
+        repos.activities.insert(activity)
+        conn.close()
+
+        # forca a PRIMEIRA chamada a observe_and_review a falhar (o jeito
+        # REAL que ela falha - devolve MemoryReviewError, nunca levanta) -
+        # chamadas seguintes funcionam normalmente.
+        call_count = {"n": 0}
+        real_observe_and_review = fsrs_adapter_module.MemoryAdapter.observe_and_review
+
+        def flaky_observe_and_review(self, *args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return MemoryReviewError(message="falha simulada no FSRS (P2)")
+            return real_observe_and_review(self, *args, **kwargs)
+
+        monkeypatch.setattr(fsrs_adapter_module.MemoryAdapter, "observe_and_review", flaky_observe_and_review)
+
+        answer_data = {
+            "activity_id": activity.id,
+            "learner_input": "She has gone to school before.",
+            "help_level": "A0",
+            "production_result": "spontaneous_correct",
+            "idempotency_key": activity.id,
+        }
+
+        first_resp = client.post(
+            f"/session/{session.id}/answer", data=answer_data, follow_redirects=False
+        )
+        assert first_resp.status_code == 303
+        assert "memory_status=error" in first_resp.headers["location"]
+
+        failure_page = client.get(first_resp.headers["location"])
+        assert failure_page.status_code == 200
+        assert "Revisao de memoria" in failure_page.text
+        assert 'class="error"' in failure_page.text
+        # o formulario de resposta sumiu (a interacao ja existe), mas o
+        # caminho de recuperacao PRECISA estar visivel.
+        assert "Tentar revisao de memoria novamente" in failure_page.text
+
+        retry_resp = client.post(
+            f"/session/{session.id}/answer", data=answer_data, follow_redirects=False
+        )
+        assert retry_resp.status_code == 303
+        assert "memory_status=ok" in retry_resp.headers["location"]
+
+        recovered_page = client.get(retry_resp.headers["location"])
+        assert recovered_page.status_code == 200
+        assert "recuperada com sucesso" in recovered_page.text
+        # ja foi recuperada - o botao de retentativa nao aparece mais.
+        assert "Tentar revisao de memoria novamente" not in recovered_page.text
+
+        conn2 = deps_module.connect(deps_module.DB_PATH)
+        repos2 = Repositories(conn2)
+        raw_interaction = repos2.raw_interactions.get_by_idempotency_key(activity.id)
+        assert raw_interaction is not None
+        observation = repos2.memory_observations.get_by_raw_interaction(raw_interaction.id)
+        assert observation is not None
+        assert len(repos2.memory_observations.list_for_competency(competency_id)) == 1  # nao duplicou
+
+        memory_state = repos2.memory_states.get(competency_id)
+        assert memory_state is not None
+        # a revisao recuperada usou o horario da tentativa ORIGINAL, nunca
+        # o horario do clique de retentativa (que aconteceu depois).
+        assert parse_iso(memory_state.last_review_at) == parse_iso(raw_interaction.occurred_at)
+        conn2.close()
+
+
 def test_restore_rejects_new_requests_while_in_progress(tmp_path, monkeypatch):
     """Quarta auditoria pos-entrega, Secao 3: 'coordene a pausa de
     requisicoes no nivel da aplicacao'. Uma requisicao HTTP que chega

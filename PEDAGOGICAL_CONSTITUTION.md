@@ -421,3 +421,50 @@ reforcos que essa auditoria tornou explicitos.
     documentado em `KNOWN_LIMITATIONS.md`), nunca algo que a propria
     agregacao decide sozinha
     (`test_common_positive_evidence_after_regression_never_silences_the_signal`).
+
+37. **Nao ha o que regredir de um dominio que ainda nao existia - uma
+    regressao so pode ser medida em relacao ao momento em que o dominio
+    foi demonstrado, nunca em relacao ao estado final recalculado com
+    TODA a evidencia.**
+    O usuario auditou o commit que implementou o Principio 36 e reproduziu
+    a sequencia "erro inicial -> tres acertos independentes": o resultado
+    era `consolidated` com `possible_regression=True`, mas o erro
+    aconteceu ANTES de qualquer evidencia positiva sequer existir - a
+    correcao anterior tinha ido longe demais ao remover TODA nocao de
+    timing, sinalizando regressao para qualquer evidencia negativa,
+    independente de quando ela ocorreu em relacao ao dominio ja
+    demonstrado. A correcao ajustou a condicao: uma evidencia TARGET
+    negativa/contraditoria so conta como regressao se, NO MOMENTO em que
+    ela ocorreu, ja existia evidencia positiva forte suficiente (>=
+    `demonstrated_min_clusters` clusters, ou >= `retention_demonstrated_min_days`
+    dias para retencao) - calculado usando so a evidencia com `created_at`
+    estritamente anterior aquela evidencia negativa especifica, nunca o
+    estado final. Um erro cronologicamente anterior a qualquer dominio
+    demonstrado e ruido normal de aquisicao, nunca regressao; um erro
+    posterior ao dominio ja demonstrado continua sinalizando regressao,
+    permanente, exatamente como o Principio 36 estabelece
+    (`test_error_before_any_demonstrated_mastery_is_not_a_regression`,
+    `test_error_after_demonstrated_mastery_is_still_a_regression`).
+
+38. **Um caminho de recuperacao que so existe no servico e invisivel -
+    a interface tem que dar ao usuario uma forma real de acionar a
+    retentativa, e essa retentativa tem que preservar o tempo real dos
+    eventos, nunca o tempo do clique que a disparou.**
+    O Principio 35 corrigiu o SERVICO para retentar a revisao de memoria
+    numa submissao repetida - mas a mesma auditoria encontrou que a rota
+    web (`POST /session/{id}/answer`) descartava o resultado inteiro
+    (inclusive um `MemoryReviewError`), e que a pagina da sessao esconde o
+    formulario de resposta assim que a interacao existe, deixando NENHUM
+    caminho visivel para o usuario sequer saber que uma revisao ficou
+    pendente, muito menos recupera-la. A correcao deu a interface web um
+    caminho completo: a pagina calcula `memory_review_pending` (atividade
+    planejada como recuperacao, ja respondida, sem `MemoryObservation`
+    gravado ainda) e mostra um formulario de retentativa que reenvia
+    EXATAMENTE a mesma resposta ja registrada - nunca uma nova. Crucial:
+    a retentativa usa `RawInteraction.occurred_at` (o horario da
+    tentativa ORIGINAL) como `review_datetime` do FSRS, nunca o horario
+    do clique de retentativa - que pode acontecer muito depois e, se
+    usado, inflaria artificialmente o intervalo que o FSRS enxerga entre
+    o momento real da tentativa e o momento em que a revisao foi
+    finalmente registrada
+    (`test_memory_review_recovery_is_visible_and_retryable_over_http`).

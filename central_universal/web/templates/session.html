@@ -3,6 +3,10 @@
 {% block content %}
 <h1>Sessao {{ session.id[:8] }} ({{ session.status.value }})</h1>
 
+{% if memory_status %}
+<p class="{{ 'ok' if memory_status == 'ok' else 'error' }}"><strong>Revisao de memoria:</strong> {{ memory_message }}</p>
+{% endif %}
+
 {% if not activity %}
   <p>Nenhuma atividade ainda.</p>
   <form method="post" action="/session/{{ session.id }}/next">
@@ -45,6 +49,24 @@
       <p><strong>Ajuda:</strong> {{ interaction.help_level.value }} &middot;
          <strong>Resultado:</strong> {{ interaction.production_result.value }}</p>
     </div>
+
+    {% if memory_review_pending %}
+    <div class="card">
+      <p>A revisao de memoria (FSRS) desta recuperacao ainda nao foi
+         registrada - pode ter falhado numa tentativa anterior. Tentar de
+         novo reenvia a MESMA resposta (nunca uma nova) e usa o horario
+         da tentativa original, sem duplicar a revisao se ela ja tiver
+         funcionado.</p>
+      <form method="post" action="/session/{{ session.id }}/answer">
+        <input type="hidden" name="activity_id" value="{{ activity.id }}">
+        <input type="hidden" name="idempotency_key" value="{{ activity.id }}">
+        <input type="hidden" name="learner_input" value="{{ interaction.learner_input }}">
+        <input type="hidden" name="help_level" value="{{ interaction.help_level.value }}">
+        <input type="hidden" name="production_result" value="{{ interaction.production_result.value }}">
+        <button type="submit">Tentar revisao de memoria novamente</button>
+      </form>
+    </div>
+    {% endif %}
 
     {% if dimension_states %}
     <h3>Estado atual da competencia</h3>

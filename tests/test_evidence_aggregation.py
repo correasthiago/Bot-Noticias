@@ -139,6 +139,55 @@ def test_common_positive_evidence_after_regression_never_silences_the_signal():
     assert result.possible_regression is True  # NAO foi silenciado pela evidencia positiva posterior
 
 
+def test_error_before_any_demonstrated_mastery_is_not_a_regression():
+    """Achado P1 da nona auditoria pos-entrega: um erro anterior a
+    qualquer dominio demonstrado nao e uma regressao - nao ha o que
+    regredir de algo que ainda nao existia. A correcao anterior
+    (Principio 36) foi longe demais: sinalizava `possible_regression=True`
+    para QUALQUER evidencia TARGET negativa, mesmo uma cronologicamente
+    ANTES de qualquer cluster forte ter sido demonstrado. Sequencia
+    reproduzida pelo usuario: erro inicial (antes de qualquer evidencia
+    positiva), seguido de tres acertos independentes que sozinhos ja
+    levam a `consolidated` - o resultado precisa ser `consolidated` COM
+    `possible_regression=False`, porque o erro veio antes da
+    aprendizagem, nao depois dela."""
+
+    events = [
+        # erro ANTES de qualquer evidencia positiva - nenhum dominio
+        # demonstrado ainda existia neste instante.
+        ev(cluster="c1", evidence_type=EvidenceType.NEGATIVE, minute_offset=0),
+        # tres acertos independentes DEPOIS do erro, suficientes para
+        # consolidated sozinhos.
+        ev(cluster="c2", minute_offset=10),
+        ev(cluster="c3", minute_offset=20),
+        ev(cluster="c4", minute_offset=30),
+    ]
+    result = classify_dimension(Dimension.ACCURACY, events)
+    assert result.state == CompetencyDimensionState.CONSOLIDATED
+    assert result.possible_regression is False  # erro pre-aprendizagem, nunca regressao
+
+
+def test_error_after_demonstrated_mastery_is_still_a_regression():
+    """Contraste direto com o teste acima: um erro que acontece DEPOIS
+    que o dominio ja foi demonstrado (>= demonstrated_min_clusters
+    strong clusters estritamente anteriores a ele) continua sinalizando
+    `possible_regression=True`, permanente, exatamente como antes."""
+
+    events = [
+        # dois clusters fortes primeiro - ja o suficiente para
+        # 'demonstrated' (demonstrated_min_clusters=2 no default).
+        ev(cluster="c1", minute_offset=0),
+        ev(cluster="c2", minute_offset=1),
+        # um terceiro cluster forte leva a consolidated.
+        ev(cluster="c3", minute_offset=2),
+        # erro DEPOIS que 'demonstrated' ja tinha sido alcancado.
+        ev(cluster="c4", evidence_type=EvidenceType.NEGATIVE, minute_offset=99),
+    ]
+    result = classify_dimension(Dimension.ACCURACY, events)
+    assert result.state == CompetencyDimensionState.CONSOLIDATED
+    assert result.possible_regression is True  # erro pos-aprendizagem, regressao genuina
+
+
 def test_incidental_negative_never_sets_possible_regression():
     events = [
         ev(cluster="c1"), ev(cluster="c2"), ev(cluster="c3"),
