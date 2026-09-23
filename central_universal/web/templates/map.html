@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Mapa de competencias{% endblock %}
+{% block content %}
+<h1>Mapa de competencias</h1>
+<table>
+  <tr>
+    <th>Competencia</th>
+    {% for dim in dimensions %}<th>{{ dim.value }}</th>{% endfor %}
+  </tr>
+  {% for row in rows %}
+  <tr>
+    <td><a href="/competency/{{ row.competency.id }}">{{ row.competency.name }}</a></td>
+    {% for dim in dimensions %}
+      {% set state = row.states.get(dim) %}
+      <td class="state-{{ state.state.value if state else 'not_assessed' }}">
+        {{ state.state.value if state else 'not_assessed' }}
+        {% if state and state.possible_regression %}<span class="flag">!</span>{% endif %}
+      </td>
+    {% endfor %}
+  </tr>
+  {% endfor %}
+</table>
+{% endblock %}
